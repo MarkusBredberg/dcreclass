@@ -94,8 +94,8 @@ param_grid = {
     'J':             [2],          # Only used for scattering classifiers
     'L':             [12],         # Only used for scattering classifiers
     'order':         [2],          # Only used for scattering classifiers
-    'percentile_lo': [1, 30, 60],  # Only used for data normalisation
-    'percentile_hi': [80, 90, 99], # Only used for data normalisation
+    'percentile_lo': [60],  # Only used for data normalisation
+    'percentile_hi': [99], # Only used for data normalisation
     'crop_size':     [(512,512)],  # Not used for preformatted data
     'downsample_size':[(128,128)], # Not used for preformatted data
     'versions':       ['RT50kpc']  # 'raw', 'T50kpc', ad hoc tapering: e.g. 'rt50'  strings in list → product() iterates them individually
@@ -254,10 +254,14 @@ def check_overfitting_indicators(metrics, gen_model_name, subset_size, fold, lr,
     print("="*60)
     
     # 1. Train vs Test accuracy gap
-    # (You need to add train accuracy tracking first)
+    print(f"📊 Train Accuracy: {np.mean(metrics[f'{base}_train_acc']):.4f} ± {np.std(metrics[f'{base}_train_acc']):.4f}")
     
     # 2. Validation vs Test accuracy gap
     print(f"\n📊 Test Accuracy: {np.mean(test_accs):.4f} ± {np.std(test_accs):.4f}")
+    print(f"📊 Validation Accuracy: {np.mean(metrics[f'{base}_val_acc']):.4f} ± {np.std(metrics[f'{base}_val_acc']):.4f}")
+    print(f"\n🔍 Accuracy Gap (Train - Test): {np.mean(metrics[f'{base}_train_acc']) - np.mean(test_accs):.4f}")
+    if np.mean(metrics[f'{base}_train_acc']) - np.mean(test_accs) > 0.1:
+        print(f"⚠️  Large accuracy gap detected (>0.1), indicating potential overfitting.")
     
     # 3. Check if early stopping triggered
     loss_key = f"{gen_model_name}_loss_{subset_size}_{fold}_0_{lr}_{reg}_{lambda_generate}"
@@ -424,10 +428,10 @@ def update_metrics(metrics,
 def initialize_history(history, model_name, subset_size, fold, experiment, lr, reg, lambda_generate):
     if model_name not in history:
         history[model_name] = {}
-
-    loss_key = f"{model_name}_loss_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"
-    val_loss_key = f"{model_name}_val_loss_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"
-    train_acc_key = f"{model_name}_train_acc_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"
+    
+    train_acc_key = f"{gen_model_name}_ss{subset_size}_f{fold}_lr{lr}_reg{reg}_lam{lambda_generate}_cs{cs}_ds{ds}_ver{ver_key}_train_acc"
+    val_loss_key = f"{gen_model_name}_ss{subset_size}_f{fold}_lr{lr}_reg{reg}_lam{lambda_generate}_cs{cs}_ds{ds}_ver{ver_key}_val_loss"
+    loss_key = f"{gen_model_name}_ss{subset_size}_f{fold}_lr{lr}_reg{reg}_lam{lambda_generate}_cs{cs}_ds{ds}_ver{ver_key}_loss"
 
     for key in [loss_key, val_loss_key, train_acc_key]:
         if key not in history[model_name]:
@@ -1201,7 +1205,7 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                 criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
             else:
                 if weights is not None:
-                    print(f"Using class weights: {weights}")
+                    #print(f"Using class weights: {weights}")
                     criterion = nn.CrossEntropyLoss(weight=weights, label_smoothing=label_smoothing)
                 else:
                     print("No class weighting")
@@ -1292,12 +1296,14 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                                     total_images += float(images.size(0))
 
                             average_loss = total_loss / total_images
-                            loss_key = f"{gen_model_name}_loss_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"
-                            history[gen_model_name][loss_key].append(average_loss)
+                            base = f"{gen_model_name}_ss{subset_size}_f{fold}_lr{lr}_reg{reg}_lam{lambda_generate}_cs{cs}_ds{ds}_ver{ver_key}"
+                            history[gen_model_name][f"{base}_loss"].append(average_loss)
 
                             model.eval()
                             val_total_loss = 0
                             val_total_images = 0
+                            val_accuracy = 0
+                            val_total_correct = 0
 
                             with torch.inference_mode(): # Validate on validation data
                                 for i, (images, scat, _rest) in enumerate(valid_loader):
@@ -1326,10 +1332,19 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
 
                                     val_total_loss += float(loss.item() * images.size(0))
                                     val_total_images += float(images.size(0))
+                                    if MULTILABEL:
+                                        preds = (torch.sigmoid(logits) >= THRESHOLD).cpu().numpy()
+                                        trues = labels.cpu().numpy()
+                                        val_total_correct += (preds == trues).all(axis=1).sum()
+                                    else:
+                                        preds = logits.argmax(dim=1)
+                                        val_total_correct += (preds == labels).sum().item()
+                                    val_total_images += labels.size(0)
 
                             val_average_loss = val_total_loss / val_total_images if val_total_images > 0 else float('inf')
-                            val_loss_key = f"{gen_model_name}_val_loss_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"
-                            history[gen_model_name][val_loss_key].append(val_average_loss)
+                            val_accuracy = val_total_correct / val_total_images if val_total_images > 0 else 0
+                            history[gen_model_name][f"{base}_val_loss"].append(val_average_loss)
+                            history[gen_model_name][f"{base}_val_accuracy"].append(val_accuracy)
 
                             # To check for overfitting, validate on training data as well
                             model.eval()
@@ -1359,8 +1374,14 @@ for lr, reg, ls, J_val, L_val, order_val, lo_val, hi_val, crop, down, vers in pr
                                         train_correct += (preds == labels).sum().item()
                                     train_total += labels.size(0)
 
+
                             train_accuracy = train_correct / train_total
-                            history[gen_model_name][f"{gen_model_name}_train_acc_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"] = train_accuracy
+
+                            # Store in metrics with correct key format
+                            cs = f"{crop_size[0]}x{crop_size[1]}"
+                            ds = f"{downsample_size[0]}x{downsample_size[1]}"
+                            train_acc_key = f"{gen_model_name}_ss{subset_size}_f{fold}_lr{lr}_reg{reg}_lam{lambda_generate}_cs{cs}_ds{ds}_ver{ver_key}_train_acc"
+                            metrics.setdefault(train_acc_key, []).append(train_accuracy)
                             
                             if ES:
                                 early_stopping(val_average_loss, model, f'./classifier/trained_models/{gen_model_name}_best_model.pth')

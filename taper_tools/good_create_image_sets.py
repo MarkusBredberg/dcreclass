@@ -477,8 +477,8 @@ def make_montage(source_name: str,
     if kpc_match:
         kpc_value = float(kpc_match.group(1))
         # Apply scale-dependent zoom factor:
-        zoom_25 = 1.42 # - 25kpc: zoom OUT significantly
-        zoom_100 = 0.82 # - 100kpc: zoom IN slightly 
+        zoom_25 = 1.42 # - 25kpc: zoom OUT
+        zoom_100 = 0.49 # - 100kpc: zoom IN 
         if kpc_value <= 30:  # 25kpc and similar
             zoom_factor = zoom_25
         elif kpc_value >= 90:  # 100kpc and similar
@@ -600,7 +600,7 @@ def main():
                     help="Crop size H,W or C,H,W in input pixels. Default: 512,512")
     ap.add_argument("--down", type=parse_tuple3, default="128,128",
                     help="Downsample size H,W or C,H,W. Default: 128,128")
-    ap.add_argument("--scales", type=str, default="25, 50, 100",
+    ap.add_argument("--scales", type=str, default="100",
                     help="Comma-separated requested RT scales in kpc (any values; nearest available T_Y is used).")
     ap.add_argument("--fov-arcmin", type=float, default=50.0,
                     help="Square FOV (arcmin) for the formatted column; crop is on RAW grid.")

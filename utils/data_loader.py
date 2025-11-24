@@ -537,6 +537,46 @@ def count_emission_regions(image, threshold=0.1, region_size=(128, 128)):
     
     return num_features
 
+def plot_class_images(images, labels, filenames=None, set_name='train'):
+    # ensure labels are a plain list of ints
+    if isinstance(labels, torch.Tensor):
+        labels = labels.tolist()
+
+    # if images have more than one channel (C, H, W), only use the first channel
+    if isinstance(images, torch.Tensor) and images.ndim == 4:
+        images = [img[0] for img in images]
+    
+    desc_map = {c['tag']: c['description'] for c in get_classes()}
+    
+    for cls in sorted(set(labels)):
+        # collect up to 10 examples of this class
+        idxs = [i for i,l in enumerate(labels) if l == cls][:10]
+        if not idxs:
+            continue
+        
+        fig, axes = plt.subplots(2, 5, figsize=(10, 4))
+        fig.suptitle(f"{set_name} images for class {cls} – {desc_map.get(cls, '')}", fontsize=12)
+        
+        for ax, idx in zip(axes.flat, idxs):
+            img = images[idx]
+            arr = img.squeeze().cpu().numpy() if isinstance(img, torch.Tensor) else np.squeeze(img)
+            
+            # If multiple channels take the first channel
+            if arr.ndim == 3 and arr.shape[0] > 1:
+                arr = arr[0]
+            
+            ax.imshow(arr, cmap='viridis', origin='lower')
+            ax.axis('off')
+            if filenames and idx < len(filenames):
+                ax.set_title(filenames[idx], fontsize=8)
+        
+        # blank out any unused subplots
+        for ax in axes.flat[len(idxs):]:
+            ax.axis('off')
+        
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.savefig(f"./classifier/{cls}_{set_name}_images.png", dpi=300)
+        plt.close(fig)
 
 def plot_cut_flow_for_all_filters(images, labels, num_thresholds=11, region_size=(64, 64), save_path_prefix="cut_flow"):
     """
@@ -1136,48 +1176,6 @@ def _to_2d_for_imshow(x, how="first"):
     # Ensure float32 ndarray
     return np.asarray(img, dtype=np.float32)
 
-def plot_class_images(images, labels, filenames=None, set_name='train'):
-    # ensure labels are a plain list of ints
-    if isinstance(labels, torch.Tensor):
-        labels = labels.tolist()
-
-    # if images have more than one channel (C, H, W), only use the first channel
-    if isinstance(images, torch.Tensor) and images.ndim == 4:
-        images = [img[0] for img in images]
-    
-    desc_map = {c['tag']: c['description'] for c in get_classes()}
-    
-    for cls in sorted(set(labels)):
-        # collect up to 10 examples of this class
-        idxs = [i for i,l in enumerate(labels) if l == cls][:10]
-        if not idxs:
-            continue
-        
-        fig, axes = plt.subplots(2, 5, figsize=(10, 4))
-        fig.suptitle(f"{set_name} images for class {cls} – {desc_map.get(cls, '')}", fontsize=12)
-        
-        for ax, idx in zip(axes.flat, idxs):
-            img = images[idx]
-            arr = img.squeeze().cpu().numpy() if isinstance(img, torch.Tensor) else np.squeeze(img)
-            
-            # If multiple channels take the first channel
-            if arr.ndim == 3 and arr.shape[0] > 1:
-                arr = arr[0]
-            
-            ax.imshow(arr, cmap='viridis', origin='lower')
-            ax.axis('off')
-            if filenames and idx < len(filenames):
-                ax.set_title(filenames[idx], fontsize=8)
-        
-        # blank out any unused subplots
-        for ax in axes.flat[len(idxs):]:
-            ax.axis('off')
-        
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-        plt.savefig(f"./classifier/{cls}_{set_name}_images.png", dpi=300)
-        plt.close(fig)
-
-
 def balance_classes(images, labels):
     """
     Randomly down‐sample each class so they all have the same number of samples
@@ -1480,10 +1478,9 @@ def augment_images(
     cumulative_augmented_images.extend(augmented_images)
     cumulative_augmented_labels.extend(augmented_labels)
     
+    # Convert cumulative lists to tensors
     augmented_images_tensor = torch.stack(cumulative_augmented_images)
     augmented_labels_tensor = torch.tensor(cumulative_augmented_labels)
-
-    # Convert cumulative lists to tensors
     if len(cumulative_augmented_labels) == 0:
             augmented_labels_tensor = torch.empty((0,) + labels.shape[1:], 
                                                 dtype=label_dtype, device=label_device)
@@ -1541,13 +1538,13 @@ def redistribute_excess(train_images, train_labels,
     per_class = math.ceil((total * 0.10) / n_cls)
     per_class = min(per_class, min(len(bins[c]) for c in target_classes))
     
-    # 4) Deterministically split each bin by hash, preserving both img+fname
+    # 4) Split each bin by hash, preserving both img+fname
     new_eval_imgs, new_eval_lbls, new_eval_fnames = [], [], []
     new_train_imgs, new_train_lbls, new_train_fnames = [], [], []
-    for cls in sorted(target_classes):
+
+    for cls in target_classes:
         items = bins[cls]
-        items_sorted = sorted(items, key=lambda x: (hashlib.sha1(str(x[1]).encode("utf-8")).hexdigest(), str(x[1])))
-        
+        items_sorted = sorted(items, key=lambda x: img_hash(x[0]))
         ev = items_sorted[:per_class]
         tr = items_sorted[per_class:]
         new_eval_imgs   += [x[0] for x in ev]
@@ -1591,78 +1588,7 @@ def redistribute_excess(train_images, train_labels,
         eval_imgs2,  eval_lbls2,
         new_eval_fnames  if eval_filenames  else [],
     )
-
-def bitold_redistribute_excess(train_images, train_labels, eval_images, eval_labels, target_classes):
-    """
-    Deterministically re‐split pooled train+eval so that:
-      1) evaluation set is exactly balanced across target_classes
-      2) |eval| ≥ 10% of total images
-    """
-    # 1) Pool everything
-    all_imgs = list(train_images) + list(eval_images)
-    all_lbls = list(train_labels) + list(eval_labels)
-
-    # 2) Group by class
-    bins = defaultdict(list)
-    for img, lbl in zip(all_imgs, all_lbls):
-        bins[int(lbl)].append(img)
-
-    # 3) Compute how many per class to put in eval:
-    total = len(all_imgs)
-    n_cls = len(target_classes)
-    per_class = math.ceil((total * 0.10) / n_cls)
-    per_class = min(per_class, min(len(bins[c]) for c in target_classes))
-
-    # 4) Deterministically split each bin by sorting on img_hash
-    def img_hash(tensor):
-        arr = tensor.cpu().numpy().tobytes()
-        return hashlib.sha1(arr).hexdigest()
-
-    new_eval_imgs, new_eval_lbls = [], []
-    new_train_imgs, new_train_lbls = [], []
-
-    for cls in sorted(target_classes):
-        imgs = bins[cls]
-        # sort by hash so that "first" per_class is reproducible
-        imgs_sorted = sorted(imgs, key=img_hash)
-        ev = imgs_sorted[:per_class]
-        tr = imgs_sorted[per_class:]
-        new_eval_imgs += ev
-        new_eval_lbls += [cls] * len(ev)
-        new_train_imgs += tr
-        new_train_lbls += [cls] * len(tr)
-
-    # 5) Convert back to original types
-    # — Images —
-    if isinstance(train_images, torch.Tensor):
-        # preserve shape if no examples
-        train_imgs2 = (torch.stack(new_train_imgs)
-                       if new_train_imgs
-                       else torch.empty((0,)+train_images.shape[1:]))
-    else:
-        train_imgs2 = new_train_imgs
-
-    if isinstance(eval_images, torch.Tensor):
-        eval_imgs2 = (torch.stack(new_eval_imgs)
-                      if new_eval_imgs
-                      else torch.empty((0,)+eval_images.shape[1:]))
-    else:
-        eval_imgs2 = new_eval_imgs
-
-    # — Labels —
-    if isinstance(train_labels, torch.Tensor):
-        train_lbls2 = torch.tensor(new_train_lbls, dtype=train_labels.dtype)
-    else:
-        train_lbls2 = new_train_lbls
-
-    if isinstance(eval_labels, torch.Tensor):
-        eval_lbls2 = torch.tensor(new_eval_lbls, dtype=eval_labels.dtype)
-    else:
-        eval_lbls2 = new_eval_lbls
-
-    return train_imgs2, train_lbls2, eval_imgs2, eval_lbls2
-
-        
+    
 ##########################################################################################
 ################################## SPECIFIC DATASET LOADER ###############################
 ##########################################################################################
@@ -2231,8 +2157,6 @@ def load_PSZ2(
         return re.sub(r'T\d+kpc.*$', '', base)
     _seen_sources = set()
     
-    print("versions:", versions)
-
     # ============= multi-version stack =============
     if isinstance(versions, (list, tuple)) and len(versions) > 1:
         # prefer a taper present in versions; else RAW
@@ -2393,7 +2317,7 @@ def load_PSZ2(
         tag = _kpc_tag(versions)
         for cls in target_classes:
             sub = classes_map.get(cls)
-            print("Processing class:", cls, "subfolder:", sub)
+            #print("Processing class:", cls, "subfolder:", sub)
             if not sub:
                 continue
 
@@ -2463,7 +2387,7 @@ def load_PSZ2(
                     Hwant, Wwant = Ho, Wo
                     proc_path = os.path.join(
                         processed_dir,
-                        f"{src_name}_{tag}_fmt_{Hwant}x{Wwant}.fits" # This is the used file name
+                        f"{src_name}_{tag}_fmt_{Hwant}x{Wwant}_old.fits" # This is the used file name
                     )
                     if os.path.isfile(proc_path):
                         arr = np.squeeze(fits.getdata(proc_path)).astype(np.float32)
@@ -2835,27 +2759,40 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
         eval_images  = all_images[len(train_images):]
        
     if NORMALISETOPM:
-        if DEBUG:
-            print("Applying normalise to ±1")
         all_images = torch.cat([train_images, eval_images], dim=0)
         all_images = normalise_images(all_images, out_min=-1, out_max=1)
         train_images = all_images[:len(train_images)]
         eval_images  = all_images[len(train_images):]
-    
-    if STRETCH:
         if DEBUG:
-            print("Applying asinh stretch")
+            print("Applying normalise to ±1")
+            plot_class_images(train_images, train_labels, train_filenames, set_name='train_2.after_normalisation')
+            plot_class_images(eval_images,  eval_labels,  eval_filenames,  set_name='eval_2.after_normalisation')
+
+    if STRETCH:
         # Concatenate so train/eval get the exact same mapping
         alpha = 10.0
         all_images = torch.cat([train_images, eval_images], dim=0)
+        
+        # THIS IS THE SAME AS IN DL2
+        images = np.stack([img.squeeze().numpy() for img in all_images], axis=0)
+        pct = torch.from_numpy(images).float()     
+        images = asinh_stretch(pct, alpha=10) #Alt: log_stretch
+        train_images = images[:len(train_images)]
+        eval_images  = images[len(train_images):]
+        
+        if False: # This is in DL1
+            # Asinh stretch (elementwise), preserves shape/device/dtype
+            stretched = torch.asinh(all_images * alpha) / math.asinh(alpha)
 
-        # Asinh stretch (elementwise), preserves shape/device/dtype
-        stretched = torch.asinh(all_images * alpha) / math.asinh(alpha)
-
-        # Split back
-        n_tr = train_images.shape[0]
-        train_images = stretched[:n_tr]
-        eval_images  = stretched[n_tr:]
+            # Split back
+            n_tr = train_images.shape[0]
+            train_images = stretched[:n_tr]
+            eval_images  = stretched[n_tr:]
+        
+        if DEBUG:
+            print("Applying asinh stretch")
+            plot_class_images(train_images, train_labels, train_filenames, set_name='train_3.after_stretching')
+            plot_class_images(eval_images,  eval_labels,  eval_filenames,  set_name='eval_3.after_stretching')
 
     # Always redistribute excess images for the test data, for fair evaluation
     classes_present = torch.unique(torch.cat([torch.tensor(train_labels), torch.tensor(eval_labels)])).tolist()

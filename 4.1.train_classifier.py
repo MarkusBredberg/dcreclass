@@ -1,5 +1,6 @@
 import os, re, time, random, pickle, hashlib, itertools, torch
-from utils.data_loader import load_galaxies, get_classes, get_synthetic, augment_images
+#from utils.data_loader import load_galaxies, get_classes, get_synthetic, augment_images
+from utils.data_loader import load_galaxies, get_classes, augment_images
 from utils.classifiers import RustigeClassifier, TinyCNN, MLPClassifier, SCNN, CNNSqueezeNet, ScatterResNet, DANNClassifier, BinaryClassifier, ScatterSqueezeNet, ScatterSqueezeNet2, DualCNNSqueezeNet
 from utils.training_tools import EarlyStopping, reset_weights
 from utils.calc_tools import cluster_metrics, normalise_images, check_tensor, fold_T_axis, compute_scattering_coeffs, custom_collate
@@ -59,10 +60,9 @@ num_experiments = 100
 folds = [5] # 0-4 for 5-fold cross validation, 5 for only one training
 lambda_values = [0]  # Ratio between generated images and original images per class. 8 is reserfved for TRAINONGENERATED
 percentile_lo = 30 # Percentile stretch lower bound
-percentile_hi = 90  # Percentile stretch upper bound
-versions = 'RT50kpc' # any mix of loadable and runtime-tapered planes. 'rt50' or 'rt100' for tapering. Square brackets for stacking
+percentile_hi = 99  # Percentile stretch upper bound
+versions = 'RAW' # any mix of loadable and runtime-tapered planes. 'rt50' or 'rt100' for tapering. Square brackets for stacking
 
-#PREFER_PROCESSED = True if versions != 'RAW' else False  # Prefer processed images if available (constant n_beams)
 PREFER_PROCESSED = False  
 STRETCH = True  # Arcsinh stretch
 USE_GLOBAL_NORMALISATION = False           # single on/off switch . False - image-by-image normalisation 
@@ -79,6 +79,9 @@ ES, patience = True, 10  # Use early stopping
 SCHEDULER = False  # Use a learning rate scheduler
 SHOWIMGS = True  # Show some generated images for each class (Tool for control)
 USE_MEMMAP = False  # Use memmap for scattering coefficients
+
+
+#PREFER_PROCESSED = True if versions != 'RAW' else False  # Prefer processed images if available (constant n_beams)
 
 # -------------------------- GAN CONFIGURATION --------------------------
 gan_epoch = 5000           # e.g., epoch number to load from
@@ -502,27 +505,25 @@ for gen_model_name in gen_model_names:
                 valid_fns = permute_like(valid_fns, perm_valid)
 
         else:
-            # real train + valid
-            _out = _loader(
-                galaxy_classes=galaxy_classes,
-                versions=versions,
-                fold=max(folds),
-                crop_size=crop_size,
-                downsample_size=downsample_size,
-                sample_size=max_num_galaxies, 
-                REMOVEOUTLIERS=FILTERED,
-                BALANCE=BALANCE,
-                STRETCH=STRETCH,
-                percentile_lo=percentile_lo,
-                percentile_hi=percentile_hi,
-                AUGMENT=not LATE_AUG,
-                NORMALISE=NORMALISEIMGS,
-                NORMALISETOPM=NORMALISEIMGSTOPM,
-                USE_GLOBAL_NORMALISATION=USE_GLOBAL_NORMALISATION,
-                GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
-                PRINTFILENAMES=PRINTFILENAMES,
-                PREFER_PROCESSED=PREFER_PROCESSED,
-                train=True)
+            _out  = _loader(galaxy_classes=galaxy_classes,
+                        versions=versions, 
+                        fold=max(folds), #Any fold other than 5 gives me the test data for the five fold cross validation
+                        crop_size=crop_size,
+                        downsample_size=downsample_size,
+                        sample_size=max_num_galaxies, 
+                        REMOVEOUTLIERS=FILTERED,
+                        BALANCE=BALANCE,           # Reduce the larger classes to the size of the smallest class
+                        STRETCH=STRETCH,
+                        percentile_lo=percentile_lo,  # Percentile stretch lower bound
+                        percentile_hi=percentile_hi,  # Percentile stretch upper bound
+                        AUGMENT=not LATE_AUG,
+                        NORMALISE=NORMALISEIMGS,
+                        NORMALISETOPM=NORMALISEIMGSTOPM,
+                        USE_GLOBAL_NORMALISATION=USE_GLOBAL_NORMALISATION,
+                        GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
+                        PRINTFILENAMES=PRINTFILENAMES,
+                        PREFER_PROCESSED=PREFER_PROCESSED,
+                        train=False)
 
             if len(_out) == 4:
                 train_images, train_labels, valid_images, valid_labels = _out

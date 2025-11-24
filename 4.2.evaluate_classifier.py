@@ -6,7 +6,6 @@ from sklearn.preprocessing import label_binarize
 from sklearn.manifold import TSNE
 from utils.data_loader import get_classes, load_galaxies, get_synthetic
 from collections import defaultdict
-from glob import glob
 import matplotlib.pyplot as plt
 import matplotlib.lines as mlines  # <-- For creating custom line legend entries
 from matplotlib.colors import LinearSegmentedColormap
@@ -134,6 +133,8 @@ if 'GAN' in generators:
 
 if TRAINONGENERATED:
     lambda_values = [8]  # To identify and distinguish TESTONGENERATED from other runs
+
+largest_sz = dataset_sizes[folds[-1]][-1]
     
 
 ############################################################
@@ -295,12 +296,13 @@ def robust_metric_histograms(
         if vals.size == 0 or not np.isfinite(vals).any():
             continue
 
-        p16, p50, p84 = np.percentile(vals, [16, 50, 84])
+        p16, p84 = np.percentile(vals, [16, 84])
+        mean = np.mean(vals)
         sigma68 = 0.5 * (p84 - p16)
 
         # parse for filenames/titles
         gparts = group_key.split("_")  # [generator, metric, subset, fold, lr, reg, lambda]
-        gen_name, metric_name = gparts[0], gparts[1]
+        generator, metric_name = gparts[0], gparts[1]
 
         vmin, vmax = float(np.min(vals)), float(np.max(vals))
         if vmin == vmax:
@@ -308,18 +310,25 @@ def robust_metric_histograms(
             vmin, vmax = vmin - eps, vmax + eps
         edges = np.linspace(vmin, vmax, 21)
 
-        plt.figure(figsize=(5, 3.2))
-        plt.hist(vals, bins=edges, edgecolor="none", alpha=0.8)
-        for x, style in [(p16, ":"), (p50, "-"), (p84, ":")]:
-            plt.axvline(x, linestyle=style)
+        plt.figure(figsize=(5, 3))
+        plt.hist(vals, bins=edges, color='#77dd77', edgecolor="none", alpha=0.8)
+        for x, style in [(p16, ":"), (mean, "-"), (p84, ":")]:
+            plt.axvline(x, linestyle=style, color='black')
+
+            # Add the actual x-values in text at the lower part (but not fully bottom to avoid overlap)
+            plt.text(x, plt.ylim()[0] + 0.2 * (plt.ylim()[1] - plt.ylim()[0]), f"{x:.3f}", rotation=90, verticalalignment='center', horizontalalignment='right' if style == ':' else 'left')
+
         plt.xlim(vmin, vmax)
-        plt.title(group_key)
-        plt.xlabel(metric_name)
+        plt.xlabel(metric_name.capitalize())
         plt.ylabel("Count")
         plt.tight_layout()
 
-        largest_sz = dataset_sizes[folds[-1]][-1]
-        save_path_hist = f"{save_dir}/{galaxy_classes}_{classifier}_{gen_name}_{largest_sz}_{metric_name}_histogram.pdf"
+        # Add legend that explains the lines are 68% intervals and mean
+        p16_line = mlines.Line2D([], [], color='black', linestyle=':', label='16th/84th percentiles')
+        mean_line = mlines.Line2D([], [], color='black', linestyle='-', label='Mean')
+        plt.legend(handles=[p16_line, mean_line], loc='upper left', fontsize=10)
+
+        save_path_hist = f"{save_dir}/{galaxy_classes}_{classifier}_{generator}_{largest_sz}_{lr}_{reg}_{lambda_generate}_{metric_name}_histogram.pdf"
         plt.savefig(save_path_hist, dpi=150)
         plt.close()
 
@@ -328,7 +337,7 @@ def robust_metric_histograms(
             "metric": metric_name,
             "n": int(vals.size),
             "p16": float(p16),
-            "p50": float(p50),
+            "mean": float(mean),
             "p84": float(p84),
             "sigma68": float(sigma68)
         })
@@ -553,13 +562,13 @@ def plot_overlap_image_grids(model, real_loader, gen_loader,
     closest_idx = order[:top_k]
     plot_grid(gen_imgs[closest_idx],
               "Top 25 Generated ➞ Real‐like",
-              f"{galaxy_classes}_{classifier}_{generator}_{dataset_sizes[folds[-1]][-1]}_gen_top25_real_like.pdf")
+              f"{galaxy_classes}_{classifier}_{generator}_{largest_sz}_{lr}_{reg}_{lambda_generate}_gen_top25_real_like.pdf")
 
     # furthest
     furthest_idx = order[-top_k:]
     plot_grid(gen_imgs[furthest_idx],
               "Top 25 Generated ➞ Outliers",
-              f"{galaxy_classes}_{classifier}_{generator}_{dataset_sizes[folds[-1]][-1]}_gen_top25_outliers.pdf")
+              f"{galaxy_classes}_{classifier}_{generator}_{largest_sz}_{lr}_{reg}_{lambda_generate}_gen_top25_outliers.pdf")
 
 def plot_accuracy_vs_lambda(lambda_values, metrics, generators, dataset_sizes=dataset_sizes,
                             folds=folds, num_experiments=num_experiments,
@@ -682,10 +691,11 @@ def plot_all_metrics_vs_dataset_size(
             plt.tight_layout()
 
             os.makedirs(save_dir, exist_ok=True)
-            fname = f'{save_dir}/{galaxy_classes}_{classifier}_{generator}_{dataset_sizes[folds[-1]][-1]}_{metric}_vs_dataset_size.pdf'
+            fname = f'{save_dir}/{galaxy_classes}_{classifier}_{generator}_{largest_sz}_{lr}_{reg}_{lambda_generate}_{metric}_vs_dataset_size.pdf'
             plt.savefig(fname)
             plt.close()
             print(f"Saved {title} vs Dataset Size plot to {fname}")
+
 
 def plot_avg_roc_curves(metrics, generators, dataset_sizes=dataset_sizes, merge_map=merge_map, 
                          folds= folds, num_experiments=num_experiments, 
@@ -693,16 +703,18 @@ def plot_avg_roc_curves(metrics, generators, dataset_sizes=dataset_sizes, merge_
                         galaxy_classes=galaxy_classes, 
                         class_descriptions={cls['tag']: cls['description'] for cls in classes}, 
                         save_dir='./classifier'):
+    from scipy.interpolate import make_interp_spline # To make the artificiallyjagged curve more smooth
+    
     min_label = min(galaxy_classes)
     adjusted_classes = [cls - min_label for cls in galaxy_classes]
-    fpr_grid = np.linspace(0, 1, 100)
+    fpr_grid = np.linspace(0, 1, 1000)
     for generator in generators:
         for lr in learning_rates:
             for reg in regularization_params:
                 for lambda_generate in lambda_values:
                     for s in range(len(dataset_sizes[0])):
+                        roc_values = {class_label: [] for class_label in adjusted_classes}
                         for experiment in range(num_experiments):
-                            roc_values = {class_label: [] for class_label in adjusted_classes}
                             for fold in folds:
                                 subset_size = dataset_sizes[fold][s]
                                 true_labels_dict = metrics[f"{generator}_all_true_labels_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"][0]
@@ -722,13 +734,15 @@ def plot_avg_roc_curves(metrics, generators, dataset_sizes=dataset_sizes, merge_
 
                                 # ROC is undefined if only one class is present in this fold; skip it.
                                 if np.unique(y).size < 2:
+                                    print(f"Skipping fold {fold} due to only one class present")
                                     continue
 
                                 if len(adjusted_classes) == 2:
                                     scores = pred_probs[:, 1] if pred_probs.ndim == 2 and pred_probs.shape[1] > 1 else pred_probs.ravel()
                                     fpr, tpr, _ = roc_curve(true_labels, scores, pos_label=1)
                                     interp_tpr = np.interp(fpr_grid, fpr, tpr)
-                                    roc_values[1].append(interp_tpr)
+                                    class_label = adjusted_classes[0] # True positive class label is the first in adjusted_classes
+                                    roc_values[class_label].append(interp_tpr)
                                 else:
                                     y_bin = label_binarize(y, classes=np.arange(len(adjusted_classes)))
                                     for i, class_label in enumerate(adjusted_classes):
@@ -736,84 +750,44 @@ def plot_avg_roc_curves(metrics, generators, dataset_sizes=dataset_sizes, merge_
                                         interp_tpr = np.interp(fpr_grid, fpr, tpr)
                                         roc_values[class_label].append(interp_tpr)
 
-                            fig, ax = plt.subplots(figsize=(8, 7), dpi=200)
-                            ax.tick_params(axis='both', which='major', labelsize=18, width=2, length=6)
-                            for spine in ax.spines.values():
-                                spine.set_linewidth(2)
-                            for class_label, galaxy_class in zip(adjusted_classes, galaxy_classes):
-                                if not roc_values[class_label]:
-                                    continue
-                                tpr_values = np.array(roc_values[class_label])
-                                mean_tpr = np.mean(tpr_values, axis=0)
-                                std_tpr = np.std(tpr_values, axis=0)
-                                mean_auc = auc(fpr_grid, mean_tpr)
-                                n = tpr_values.shape[0]
-                                ax.plot(fpr_grid, mean_tpr, lw=3.5,
-                                        label=f'Mean ROC (AUC={mean_auc:.2f}, n={n})')
-                                ax.fill_between(fpr_grid, mean_tpr - std_tpr, mean_tpr + std_tpr, alpha=0.25)
-
-                            ax.plot([0, 1], [0, 1], color='navy', lw=3, linestyle='--')
-                            ax.set_xlim([0.0, 1.0])
-                            ax.set_ylim([0.0, 1.05])
-                            ax.set_xlabel('False Positive Rate', fontsize=22)
-                            ax.set_ylabel('True Positive Rate', fontsize=22)
-                            merged_subset_key = merge_map.get(subset_size, str(subset_size))
-                            ax.legend(loc="lower right", fontsize=18)
-                            os.makedirs(save_dir, exist_ok=True)
-                            plt.savefig(f'{save_dir}/{galaxy_classes}_{classifier}_{generator}_{merged_subset_key}_{lr}_{reg}_{lambda_generate}_avg_roc_curve.pdf')
-                            plt.close(fig)
-                print(f"Saved average ROC curve at {save_dir}/{galaxy_classes}_{classifier}_{generator}_{merged_subset_key}_{lr}_{reg}_{lambda_generate}_avg_roc_curve.pdf")
-
-
-def plot_roc_curves(metrics, generators, dataset_sizes=dataset_sizes,  folds= folds, num_experiments=num_experiments, learning_rates=learning_rates, regularization_params=regularization_params, 
-                    galaxy_classes=galaxy_classes, class_descriptions={cls['tag']: cls['description'] for cls in classes}, save_dir='./classifier'):
-    min_label = min(galaxy_classes)
-    adjusted_classes = [cls - min_label for cls in galaxy_classes]
-    for generator in generators:
-        for fold in folds:
-            for lr in learning_rates:
-                for reg in regularization_params:
-                    for lambda_generate in lambda_values:
-                        for subset_size in dataset_sizes[fold]:
-                            if subset_size not in merge_map:
+                        fig, ax = plt.subplots(figsize=(10, 10), dpi=300)
+                        ax.tick_params(axis='both', which='major', labelsize=18, width=2, length=6)
+                        for spine in ax.spines.values():
+                            spine.set_linewidth(2)
+                        for class_label, galaxy_class in zip(adjusted_classes, galaxy_classes):
+                            if not roc_values[class_label]:
                                 continue
-                             
-                            for experiment in range(num_experiments):
-                                key = f"{generator}_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"
-                                true_labels = metrics[f"{generator}_all_true_labels_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"][0]
-                                pred_probs = metrics[f"{generator}_all_pred_probs_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"][0]
-                                true_labels = true_labels[key]
-                                pred_probs = np.array(pred_probs[key])
-                                if len(true_labels) == 0 or len(pred_probs) == 0:
-                                    continue
-                                fig, ax = plt.subplots(figsize=(6, 5))
-                                if len(galaxy_classes) == 2:
-                                    if pred_probs.ndim == 2 and pred_probs.shape[1] > 1:
-                                        scores = pred_probs[:, 1]
-                                    else:
-                                        scores = pred_probs.reshape(-1)
-                                    positive = galaxy_classes[1]
-                                    fpr, tpr, _ = roc_curve(true_labels, scores, pos_label=positive)
-                                    roc_auc = auc(fpr, tpr)
-                                    ax.plot(fpr, tpr, lw=2, label=f'ROC (AUC = {roc_auc:.2f})')
-                                else:
-                                    # your existing multi‐class loop
-                                    true_bin = label_binarize(true_labels, classes=np.arange(len(adjusted_classes)))
-                                    for i, cls in enumerate(adjusted_classes):
-                                        fpr, tpr, _ = roc_curve(true_bin[:, i], pred_probs[:, i])
-                                        auc_i = auc(fpr, tpr)
-                                        ax.plot(fpr, tpr, lw=2, label=f'{class_descriptions[galaxy_classes[i]]} (AUC={auc_i:.2f})')
-                                    
-                                ax.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
-                                ax.set_xlim([0.0, 1.0])
-                                ax.set_ylim([0.0, 1.05])
-                                ax.set_xlabel('False Positive Rate', fontsize=18)
-                                ax.set_ylabel('True Positive Rate', fontsize=18)
-                                ax.set_title(f'ROC Curve - {generator} \n {subset_size}, Fold {fold}, Experiment {experiment}', fontsize=16)
-                                ax.legend(loc="lower right")
-                                os.makedirs(save_dir, exist_ok=True)
-                                plt.savefig(f'{save_dir}/{galaxy_classes}_{classifier}_{generator}_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}_roc_curve.pdf')
-                                plt.close(fig)
+                            tpr_values = np.array(roc_values[class_label])
+                            mean_tpr = np.mean(tpr_values, axis=0)
+                            std_tpr = np.std(tpr_values, axis=0)
+                            tpr_p16, tpr_p84 = np.percentile(tpr_values, [16, 84], axis=0)                            
+                            mean_auc = auc(fpr_grid, mean_tpr)
+                            n = tpr_values.shape[0] # number of runs
+                            auc_values = [auc(fpr_grid, tpr_values[i, :]) for i in range(n)]
+                            std_auc = np.std(auc_values)
+                            auc_p16, auc_p84 = np.percentile(auc_values, [16, 84])
+                            print(f"Class {class_descriptions.get(galaxy_class, str(galaxy_class))}: AUC={mean_auc:.3f}=±{std_auc:.3f}, 16th={auc_p16:.3f}, 84th={auc_p84:.3f}, runs={n}")
+                            ax.plot(fpr_grid, mean_tpr, lw=3.5, color='#77dd77',
+                                    label=f'Mean ROC (AUC={mean_auc:.3f}, 16th={auc_p16:.3f}, 84th={auc_p84:.3f})')
+                            # Add shaded percentile region
+                            ax.fill_between(fpr_grid,
+                                            np.clip(tpr_p16, 0, 1),
+                                            np.clip(tpr_p84, 0, 1),
+                                            color='#77dd77', alpha=0.3,
+                                            label=f'68% confidence interval (runs={n})')
+
+                        ax.plot([0, 1], [0, 1], color='black', lw=3, linestyle='--')
+                        ax.set_xlim([0.0, 1.0])
+                        ax.set_ylim([0.0, 1.05])
+                        ax.set_xlabel('False Positive Rate', fontsize=22)
+                        ax.set_ylabel('True Positive Rate', fontsize=22)
+                        merged_subset_key = merge_map.get(subset_size, str(subset_size))
+                        ax.legend(loc="lower right", fontsize=18)
+                        os.makedirs(save_dir, exist_ok=True)
+                        plt.savefig(f'{save_dir}/{galaxy_classes}_{classifier}_{generator}_{largest_sz}_{lr}_{reg}_{lambda_generate}_avg_roc_curve.pdf')
+                        plt.close(fig)
+                print(f"Saved average ROC curve at {save_dir}/{galaxy_classes}_{classifier}_{generator}_{largest_sz}_{lr}_{reg}_{lambda_generate}_avg_roc_curve.pdf")
+
 
 def plot_diff_avg_std_confusion_matrix(metrics, generators, metric_stats,
     merge_map={249: "250", 250: "250", 2492: "2500", 2505: "2500", 24928: "25000", 25056: "25000"},
@@ -878,7 +852,7 @@ def plot_diff_avg_std_confusion_matrix(metrics, generators, metric_stats,
             ax.set_ylabel("True Label", fontsize=14)
             ax.set_title(f"Difference in Average Accuracy: {mean_diff:.2f} ± {std_diff:.2f}", fontsize=16)
             os.makedirs(save_dir, exist_ok=True)
-            save_path = f"{save_dir}/{galaxy_classes}_{classifier}_{generator}_{merged_size}_{lr}_{reg}_{lambda_vals[1]}-{lambda_vals[0]}_diff_confusion_matrix.pdf"
+            save_path = f"{save_dir}/{galaxy_classes}_{classifier}_{generator}_{largest_sz}_{lr}_{reg}_{lambda_vals[1]}-{lambda_vals[0]}_diff_confusion_matrix.pdf"
             plt.savefig(save_path)
             plt.close(fig)
 
@@ -948,42 +922,9 @@ def plot_avg_std_confusion_matrix(metrics, generators, metric_stats, merge_map={
                 cbar.ax.tick_params(labelsize=40)
 
                 os.makedirs(save_dir, exist_ok=True)
-                save_path = f"{save_dir}/{galaxy_classes}_{classifier}_{generator}_{subset_size}_{lr}_{reg}_{lambda_generate}_avg_confusion_matrix.pdf"
+                save_path = f"{save_dir}/{galaxy_classes}_{classifier}_{generator}_{largest_sz}_{lr}_{reg}_{lambda_generate}_avg_confusion_matrix.pdf"
                 plt.savefig(save_path, bbox_inches='tight')
                 plt.close(fig)
-
-
-def plot_confusion_matrix(metrics, generators, dataset_sizes=dataset_sizes,  folds= folds, num_experiments=num_experiments, 
-                          learning_rates=learning_rates, regularization_params=regularization_params, 
-                          galaxy_classes=galaxy_classes, lambda_values=lambda_values,
-                          class_descriptions=[cls['description'] for cls in classes if cls['tag'] in galaxy_classes], 
-                          save_dir='./classifier'):
-    for generator in generators:
-        for fold, lr, reg, lambda_generate, experiment in itertools.product(folds, learning_rates, regularization_params, lambda_values, range(num_experiments)):
-            for subset_size in dataset_sizes[fold]:
-                if subset_size <= 0:
-                    continue
-                key = f"{generator}_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"
-                true_labels = metrics[f"{generator}_all_true_labels_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"][0]
-                pred_labels = metrics[f"{generator}_all_pred_labels_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"][0]
-                true_labels = true_labels[key]
-                pred_labels = pred_labels[key]
-                if not true_labels or not pred_labels:
-                    continue
-                cm = confusion_matrix(true_labels, pred_labels, normalize='true')
-                fig, ax = plt.subplots(figsize=(6, 5))
-                sns.heatmap(cm, annot=True, fmt=".1%", linewidths=.5, square=True, cmap=cmap_green, ax=ax,
-                            xticklabels=class_descriptions, yticklabels=class_descriptions, annot_kws={"size": 16})
-                colorbar = ax.collections[0].colorbar
-                colorbar.ax.tick_params(labelsize=16)
-                accuracy = accuracy_score(true_labels, pred_labels)
-                ax.set_title(f'Model: {generator} \n Total accuracy: {accuracy*100:.2f}%', fontsize=16)
-                ax.set_ylabel('True label', fontsize=18)
-                ax.set_xlabel('Predicted label', fontsize=18)
-                save_path = f'{save_dir}/{galaxy_classes}_{classifier}_{generator}_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}_confusion_matrix.pdf'
-                plt.savefig(save_path)
-                plt.close()
- 
 
 def plot_loss(
     generators,
@@ -995,7 +936,8 @@ def plot_loss(
     learning_rates=learning_rates,
     regularization_params=regularization_params,
     classifier=classifier,
-    lambda_values=lambda_values
+    lambda_values=lambda_values,
+    save_dir='./classifier'
 ):
     sorted_lambdas = sorted(lambda_values)
     n_lambdas = len(sorted_lambdas)
@@ -1130,7 +1072,7 @@ def plot_loss(
                   ncol=2, columnspacing=1.2, handletextpad=0.7)
 
         plt.tight_layout()
-        plt.savefig(f"./classifier/{galaxy_classes}_{classifier}_{generator}_{dataset_sizes[-1][-1]}_{lr}_{reg}_loss.pdf")
+        plt.savefig(f"{save_dir}/{galaxy_classes}_{classifier}_{generator}_{largest_sz}_{lr}_{reg}_{lambda_generate}_loss.pdf")
         plt.close(fig)
 
 ###############################################
@@ -1153,14 +1095,14 @@ for lam in valid_lambda_values:
                     metrics_last[lam][metric].append(tot_metrics[k][0])
 
 # Pretty print rankings per λ
-for lam, stats in metrics_last.items():
-    print(f"\nRankings for λ = {lam}:\n")
-    for metric in ["accuracy", "precision", "recall", "f1_score"]:
-        vals = stats.get(metric, [])
-        print(f"{metric.capitalize()} Rankings (sorted by highest value):")
-        for rank, v in enumerate(sorted(vals, reverse=True), start=1):
-            print(f"{rank}: {metric.capitalize()}: {v:.4f}")
-        print()
+#for lam, stats in metrics_last.items():
+#    print(f"\nRankings for λ = {lam}:\n")
+#    for metric in ["accuracy", "precision", "recall", "f1_score"]:
+#        vals = stats.get(metric, [])
+#        print(f"{metric.capitalize()} Rankings (sorted by highest value):")
+#        for rank, v in enumerate(sorted(vals, reverse=True), start=1):
+#            print(f"{rank}: {metric.capitalize()}: {v:.4f}")
+#        print()
 
 # Mean ± Std per λ
 for lam, stats in metrics_last.items():
@@ -1337,10 +1279,10 @@ if any(lam > 0 for lam in lambda_values):
             device=device,
             perplexity=30,
             n_iter=1000,
-            save_path=f"./classifier/{galaxy_classes}_{classifier}_{generator}_{dataset_sizes[folds[-1]][-1]}_tsne.pdf"
+            save_path=f"./classifier/{galaxy_classes}_{classifier}_{generator}_{largest_sz}_tsne.pdf"
         )
         visualize_tsne_by_class(model, real_loader, gen_loader, wrappername, device=device,
-                                save_path=f"./classifier/{galaxy_classes}_{classifier}_{generator}_{dataset_sizes[folds[-1]][-1]}_tsne_by_class.pdf"
+                                save_path=f"./classifier/{galaxy_classes}_{classifier}_{generator}_{largest_sz}_tsne_by_class.pdf"
         )
 
         plot_overlap_image_grids(model, real_loader, gen_loader, device=device)
@@ -1349,11 +1291,9 @@ if any(lam > 0 for lam in lambda_values):
 # ——— Make plots ———
 plot_loss(generators, history=history)
 robust_metric_histograms(metrics)
-#plot_roc_curves(metrics, generators)
 plot_avg_roc_curves(metrics, generators, merge_map=merge_map)
-plot_all_metrics_vs_dataset_size(metrics, generators, merge_map=merge_map)
+#plot_all_metrics_vs_dataset_size(metrics, generators, merge_map=merge_map)
 #plot_accuracy_vs_lambda(lambda_values, metrics, generators)
-#plot_confusion_matrix(metrics, generators)
 plot_avg_std_confusion_matrix(metrics, generators, metric_stats=metrics_last, merge_map=merge_map)
 #plot_diff_avg_std_confusion_matrix(metrics, generators, metric_stats=metrics_last, merge_map=merge_map)
 

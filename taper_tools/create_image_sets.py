@@ -563,11 +563,9 @@ def make_montage(source_name: str,
                                                [I_fmt_np, RT_fmt_np, T_fmt_np],
                                                [H_i_fmt, H_rt_fmt, H_t_fmt]):
             fout = out_fits_dir / f"{source_name}_{type_label}_fmt_{Ho}x{Wo}_{scale_factor}.fits"
-            if fout.exists():
-                print(f"[info] Overwriting existing FITS {fout}")
             fits.writeto(fout, np_map.astype(np.float32), H_vers, overwrite=True)
             report_nans(fout)
-        print(f"[info] Saved formatted FITS to {out_fits_dir} under names like {source_name}_RAW_fmt_{Ho}x{Wo}_{scale_factor}.fits")
+        #print(f"[info] Saved formatted FITS to {out_fits_dir} under names like {source_name}_RAW_fmt_{Ho}x{Wo}_{scale_factor}.fits")
 
 
 # --------------------------------- CLI ---------------------------------------

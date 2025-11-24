@@ -1,30 +1,25 @@
-import torch, math, time, random, re, sys, os, glob, pickle, itertools, matplotlib
-import numpy as np
-import torch.nn as nn
-from torch.utils.data import TensorDataset, DataLoader, Subset, Dataset
-from torchsummary import summary
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score 
-from utils.data_loader import load_galaxies, get_classes,  get_synthetic, augment_images, apply_formatting
+import os, re, time, random, pickle, hashlib, itertools, torch
+#from utils.data_loader import load_galaxies, get_classes, get_synthetic, augment_images
+from utils.data_loader2_old import load_galaxies, get_classes, augment_images
 from utils.classifiers import RustigeClassifier, TinyCNN, MLPClassifier, SCNN, CNNSqueezeNet, ScatterResNet, DANNClassifier, BinaryClassifier, ScatterSqueezeNet, ScatterSqueezeNet2, DualCNNSqueezeNet
 from utils.training_tools import EarlyStopping, reset_weights
 from utils.calc_tools import cluster_metrics, normalise_images, check_tensor, fold_T_axis, compute_scattering_coeffs, custom_collate
 from utils.plotting import plot_histograms, plot_images_by_class, plot_image_grid, plot_background_histogram
-from torchvision.utils import make_grid, save_image
+import numpy as np
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import AdamW
+from torch.utils.data import TensorDataset, DataLoader, Subset
+from torchsummary import summary
 from kymatio.torch import Scattering2D
-from scipy.ndimage import gaussian_filter
-from collections import defaultdict, Counter
-from astropy.io import fits
-from astropy.convolution import convolve_fft, Gaussian2DKernel
-from functools import lru_cache
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 import pandas as pd
 from tqdm import tqdm
-from torch.optim import AdamW
-from itertools import product
-from sklearn.metrics import confusion_matrix
-import seaborn as sns
-import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plts
 
-SEED = 42  # Set a seed for reproducibility
+SEED = 41  # Set a seed for reproducibility # Original: 42
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -36,71 +31,89 @@ def set_seed(seed):
 
 set_seed(SEED)
 
+print("Running script 4.1train_classifier_edit.py. Latest version with seed", SEED)
 
-os.makedirs('./classifier/trained_models', exist_ok=True)
-os.makedirs('./classifier/trained_models_filtered', exist_ok=True)
-matplotlib.use('Agg')
-tqdm.pandas(disable=True)
-
-print("Running script 4.1 when busy Latest version with seed", SEED)
-
-#Update the classifiers so that they are okay for just two classes
 #EDIT: Allow for max_num_galaxies as None
 
 ###############################################
 ################ CONFIGURATION ################
 ###############################################
-
-classes = get_classes()
-galaxy_classes = [50, 51]  # Classes to classify
-max_num_galaxies = 1000000  # Upper limit for the all-classes combined training data before classical augmentation
-dataset_portions = [1]  # Portions of complete dataset for the accuracy vs dataset size
-J, L, order = 2, 12, 2  # Scatter transform parameters
+galaxy_classes    = [50, 51]
+max_num_galaxies  = 1000000  # Upper limit for the all-classes combined training data before classical augmentation
+dataset_portions  = [1]
+J, L, order       = 2, 12, 2
 classifier = ["TinyCNN", # Very Simple CNN
               "Rustige", # Simple CNN from Rustige et al. 2023, https://github.com/floriangriese/wGAN-supported-augmentation/blob/main/src/Classifiers/SimpleClassifiers/Classifiers.py
               "SCNN", # Simple CNN similar to Rustige's
               "CNNSqueezeNet", # SCNN with Squeeze-and-Excitation blocks
               "DualCNNSqueezeNet", # Dual CNN with Squeeze-and-Excitation blocks
-              "CloudNet", # From https://github.com/SorourMo/Cloud-Net-A-semantic-segmentation-CNN-for-cloud-detection/tree/master
               "DANN", # Domain-Adversarial Neural Network
               "ScatterNet", "ScatterSqueezeNet", "ScatterSqueezeNet2",
               "Binary", "ScatterResNet"][-4]
 gen_model_names = ['DDPM'] #['ST', 'DDPM', 'wGAN', 'GAN', 'Dual', 'CNN', 'STMLP', 'lavgSTMLP', 'ldiffSTMLP'] # Specify the generative model_name
-label_smoothing = 0  # Label smoothing for the classifier
-num_experiments = 100
-learning_rates = [1e-3]  # Learning rates
-regularization_params = [1e-4]  # Regularisation parameters
-percentile_lo = 60 # Percentile stretch lower bound
-percentile_hi = 99  # Percentile stretch upper bound
-versions = ['rt50kpc']  # any mix of loadable and runtime-tapered planes. 'rt50' or 'rt100' for tapering. Square brackets for stacking
-folds = [5] # 0-4 for 5-fold cross validation, 5 for only one training
-lambda_values = [0]  # Ratio between generated images and original images per class. 8 is reserfved for TRAINONGENERATED
 num_epochs_cuda = 200
 num_epochs_cpu = 100
+learning_rates = [1e-3]
+regularization_params = [1e-3]  
+label_smoothing = 0.2  
+num_experiments = 100 
+folds = [5] # 0-4 for 5-fold cross validation, 5 for only one training
+lambda_values = [0]  # Ratio between generated images and original images per class. 8 is reserfved for TRAINONGENERATED
+percentile_lo = 30 # Percentile stretch lower bound
+percentile_hi = 99  # Percentile stretch upper bound
+versions = 'RAW' # any mix of loadable and runtime-tapered planes. 'rt50' or 'rt100' for tapering. Square brackets for stacking
 
-FLUX_CLIPPING = False  # Clip the flux of the images
-STRETCH = True  # Stretch the images with mathematical morphology
-USE_GLOBAL_NORMALISATION = True           # single on/off switch . False - image-by-image normalisation 
-GLOBAL_NORM_MODE = "percentile"           # "percentile" or "flux"
-ES, patience = True, 10  # Use early stopping
-SCHEDULER = False  # Use a learning rate scheduler
-SHOWIMGS = True  # Show some generated images for each class (Tool for control)
+DL2 = True  # Whether to use the DL2 data loader 
 
-NORMALISEIMGS = True  # Globally normalise images to [0, 1]
-NORMALISEIMGSTOPM = False  # Globally normalise images to [-1, 1] 
-NORMALISESCS = False  # Normalise scattering coefficients to [0, 1]
-NORMALISESCSTOPM = False  # Normalise scattering coefficients to [-1, 1]
+if DL2:
+    FLUX_CLIPPING = False  # Clip the flux of the images
+    STRETCH = True  # Stretch the images with mathematical morphology
+    ES, patience = True, 10  # Use early stopping
+    SCHEDULER = False  # Use a learning rate scheduler
+    SHOWIMGS = True  # Show some generated images for each class (Tool for control)
+    NORMALISEIMGS = True  # Globally normalise images to [0, 1]
+    NORMALISEIMGSTOPM = False  # Globally normalise images to [-1, 1] 
+    NORMALISESCS = False  # Normalise scattering coefficients to [0, 1]
+    NORMALISESCSTOPM = False  # Normalise scattering coefficients to [-1, 1]
+    BALANCE = True if galaxy_classes == [52, 53] else False  # Balance the dataset by undersampling the majority class
+    USE_CLASS_WEIGHTS = True  # Set to False to disable class weights
+    FILTERED = True  # Remove in training, validation and test data for the classifier
+    FILTERGEN = False  # Remove generated images that are too similar to other generated images
+    HISTOGRAMMATCHING = False  # Histogram matching for generated images
+    USE_MEMMAP = False  # Use memmap for scattering coefficients
+    SIGMACLIPPONDDPM = False  # Apply sigma clipping to DDPM data
+    LATE_AUG = False  # Apply augmentations after PSF matching
+    PRINTFILENAMES = False  # Print filenames when loading data
+    
+    TRAINONGENERATED = False  # Use generated data as testdata
+    USE_GLOBAL_NORMALISATION = False           # single on/off switch . False - image-by-image normalisation 
+    GLOBAL_NORM_MODE = "percentile"           # "percentile" or "flux". Becomes "none" if USE_GLOBAL_NORMALISATION is 
+    PREFER_PROCESSED = False  # For data_loader2 (dl2)
+    
+else:
+    # For data_loader (not dl2)
+    PREFER_PROCESSED = False  
+    STRETCH = True  # Arcsinh stretch
+    USE_GLOBAL_NORMALISATION = False           # single on/off switch . False - image-by-image normalisation 
+    GLOBAL_NORM_MODE = "percentile"           # "percentile" or "flux". Becomes "none" if USE_GLOBAL_NORMALISATION is 
+    NORMALISEIMGS = True  # Normalise images to [0, 1]
+    NORMALISEIMGSTOPM = False  # Normalise images to [-1, 1] 
+    NORMALISESCS = False  # Normalise scattering coefficients to [0, 1]
+    NORMALISESCSTOPM = False  # Normalise scattering coefficients to [-1, 1]
+    FILTERED = True  # Remove in training, validation and test data for the classifier
+    FILTERGEN = False  # Remove generated images that are too similar to other generated images
+    USE_CLASS_WEIGHTS = True  # Set to False to disable class weights
+    TRAINONGENERATED = False  # Use generated data as testdata
+    ES, patience = True, 10  # Use early stopping
+    SCHEDULER = False  # Use a learning rate scheduler
+    SHOWIMGS = True  # Show some generated images for each class (Tool for control)
+    USE_MEMMAP = False  # Use memmap for scattering coefficients
+    
+    BALANCE = True if galaxy_classes == [52, 53] else False  # Balance the dataset by undersampling the majority class
+    LATE_AUG = False  # Apply augmentations after PSF matching
+    
 
-BALANCE = True if galaxy_classes == [52, 53] else False  # Balance the dataset by undersampling the majority class
-USE_CLASS_WEIGHTS = True  # Set to False to disable class weights
-TRAINONGENERATED = False  # Use generated data as testdata
-FILTERED = True  # Remove in training, validation and test data for the classifier
-FILTERGEN = False  # Remove generated images that are too similar to other generated images
-
-HISTOGRAMMATCHING = False  # Histogram matching for generated images
-USE_MEMMAP = False  # Use memmap for scattering coefficients
-SIGMACLIPPONDDPM = False  # Apply sigma clipping to DDPM data
-
+#PREFER_PROCESSED = True if versions != 'RAW' else False  # Prefer processed images if available (constant n_beams)
 
 # -------------------------- GAN CONFIGURATION --------------------------
 gan_epoch = 5000           # e.g., epoch number to load from
@@ -117,7 +130,6 @@ gan_lambda_div = 0
 gan_type = ['Simple', 'Advanced'][0]
 gan_data_version = 'clean' if FILTERED else 'full'  # 'full' or 'clean'
 
-
 # ---------------------------- VAE CONFIGURATION -----------------------------
 VAE_train_size = 1101128
 forbidden_classes = 12  # Generated bent sources look awful
@@ -125,6 +137,9 @@ forbidden_classes = 12  # Generated bent sources look awful
 #####################################################################################
 ########################### AUTOMATIC CONFIGURATION #################################
 #####################################################################################
+
+os.makedirs('./classifier/trained_models', exist_ok=True)
+os.makedirs('./classifier/trained_models_filtered', exist_ok=True)
     
 if any (cls in galaxy_classes for cls in [10, 11, 12, 13]):
     crop_size = (128, 128)  # Crop size for the images
@@ -135,8 +150,8 @@ elif galaxy_classes[0] in list(range(40, 49)):
     downsample_size = (128, 128)  # Downsample size for the images
     batch_size = 16
 elif galaxy_classes[0] in list(range(50, 60)):
-    crop_size = (1, 512, 512)  # Crop size for the images
-    downsample_size = (1, 128, 128)  # Downsample size for the images
+    crop_size = (512, 512)  # Crop size for the images
+    downsample_size = (128, 128)  # Downsample size for the images
     batch_size = 16 
 
 img_shape = downsample_size
@@ -148,25 +163,42 @@ if TRAINONGENERATED:
 if torch.cuda.is_available():
     DEVICE = "cuda"
     num_epochs = num_epochs_cuda
-    print(f"CUDA is available. Setting epochs to {num_epochs}.")
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    DEVICE = "mps"   # Apple silicon fallback if relevant
+    num_epochs = num_epochs_cpu
 else:
     DEVICE = "cpu"
     num_epochs = num_epochs_cpu
-    print(f"CUDA is not available. Setting epochs to {num_epochs}.")
-    
-ARCSEC = np.deg2rad(1/3600.0)
-PSZ2_ROOT = "/users/mbredber/scratch/data/PSZ2"  # FITS root used below
-
-# drive augmentation/filenames solely from presence of rt*
-LATE_AUG = bool(_gen_versions) # True if any(v.startswith('rt') for v in _gen_versions)
-PRINTFILENAMES = bool(_gen_versions)
-EXTRAVARS = False  # Use extra features (redshift, mass, size) for the classifier. Will automatically be true if test_meta is not None.
+print(f"{DEVICE.upper()} is available. Setting epochs to {num_epochs}.")
 
 if set(galaxy_classes) & {18} or set(galaxy_classes) & {19}:
     galaxy_classes = [20, 21, 21, 22, 23, 24, 25, 26, 27, 28, 29]  # Include all digits if 18 or 19 is in target_classes
 else:
     galaxy_classes = galaxy_classes
 num_classes = len(galaxy_classes)
+
+# —— MULTI-LABEL SWITCH for RH/RR ——
+if galaxy_classes == [52, 53]:
+    from utils.data_loader import load_halos_and_relics
+    import seaborn as sns
+    MULTILABEL = True            # predict RH and RR independently
+    LABEL_INDEX = {"RH": 0, "RR": 1}
+    THRESHOLD = 0.5
+else:
+    MULTILABEL = False
+
+_loader = load_halos_and_relics if galaxy_classes == [52, 53] else load_galaxies
+BALANCE = True if galaxy_classes == [52, 53] else False  # Balance the dataset by undersampling the majority class
+EXTRAVARS = False  # Use extra features (redshift, mass, size) for the classifier. Will automatically be true if test_meta is not None.
+LATE_AUG =  True if any(v.startswith('rt') for v in versions) else False  # Apply augmentations after tapering
+PRINTFILENAMES = True if any(v.startswith('rt') for v in versions) else False  # Print filenames if rt versions are used
+GLOBAL_NORM_MODE = "none" if not USE_GLOBAL_NORMALISATION else GLOBAL_NORM_MODE
+    
+if EXTRAVARS:
+    try:
+        from utils.classifiers import MetaWrapper  # only used if EXTRAVARS=True
+    except Exception:
+        MetaWrapper = None
 
 def _verkey(v):
     if isinstance(v, (list, tuple)):
@@ -178,113 +210,14 @@ ver_key = _verkey(versions)
 ##################### HELPER FUNCTIONS #################################
 ########################################################################
 
+def as_index_labels(y: torch.Tensor) -> torch.Tensor:
+    # returns 1-D class indices regardless of encoding
+    return y.argmax(dim=1) if y.ndim > 1 else y
 
-def _to_base_name(fn):
-    return Path(str(fn)).stem.split('T', 1)[0]
+def _as_5d(x):
+    return x if x.dim() == 5 else x.unsqueeze(1)  # [B,1,H,W] -> [B,1,1,H,W]
 
-def _first_recursive(pattern: str):
-    hits = sorted(glob.glob(pattern, recursive=True))
-    return hits[0] if hits else None
-
-def plot_first_rows_by_source(images, filenames, versions, out_path, n_show=10):
-    """
-    Plot the first N rows titled by source name. If images are [B,T,1,H,W] or [B,T,H,W],
-    show 2 columns (left/right = first/second plane). If single version, plot 1 column.
-    """
-
-    if isinstance(images, (list, tuple)):
-        images = torch.stack([torch.as_tensor(x) for x in images], dim=0)
-
-    # Normalize shape to convenient form
-    if images.dim() == 5:                 # [B, T, 1, H, W]
-        images = images.flatten(2, 3)     # [B, T, H, W]
-    elif images.dim() == 4:               # [B, C, H, W]
-        pass
-    else:
-        raise ValueError(f"Unsupported images ndim={images.ndim}")
-
-    B = images.shape[0]
-    n_show = min(n_show, B)
-
-    # Row titles from filenames (strip trailing T*kpc or T*kpcSUB)
-    names = (filenames[:n_show] if filenames else [f"idx_{i}" for i in range(n_show)])
-    def _src_name(s):
-        b = os.path.splitext(os.path.basename(str(s)))[0]
-        return re.sub(r'(?:T\d+kpc(?:SUB)?)$', '', b)
-    row_titles = [_src_name(s) for s in names]
-
-    is_two_cols = images.shape[1] >= 2      # have at least two planes (e.g., RT/T)
-    if is_two_cols:
-        fig, axes = plt.subplots(n_show, 2, figsize=(5.4, 2.6*n_show), constrained_layout=True)
-        if n_show == 1:
-            axes = np.array([axes])
-        for i in range(n_show):
-            left  = images[i, 0].detach().cpu().numpy()
-            right = images[i, 1].detach().cpu().numpy()
-            axes[i, 0].imshow(left, cmap="viridis", origin="lower")
-            axes[i, 0].set_title(f"{row_titles[i]} — {versions[0] if isinstance(versions,(list,tuple)) else 'v0'}")
-            axes[i, 0].axis('off')
-            axes[i, 1].imshow(right, cmap="viridis", origin="lower")
-            axes[i, 1].set_title(f"{row_titles[i]} — {versions[1] if isinstance(versions,(list,tuple)) else 'v1'}")
-            axes[i, 1].axis('off')
-    else:
-        fig, axes = plt.subplots(n_show, 1, figsize=(2.7, 2.6*n_show), constrained_layout=True)
-        if n_show == 1:
-            axes = [axes]
-        for i in range(n_show):
-            img = images[i, 0].detach().cpu().numpy()   # first/only channel
-            ax = axes[i]
-            ax.imshow(img, cmap="viridis", origin="lower")
-            ax.set_title(f"{row_titles[i]} — {versions if not isinstance(versions,(list,tuple)) else versions[0]}")
-            ax.axis('off')
-
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    plt.savefig(out_path, dpi=150)
-    plt.close()
-    print(f"[quicklook] wrote {out_path}")
-
-def _first(pattern: str):
-    hits = sorted(glob.glob(pattern))
-    return hits[0] if hits else None
-
-def _pixscale_arcsec(hdr):
-    if 'CDELT1' in hdr:  # deg/pix
-        return abs(hdr['CDELT1']) * 3600.0
-    cd11 = hdr.get('CD1_1'); cd12 = hdr.get('CD1_2', 0.0)
-    if cd11 is not None:
-        return float(np.hypot(cd11, cd12)) * 3600.0
-    raise KeyError("No CDELT* or CD* keywords in FITS header")
-
-def collapse_logits(logits, num_classes, multilabel):
-    # [B,C,H,W] → [B,C]
-    if logits.ndim == 4:
-        logits = torch.nn.functional.adaptive_avg_pool2d(logits, (1, 1)).squeeze(-1).squeeze(-1)
-    elif logits.ndim == 3:
-        logits = logits.mean(dim=-1)
-    # ensure [B,C]
-    if logits.ndim == 1:
-        logits = logits.unsqueeze(1)
-    if not multilabel and logits.shape[1] == 1 and num_classes == 2:
-        logits = torch.cat([-logits, logits], dim=1)
-    return logits
-
-def compute_classification_metrics(y_true, y_pred, multilabel, num_classes):
-    acc = accuracy_score(y_true, y_pred)
-    if multilabel:
-        avg = 'macro'
-        return acc, precision_score(y_true, y_pred, average=avg, zero_division=0), \
-                     recall_score(y_true, y_pred, average=avg, zero_division=0), \
-                     f1_score(y_true, y_pred, average=avg, zero_division=0)
-    if num_classes == 2:
-        return acc, precision_score(y_true, y_pred, average='binary', zero_division=0), \
-                     recall_score(y_true, y_pred, average='binary', zero_division=0), \
-                     f1_score(y_true, y_pred, average='binary', zero_division=0)
-    avg = 'macro'
-    return acc, precision_score(y_true, y_pred, average=avg, zero_division=0), \
-                 recall_score(y_true, y_pred, average=avg, zero_division=0), \
-                 f1_score(y_true, y_pred, average=avg, zero_division=0)
-
-def permute_like_old(x, perm, SEED=SEED):
+def permute_like(x, perm):
     if x is None: return None
     idx = perm.cpu().tolist()
     if isinstance(x, torch.Tensor): return x[perm]
@@ -292,31 +225,7 @@ def permute_like_old(x, perm, SEED=SEED):
     if isinstance(x, (list, tuple)): return [x[i] for i in idx]
     return x
 
-def permute_like(x, perm):
-    if x is None:
-        return None
-
-    # Torch tensors: deterministic gather via index_select and device-safe indices
-    if isinstance(x, torch.Tensor):
-        idx = perm.to(device=x.device, dtype=torch.long)
-        return x.index_select(0, idx)
-
-    # Prepare a plain integer index array once for non-tensor cases
-    if isinstance(perm, torch.Tensor):
-        idx = perm.detach().cpu().to(torch.long).tolist()
-    elif isinstance(perm, np.ndarray):
-        idx = [int(i) for i in perm.tolist()]
-    else:
-        idx = [int(i) for i in perm]
-
-    if isinstance(x, np.ndarray):
-        return x[np.asarray(idx, dtype=np.int64)]
-    if isinstance(x, list):
-        return [x[i] for i in idx]
-    if isinstance(x, tuple):
-        return tuple(x[i] for i in idx)
-    return x
-
+base_cls = min(galaxy_classes)
 def relabel(y):
     """
     Convert raw single-class ids to 2-bit multi-label targets [RH, RR].
@@ -324,25 +233,17 @@ def relabel(y):
     RR (53) -> [0,1]
     If you ever have 'both', set both bits to 1 *upstream*.
     """
-    y = y.long()
-    out = torch.zeros((y.shape[0], 2), dtype=torch.float32, device=y.device)
-    out[:, 0] = (y == 52).float()  # RH
-    out[:, 1] = (y == 53).float()  # RR
-    return out    
-
-def _per_image_percentile_stretch(x2d, lo=60, hi=95):
-    t = torch.as_tensor(x2d, dtype=torch.float32)
-    pl = torch.quantile(t.reshape(-1), lo/100.0)
-    ph = torch.quantile(t.reshape(-1), hi/100.0)
-    y = (t - pl) / (ph - pl + 1e-6)
-    return y.clamp(0, 1)
-
-def as_index_labels(y: torch.Tensor) -> torch.Tensor:
-    return y.argmax(dim=1) if y.ndim > 1 else y
+    if MULTILABEL:
+        y = y.long()
+        out = torch.zeros((y.shape[0], 2), dtype=torch.float32, device=y.device)
+        out[:, 0] = (y == 52).float()   # RH
+        out[:, 1] = (y == 53).float()   # RR
+        return out
+    return (y - base_cls).long()
 
 def collapse_logits(logits, num_classes, multilabel):
     if logits.ndim == 4:
-        logits = torch.nn.functional.adaptive_avg_pool2d(logits, (1, 1)).squeeze(-1).squeeze(-1)
+        logits = F.adaptive_avg_pool2d(logits, (1, 1)).squeeze(-1).squeeze(-1)
     elif logits.ndim == 3:
         logits = logits.mean(dim=-1)
     if logits.ndim == 1:
@@ -354,85 +255,43 @@ def collapse_logits(logits, num_classes, multilabel):
 def replicate_list(x, n):
     return [v for v in x for _ in range(int(n))]
 
+def shuffle_with_filenames(images, labels, filenames=None):
+    perm = torch.randperm(images.size(0))
+    images, labels = images[perm], labels[perm]
+    if filenames is not None:
+        filenames = [filenames[i] for i in perm.tolist()]
+    return images, labels, filenames
+
 def late_augment(images, labels, filenames=None, *, st_aug=False):
     """
     Apply your normal augmentations AFTER tapering.
     Returns (imgs_aug, labels_aug, filenames_aug).
-    If images is empty, this is a no-op.
+    The replication factor n_aug is inferred from sizes.
     """
-    if images is None or (isinstance(images, torch.Tensor) and images.numel() == 0):
-        return images, labels, filenames
     imgs_aug, labels_aug = augment_images(images, labels, ST_augmentation=st_aug)
-    n_aug = imgs_aug.size(0) // max(1, images.size(0))
+    n_aug = imgs_aug.size(0) // max(1, images.size(0))     # infer n_aug (e.g. 8 for 4 rotations × 2 flips)
     if filenames is not None:
         filenames = replicate_list(filenames, n_aug)
     return imgs_aug, labels_aug, filenames
-
-def _name_base_from_fn(fn):
-    stem = Path(str(fn)).stem
-    return stem.split('T', 1)[0]
-
-def _z_from_meta(name):                 # base like "PSZ2G192.18+56.12"
-    return CLUSTER_META.get(name)
-
-# put near your other helpers
-def _ensure_4d(x: torch.Tensor) -> torch.Tensor:
-    """Make images [B,C,H,W]. If [B,T,1,H,W], fold T into C."""
-    if x is None:
-        return x
-    if x.dim() == 5:
-        # [B, T, 1, H, W]  ->  [B, T, H, W] -> treat T as channels
-        return x.flatten(1, 2)  # fold_T_axis does the same; this is inline & fast
-    if x.dim() == 3:
-        return x.unsqueeze(1)
-    return x  # already [B,C,H,W]
-
-def _coerce_float(v):
-    try:
-        x = float(v); 
-        return x if np.isfinite(x) else None
-    except Exception:
-        pass
-    if isinstance(v, (bytes, bytearray)):
-        try: v = v.decode('utf-8', 'ignore')
-        except Exception: return None
-    if isinstance(v, str):
-        m = re.search(r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?', v)
-        if m:
-            try: return float(m.group(0))
-            except Exception: return None
-    return None
 
 
 ###############################################
 ########### DATA STORING FUNCTIONS ###############
 ###############################################
 
-
 def initialize_metrics(metrics,
                     model_name, subset_size, fold, experiment,
                     lr, reg, lam,
                     crop, down, ver):
-    # make a short stable string for each hyperparam
     cs = f"{crop[0]}x{crop[1]}"
     ds = f"{down[0]}x{down[1]}"
     key_base = (
-    f"{model_name}"
-    f"_ss{subset_size}"
-    f"_f{fold}"
-    f"_lr{lr}"
-    f"_reg{reg}"
-    f"_lam{lam}"
-    f"_cs{cs}"
-    f"_ds{ds}"
-    f"_ver{ver}"
+        f"{model_name}_ss{subset_size}_f{fold}_lr{lr}_reg{reg}_lam{lam}_cs{cs}_ds{ds}_ver{ver}"
     )
     metrics.setdefault(f"{key_base}_accuracy", [])
     metrics.setdefault(f"{key_base}_precision", [])
     metrics.setdefault(f"{key_base}_recall", [])
     metrics.setdefault(f"{key_base}_f1_score", [])
-
-    metrics[f"{key_base}_f1_score"]   = []
 
 def update_metrics(metrics,
                 model_name, subset_size, fold, experiment,
@@ -456,7 +315,7 @@ def update_metrics(metrics,
     metrics.setdefault(f"{key_base}_recall", []).append(recall)
     metrics.setdefault(f"{key_base}_f1_score", []).append(f1)
 
-    
+
 def initialize_history(history, model_name, subset_size, fold, experiment, lr, reg, lambda_generate):
     if model_name not in history:
         history[model_name] = {}
@@ -509,7 +368,7 @@ dataset_sizes = {}
 scattering = Scattering2D(J=J, L=L, shape=img_shape[-2:], max_order=order)      
 for gen_model_name in gen_model_names:
 
-    with torch.no_grad():
+    with torch.inference_mode():
         dummy = torch.zeros((1, *img_shape)).cpu()
         scat_dummy = scattering(dummy)
         if scat_dummy.dim()==5:
@@ -521,23 +380,45 @@ for gen_model_name in gen_model_names:
     hidden_dim2 = 128
     vae_latent_dim = 64
     
-    _out  = load_galaxies(galaxy_classes=galaxy_classes,
-                versions=_versions_to_load or ['raw'], 
-                fold=max(folds), #Any fold other than 5 gives me the test data for the five fold cross validation
-                crop_size=crop_size,
-                downsample_size=downsample_size,
-                sample_size=max_num_galaxies, 
-                REMOVEOUTLIERS=FILTERED,
-                BALANCE=BALANCE,           # Reduce the larger classes to the size of the smallest class
-                FLUX_CLIPPING=FLUX_CLIPPING,
-                STRETCH=STRETCH,
-                percentile_lo=percentile_lo,  # Percentile stretch lower bound
-                percentile_hi=percentile_hi,  # Percentile stretch upper bound
-                AUGMENT=not LATE_AUG,
-                NORMALISE=NORMALISEIMGS,
-                NORMALISETOPM=NORMALISEIMGSTOPM,
-                PRINTFILENAMES=PRINTFILENAMES,
-                train=False)
+    if DL2:
+        _versions_to_load = versions
+        _out = _loader(galaxy_classes=galaxy_classes,
+                    versions=_versions_to_load or ['raw'], 
+                    fold=max(folds), #Any fold other than 5 gives me the test data for the five fold cross validation
+                    crop_size=crop_size,
+                    downsample_size=downsample_size,
+                    sample_size=max_num_galaxies, 
+                    REMOVEOUTLIERS=FILTERED,
+                    BALANCE=BALANCE,           # Reduce the larger classes to the size of the smallest class
+                    FLUX_CLIPPING=FLUX_CLIPPING,
+                    STRETCH=STRETCH,
+                    percentile_lo=percentile_lo,  # Percentile stretch lower bound
+                    percentile_hi=percentile_hi,  # Percentile stretch upper bound
+                    AUGMENT=not LATE_AUG,
+                    NORMALISE=NORMALISEIMGS,
+                    NORMALISETOPM=NORMALISEIMGSTOPM,
+                    PRINTFILENAMES=PRINTFILENAMES,
+                    train=False)
+    else:
+        _out  = _loader(galaxy_classes=galaxy_classes,
+                    versions=versions, 
+                    fold=max(folds), #Any fold other than 5 gives me the test data for the five fold cross validation
+                    crop_size=crop_size,
+                    downsample_size=downsample_size,
+                    sample_size=max_num_galaxies, 
+                    REMOVEOUTLIERS=FILTERED,
+                    BALANCE=BALANCE,           # Reduce the larger classes to the size of the smallest class
+                    STRETCH=STRETCH,
+                    percentile_lo=percentile_lo,  # Percentile stretch lower bound
+                    percentile_hi=percentile_hi,  # Percentile stretch upper bound
+                    AUGMENT=not LATE_AUG,
+                    NORMALISE=NORMALISEIMGS,
+                    NORMALISETOPM=NORMALISEIMGSTOPM,
+                    USE_GLOBAL_NORMALISATION=USE_GLOBAL_NORMALISATION,
+                    GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
+                    PRINTFILENAMES=PRINTFILENAMES,
+                    PREFER_PROCESSED=PREFER_PROCESSED,
+                    train=False)
 
     if len(_out) == 4:
         train_images, train_labels, test_images, test_labels = _out
@@ -547,38 +428,26 @@ for gen_model_name in gen_model_names:
     elif len(_out) == 6:
         train_images, train_labels, test_images, test_labels, train_fns, test_fns = _out
         test_images, test_labels, test_fns = shuffle_with_filenames(test_images, test_labels, test_fns)
+
     else:
         raise ValueError(f"load_galaxies returned {len(_out)} values, expected 4 or 6")
 
     train_labels = relabel(train_labels)  # Will be used for the sanity check below
     test_labels  = relabel(test_labels)   # [0,1,...] aligning with galaxy_classes
-    unique_labels, counts = torch.unique(test_labels, return_counts=True)
-
-    # --- PSF matching for the test/eval set only (RAW → 50/100) ---
-    if _gen_versions:
-        if test_fns is None:
-            raise RuntimeError("versions includes rt*, but filenames were not returned. Set PRINTFILENAMES=True.")
-        test_images, test_labels, test_fns, info_test = _append_rt_versions(test_images, test_fns, _gen_versions, labels=test_labels)
-        print(f"[TEST] dropped {info_test['removed_total']} (kept {info_test['kept']}/{info_test['initial']})")
-        if REPLACE_WITH_RT:
-            test_images = test_images[:, 1:2]  # keep only the runtime-tapered plane
-            print(f"[TEST] after replacing with RT: {test_images.size(0)} images")
-
-        if LATE_AUG:
-            test_images, test_labels, test_fns = late_augment(test_images, test_labels, test_fns)
-            print(f"[TEST] after late augmentation: {test_images.size(0)} images")
-
+    if not MULTILABEL:
+        unique_labels, counts = torch.unique(as_index_labels(test_labels), return_counts=True)
 
     # ——— Data sanity checks ———
     for i, cls in enumerate(galaxy_classes):
-        cls_mask = (train_labels == i)
-        cls_images = train_images[cls_mask]
-        check_tensor(f"Train images for class {cls} (idx={i})", cls_images)
-        cls_mask = (test_labels == i)
-        cls_images = test_images[cls_mask]
-        check_tensor(f"Test images for class {cls} (idx={i})", cls_images)
+        if MULTILABEL:
+            train_mask = train_labels[:, i] > 0.5
+            test_mask  = test_labels[:,  i] > 0.5
+        else:
+            train_mask = as_index_labels(train_labels) == i
+            test_mask  = as_index_labels(test_labels)  == i
 
-    import hashlib
+        check_tensor(f"Train images for class {cls} (idx={i})", train_images[train_mask])
+        check_tensor(f"Test images for class {cls} (idx={i})",  test_images[test_mask])
 
     def img_hash(img: torch.Tensor) -> str:
         # ensure CPU & contiguous
@@ -619,10 +488,14 @@ for gen_model_name in gen_model_names:
             else:
                 test_dataset = TensorDataset(test_images, test_scat_coeffs, test_labels)
 
-    else: 
+    else:
+        if test_images.dim() == 5:
+            test_images = fold_T_axis(test_images)  # [B,T,1,H,W] -> [B,T,H,W]
+        assert test_images.dim() == 4, f"test_images should be [B,C,H,W], got {tuple(test_images.shape)}"
         test_dataset = TensorDataset(test_images, mock_tensor, test_labels)
+
                             
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=custom_collate, drop_last=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=custom_collate, drop_last=False)
 
     ###############################################
     ########### LOOP OVER DATA FOLD ###############
@@ -634,6 +507,12 @@ for gen_model_name in gen_model_names:
         torch.cuda.empty_cache()
         runname = f"{galaxy_classes}_{gen_model_name}_lr{lr}_reg{reg}_lo{percentile_lo}_hi{percentile_hi}_cs{crop_size[0]}x{crop_size[1]}"
 
+        print(f"\n▶ Experiment: g_classes={galaxy_classes}, lr={lr}, reg={reg}, ls={label_smoothing}, "
+        f"J={J}, L={L}, crop={crop_size}, down={downsample_size}, ver={versions}, "
+        f"lo={percentile_lo}, hi={percentile_hi}, classifier={classifier}, "
+        f"global_norm={USE_GLOBAL_NORMALISATION}, norm_mode={GLOBAL_NORM_MODE}, "
+        f"PREFER_PROCESSED={PREFER_PROCESSED} ◀\n")
+
         log_path = f"./classifier/log_{runname}.txt"
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         #file = open(log_path, 'w')
@@ -643,52 +522,79 @@ for gen_model_name in gen_model_names:
             # only synthetic for training; reserve real for validation
             train_images = torch.empty((0, *img_shape), device=DEVICE)
             train_labels = torch.empty((0,), dtype=torch.long, device=DEVICE)
-            _out = load_galaxies(
+            _out = _loader(
                 galaxy_classes=galaxy_classes,
-                versions=_versions_to_load or ['raw'],
+                versions=versions,
                 fold=fold,
                 crop_size=crop_size,
                 downsample_size=downsample_size,
                 sample_size=max_num_galaxies,
                 REMOVEOUTLIERS=FILTERED,
-                BALANCE=BALANCE,           # Reduce the larger classes to the size of the smallest class
-                AUGMENT=False,   
+                BALANCE=BALANCE,
+                AUGMENT=False,
                 NORMALISE=NORMALISEIMGS,
                 NORMALISETOPM=NORMALISEIMGSTOPM,
-                train=True)
-            
+                USE_GLOBAL_NORMALISATION=USE_GLOBAL_NORMALISATION,
+                GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
+                train=True,
+                PRINTFILENAMES=PRINTFILENAMES,
+                PREFER_PROCESSED=PREFER_PROCESSED
+            )
+
             if len(_out) == 4:
                 _, _, valid_images, valid_labels = _out
-                valid_data = None
+                train_fns = valid_fns = None
             elif len(_out) == 6:
-                _, _, valid_images, valid_labels, _, valid_data = _out
+                _, _, valid_images, valid_labels, train_fns, valid_fns = _out
+            else:
+                raise ValueError(f"load_galaxies returned {len(_out)} values, expected 4 or 6")
 
             # Relabel and shuffle validation data
-            valid_labels = relabel(valid_labels)  # [0,1,2,...] for classes [50,51,...]
+            valid_labels = relabel(valid_labels)
             perm_valid = torch.randperm(valid_images.size(0))
             valid_images, valid_labels = valid_images[perm_valid], valid_labels[perm_valid]
-            if PRINTFILENAMES: valid_fns = permute_like(valid_fns, perm_valid)
+            if PRINTFILENAMES and (valid_fns is not None):
+                valid_fns = permute_like(valid_fns, perm_valid)
 
         else:
-            # real train + valid
-            _out = load_galaxies(
-                galaxy_classes=galaxy_classes,
-                versions=_versions_to_load or ['raw'],
-                fold=max(folds),
-                crop_size=crop_size,
-                downsample_size=downsample_size,
-                sample_size=max_num_galaxies, 
-                REMOVEOUTLIERS=FILTERED,
-                BALANCE=BALANCE,
-                FLUX_CLIPPING=FLUX_CLIPPING,
-                STRETCH=STRETCH,
-                percentile_lo=percentile_lo,
-                percentile_hi=percentile_hi,
-                AUGMENT=not LATE_AUG,
-                NORMALISE=NORMALISEIMGS,
-                NORMALISETOPM=NORMALISEIMGSTOPM,
-                PRINTFILENAMES=PRINTFILENAMES,
-                train=True)
+            if DL2:
+                _out = _loader(galaxy_classes=galaxy_classes,
+                            versions=_versions_to_load or ['raw'], 
+                            fold=max(folds), #Any fold other than 5 gives me the test data for the five fold cross validation
+                            crop_size=crop_size,
+                            downsample_size=downsample_size,
+                            sample_size=max_num_galaxies, 
+                            REMOVEOUTLIERS=FILTERED,
+                            BALANCE=BALANCE,           # Reduce the larger classes to the size of the smallest class
+                            FLUX_CLIPPING=FLUX_CLIPPING,
+                            STRETCH=STRETCH,
+                            percentile_lo=percentile_lo,  # Percentile stretch lower bound
+                            percentile_hi=percentile_hi,  # Percentile stretch upper bound
+                            AUGMENT=not LATE_AUG,
+                            NORMALISE=NORMALISEIMGS,
+                            NORMALISETOPM=NORMALISEIMGSTOPM,
+                            PRINTFILENAMES=PRINTFILENAMES,
+                            train=False)
+            else:
+                _out  = _loader(galaxy_classes=galaxy_classes,
+                            versions=versions, 
+                            fold=max(folds), #Any fold other than 5 gives me the test data for the five fold cross validation
+                            crop_size=crop_size,
+                            downsample_size=downsample_size,
+                            sample_size=max_num_galaxies, 
+                            REMOVEOUTLIERS=FILTERED,
+                            BALANCE=BALANCE,           # Reduce the larger classes to the size of the smallest class
+                            STRETCH=STRETCH,
+                            percentile_lo=percentile_lo,  # Percentile stretch lower bound
+                            percentile_hi=percentile_hi,  # Percentile stretch upper bound
+                            AUGMENT=not LATE_AUG,
+                            NORMALISE=NORMALISEIMGS,
+                            NORMALISETOPM=NORMALISEIMGSTOPM,
+                            USE_GLOBAL_NORMALISATION=USE_GLOBAL_NORMALISATION,
+                            GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
+                            PRINTFILENAMES=PRINTFILENAMES,
+                            PREFER_PROCESSED=PREFER_PROCESSED,
+                            train=False)
 
             if len(_out) == 4:
                 train_images, train_labels, valid_images, valid_labels = _out
@@ -705,20 +611,6 @@ for gen_model_name in gen_model_names:
                     train_images, train_labels, valid_images, valid_labels, train_fns, valid_fns = _out
                 else:
                     print("Not implemented extradata yet")
-
-                # --- PSF matching for train/valid when requested ---
-                if _gen_versions:
-                    if train_fns is None or valid_fns is None:
-                        raise RuntimeError("versions includes rt*, but train/valid filenames were not returned.")
-                    
-                    train_images, train_labels, train_fns, info_tr = _append_rt_versions(train_images, train_fns, _gen_versions, labels=train_labels)
-                    valid_images, valid_labels, valid_fns, info_va = _append_rt_versions(valid_images, valid_fns, _gen_versions, labels=valid_labels)
-                    print(f"[TRAIN] dropped {info_tr['removed_total']} (kept {info_tr['kept']}/{info_tr['initial']})")
-                    print(f"[VALID] dropped {info_va['removed_total']} (kept {info_va['kept']}/{info_va['initial']})")
-                    
-                    if REPLACE_WITH_RT:
-                        train_images = train_images[:, 1:2]
-                        valid_images = valid_images[:, 1:2]
                     
                 if LATE_AUG:
                     before = len(train_images)
@@ -813,8 +705,8 @@ for gen_model_name in gen_model_names:
                     pristine_train_labels = train_labels
                     
             # Check the tensor for generated images
-            for cls in galaxy_classes:
-                cls_mask = (train_labels == cls)
+            for i, cls in enumerate(galaxy_classes):
+                cls_mask = (as_index_labels(train_labels) == i)
                 cls_images = train_images[cls_mask]
                 check_tensor(f"Generated images for class {cls} with model {gen_model_name}", cls_images)
             train_labels = relabel(train_labels)  # [0,1,2,...] for classes [50,51,...]
@@ -852,7 +744,10 @@ for gen_model_name in gen_model_names:
                 print("Cannot use extra features with TRAINONGENERATED, setting EXTRAVARS to False")
                 EXTRAVARS = False
             
-        unique_labels, counts = torch.unique(train_labels, return_counts=True)
+        if not MULTILABEL:
+            unique_labels, counts = torch.unique(as_index_labels(train_labels), return_counts=True)
+            #labels_1d = train_labels.argmax(dim=1) if train_labels.ndim > 1 else train_labels
+            #unique_labels, counts = torch.unique(labels_1d, return_counts=True)
 
         if dataset_sizes == {}:
             dataset_sizes[fold] = [int(len(train_images) * p) for p in dataset_portions]
@@ -865,11 +760,11 @@ for gen_model_name in gen_model_names:
         if classifier in ['Rustige', 'CNNSqueezeNet', 'SCNN', 'ScatterSqueezeNet', 'ScatterSqueezeNet2', 'Binary']:
             if lambda_generate not in [0, 8]:
                 # 1. concatenate images
-                img_splits = [
-                    pristine_train_images.to(DEVICE),
-                    generated_images.to(DEVICE),
-                    valid_images.to(DEVICE)
-                ]
+                p = _as_5d(pristine_train_images).to(DEVICE)
+                g = _as_5d(generated_images).to(DEVICE)
+                v = _as_5d(valid_images).to(DEVICE)
+
+                img_splits = [p, g, v]
                 img_lengths = [len(t) for t in img_splits]
                 all_images = torch.cat(img_splits, dim=0)
 
@@ -905,10 +800,10 @@ for gen_model_name in gen_model_names:
 
             else:
                 # same idea if lambda_generate == 0 (i.e. only real train+valid)
-                img_splits = [
-                    train_images.to(DEVICE),
-                    valid_images.to(DEVICE)
-                ]
+                a = _as_5d(train_images).to(DEVICE)
+                b = _as_5d(valid_images).to(DEVICE)
+
+                img_splits = [a, b]
                 img_lengths = [len(t) for t in img_splits]
                 all_images = torch.cat(img_splits, dim=0)
 
@@ -933,18 +828,32 @@ for gen_model_name in gen_model_names:
         
         # ── SANITY-CHECK PLOTS ON FIRST FOLD ONLY ──
         if fold == folds[0] and SHOWIMGS and downsample_size == (1, 128, 128):
-            
+
+            def _mask_for_class(labels: torch.Tensor, cls_val: int) -> torch.Tensor:
+                """
+                Return a 1-D boolean mask of shape [B] selecting samples of class `cls_val`.
+                In multi-label mode (RH/RR), use the corresponding column; otherwise use indices.
+                """
+                if MULTILABEL:
+                    # Map class value (e.g. 52 or 53) to column 0 (RH) or 1 (RR)
+                    col = 0 if cls_val == galaxy_classes[0] else 1
+                    return labels[:, col] > 0.5
+                else:
+                    return as_index_labels(labels) == (cls_val - min(galaxy_classes))
+
+            def _to_4d(x: torch.Tensor) -> torch.Tensor:
+                # For plotting, make sure images are [N, C, H, W]
+                return fold_T_axis(x) if x.dim() == 5 else x
+
             if len(galaxy_classes) == 2:
-                # Plot histograms for the two classes
-                train_images_cls1 = train_images[train_labels == galaxy_classes[0] - min(galaxy_classes)]
-                train_images_cls2 = train_images[train_labels == galaxy_classes[1] - min(galaxy_classes)]
-                
-                #Make sure the images are not tupples
-                if isinstance(train_images_cls1, tuple):
-                    train_images_cls1 = train_images_cls1[0]
-                if isinstance(train_images_cls2, tuple):
-                    train_images_cls2 = train_images_cls2[0]
-                
+                # Build per-class views
+                train_images_cls1 = _to_4d(train_images[_mask_for_class(train_labels, galaxy_classes[0])])
+                train_images_cls2 = _to_4d(train_images[_mask_for_class(train_labels, galaxy_classes[1])])
+
+                # Make sure the images are not tuples
+                if isinstance(train_images_cls1, tuple): train_images_cls1 = train_images_cls1[0]
+                if isinstance(train_images_cls2, tuple): train_images_cls2 = train_images_cls2[0]
+
                 plot_histograms(
                     train_images_cls1.cpu(),
                     train_images_cls2.cpu(),
@@ -954,17 +863,17 @@ for gen_model_name in gen_model_names:
                 )
 
                 plot_background_histogram(
-                    train_images_cls1.cpu(),        # shape (936, 1, 128, 128)
-                    train_images_cls2.cpu(),        # shape (720, 1, 128, 128)
+                    train_images_cls1.cpu(),
+                    train_images_cls2.cpu(),
                     img_shape=(1, 128, 128),
                     title="Background histograms",
                     save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_background_hist.pdf"
                 )
 
                 for cls in galaxy_classes:
-                    orig_imgs = train_images[train_labels == (cls - min(galaxy_classes))][:36]
-                    test_imgs = test_images[test_labels == (cls - min(galaxy_classes))][:36]
-                                
+                    orig_imgs = _to_4d(train_images[_mask_for_class(train_labels, cls)])[:36]
+                    test_imgs = _to_4d(test_images[_mask_for_class(test_labels, cls)])[:36]
+
                     plot_image_grid(
                         orig_imgs.cpu(),
                         num_images=36,
@@ -975,35 +884,29 @@ for gen_model_name in gen_model_names:
                         num_images=36,
                         save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_test_grid.pdf"
                     )
+
+                    # summed-intensity histogram helper unchanged...
                     tag_to_desc = { d["tag"]: d["description"] for d in get_classes() }
-                    
-                    # helper to plot summed‐intensity histogram with dynamic labels
                     def plot_intensity_histogram(tensor1, tensor2, label1, label2, save_path, bins=30):
-                        vals1 = tensor1.sum(dim=(1,2,3)).cpu().numpy()
-                        vals2 = tensor2.sum(dim=(1,2,3)).cpu().numpy()
+                        vals1 = tensor1.sum(dim=tuple(range(1, tensor1.ndim))).cpu().numpy()
+                        vals2 = tensor2.sum(dim=tuple(range(1, tensor2.ndim))).cpu().numpy()
                         plt.figure(figsize=(10,5))
                         plt.hist(vals1, bins=bins, alpha=0.6, label=label1, color='C1')
                         plt.hist(vals2, bins=bins, alpha=0.6, label=label2, color='C0')
-                        plt.xlabel('Total Intensity')
-                        plt.ylabel('Count')
+                        plt.xlabel('Total Intensity'); plt.ylabel('Count')
                         plt.title(f'Total Intensity per Image: {label1} vs {label2}')
-                        plt.legend()
-                        plt.savefig(save_path)
-                        plt.close()
+                        plt.legend(); plt.savefig(save_path); plt.close()
 
-                    # now call it using your class descriptions
                     plot_intensity_histogram(
                         train_images_cls1.cpu(),
                         train_images_cls2.cpu(),
-                        label1=tag_to_desc[classes[galaxy_classes[0]]['tag']],
-                        label2=tag_to_desc[classes[galaxy_classes[1]]['tag']],
+                        label1=tag_to_desc[get_classes()[galaxy_classes[0]]['tag']],
+                        label2=tag_to_desc[get_classes()[galaxy_classes[1]]['tag']],
                         save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_summed_intensity_histogram.pdf"
                     )
-                    
-        
+
                     if lambda_generate not in [0, 8]:
                         gen_imgs = generated_by_class[cls][:36]
-
                         plot_image_grid(
                             gen_imgs,
                             num_images=36,
@@ -1021,31 +924,38 @@ for gen_model_name in gen_model_names:
                             gen_imgs,
                             img_shape=(1, 128, 128),
                             title="Background histograms",
-                            save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_background_hist.pdf")
+                            save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_background_hist.pdf"
+                        )
+
         
-        if USE_CLASS_WEIGHTS:
-            unique, counts = np.unique(train_labels.cpu().numpy(), return_counts=True)
-            total_count = sum(counts)
-            class_weights = {i: total_count / count for i, count in zip(unique, counts)}
-            weights = torch.tensor([class_weights.get(i, 1.0) for i in range(num_classes)],
-                                dtype=torch.float, device=DEVICE)
-            missing_classes = [cls for cls in unique if cls not in class_weights]
-            if missing_classes:
-                print(f"Warning: Missing classes in dataset: {missing_classes}")
-                class_weights.update({int(cls): 1.0 for cls in missing_classes})
-                
-            unique_valid, counts_valid = np.unique(valid_labels.cpu().numpy(), return_counts=True)
-            unique_test, counts_test = np.unique(test_labels.cpu().numpy(), return_counts=True)
-            class_counts_valid = dict(zip(map(int, unique_valid), map(int, counts_valid)))
-            class_counts_test = dict(zip(map(int, unique_test), map(int, counts_test)))
+        if MULTILABEL:
+            # labels are 2-hot; compute per-label pos_weight for BCE
+            pos_counts = train_labels.sum(dim=0)                       # [2]
+            neg_counts = train_labels.shape[0] - pos_counts            # [2]
+            pos_counts = torch.clamp(pos_counts, min=1.0)
+            pos_weight = (neg_counts / pos_counts).to(DEVICE)          # [2]
+            print(f"[pos_weight] RH={pos_weight[0].item():.2f}, RR={pos_weight[1].item():.2f}")
+            weights = None  # not used in BCE branch
         else:
-            weights = None
+            if USE_CLASS_WEIGHTS:
+                unique, counts = np.unique(train_labels.cpu().numpy(), return_counts=True)
+                total_count = sum(counts)
+                class_weights = {i: total_count / count for i, count in zip(unique, counts)}
+                weights = torch.tensor([class_weights.get(i, 1.0) for i in range(num_classes)],
+                                    dtype=torch.float, device=DEVICE)
+            else:
+                weights = None
 
         if fold in [0, 5] and SHOWIMGS:
             imgs = train_images.detach().cpu().numpy()
-            lbls = (train_labels + min(galaxy_classes)).detach().cpu().numpy() # This is to match the original class labels
-            plot_images_by_class(imgs, labels=lbls, num_images=5, save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_example_train_data.pdf")
-        
+            # Make labels 1-D: 0 for first class, 1 for second; then shift to 52/53
+            lbls = (as_index_labels(train_labels) + min(galaxy_classes)).detach().cpu().numpy()
+            plot_images_by_class(
+                imgs,
+                labels=lbls,
+                num_images=5,
+                save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_example_train_data.pdf"
+            )
         # Prepare input data
         mock_tensor = torch.zeros_like(train_images)
         valid_mock_tensor = torch.zeros_like(valid_images)
@@ -1108,17 +1018,25 @@ for gen_model_name in gen_model_names:
                         train_dataset = TensorDataset(train_images, train_scat_coeffs, train_labels)
                         valid_dataset = TensorDataset(valid_images, valid_scat_coeffs, valid_labels)
         else:
+            if train_images.dim() == 5:
+                train_images = fold_T_axis(train_images)   # [B,T,1,H,W] -> [B,T,H,W]
+                valid_images = fold_T_axis(valid_images)
+                # test_images was folded earlier
+            for x,name in [(train_images,"train"), (valid_images,"valid")]:
+                assert x.dim() == 4, f"{name}_images should be [B,C,H,W], got {tuple(x.shape)}"
             mock_train = torch.zeros_like(train_images)
             mock_valid = torch.zeros_like(valid_images)
             train_dataset = TensorDataset(train_images, mock_train, train_labels)
             valid_dataset = TensorDataset(valid_images, mock_valid, valid_labels)
 
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=custom_collate, drop_last=False)
-        valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=custom_collate, drop_last=False)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=custom_collate, drop_last=False)
+        valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=custom_collate, drop_last=False)
+        
+        print("Length of train dataset: ", len(train_dataset))
 
         if SHOWIMGS and lambda_generate not in [0, 8]: 
             if classifier in ['TinyCNN', 'SCNN', 'CNNSqueezeNet', 'Rustige', 'ScatterSqueezeNet', 'ScatterSqueezeNet2', 'Binary']:
-                #save_images_tensorboard(generated_images[:36], save_path=f"./classifier/{gen_model_name}_{galaxy_classes}_generated.png", nrow=6)
+                #save_images_tensorboard(generated_images[:36], save_path=f"./classifier/{gen_model_name}_{galaxy_classes}_generated.pdf", nrow=6)
                 plot_histograms(pristine_train_images, valid_images, title1="Train images", title2="Valid images", imgs3=generated_images, imgs4=test_images, title3='Generated images', title4='Test images', save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_histograms.pdf")
 
         
@@ -1136,11 +1054,6 @@ for gen_model_name in gen_model_names:
             models = {"DualCNNSqueezeNet": {"model": DualCNNSqueezeNet(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)}}
         elif classifier == "TinyCNN":
             models = {"TinyCNN": {"model": TinyCNN(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)}} 
-        elif classifier == 'CloudNet':
-            cloud_model = CloudNet()  
-            cloud_model.load_weights(os.path.join(sys.path[0],
-                'Cloud-Net_trained_on_38-Cloud_training_patches.h5'))
-            cloud_model.trainable = True   # now you can fine-tune it on your radio maps
         elif classifier == "DANN":
             models = {"DANN": {"model": DANNClassifier(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)}}
         elif classifier == "ScatterNet":
@@ -1174,21 +1087,20 @@ for gen_model_name in gen_model_names:
                     summary(model_details["model"], input_size=tuple(valid_images.shape[1:]), device=DEVICE)
             FIRSTTIME = False
             
-   
+            
         ###############################################
         ############### TRAINING LOOP #################
         ###############################################
         
-        if weights is not None:
-            print(f"Using class weights: {weights}")
-            criterion = nn.CrossEntropyLoss(weight=weights, label_smoothing=label_smoothing)
+        if MULTILABEL:
+            criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
         else:
-            print("No class weighting")
-            if len(galaxy_classes) == 2:
-                criterion = nn.BCEWithLogitsLoss()
+            if weights is not None:
+                print(f"Using class weights: {weights}")
+                criterion = nn.CrossEntropyLoss(weight=weights, label_smoothing=label_smoothing)
             else:
-                criterion = nn.CrossEntropyLoss()
-            
+                print("No class weighting")
+                criterion = nn.BCEWithLogitsLoss() if num_classes == 2 else nn.CrossEntropyLoss() 
 
         optimizer = AdamW(models[classifier_name]["model"].parameters(), lr=lr, weight_decay=reg)
         if SCHEDULER:
@@ -1218,7 +1130,7 @@ for gen_model_name in gen_model_names:
                     subset_indices = torch.randperm(len(train_dataset))[:subset_size].tolist() # Randomly select indices to include generated samples
                     subset_train_dataset = Subset(train_dataset, subset_indices)
                     eff_bs = max(2, min(batch_size, len(subset_train_dataset)))
-                    subset_train_loader = DataLoader(subset_train_dataset, batch_size=eff_bs, shuffle=True, num_workers=0, collate_fn=custom_collate, drop_last=True)
+                    subset_train_loader = DataLoader(subset_train_dataset, batch_size=eff_bs, shuffle=False, num_workers=0, collate_fn=custom_collate, drop_last=True)
 
                     early_stopping = EarlyStopping(patience=patience, verbose=False) if ES else None
 
@@ -1233,32 +1145,14 @@ for gen_model_name in gen_model_names:
                                 meta = meta.to(DEVICE)  # Send metadata to device
                             else:
                                 labels = _rest
-                            images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE) # Send to device
+                            images  = images.to(DEVICE, non_blocking=True)
+                            scat    = scat.to(DEVICE, non_blocking=True)
+                            labels  = labels.to(DEVICE, non_blocking=True)
+
                             optimizer.zero_grad()
                             if classifier == "DANN":
-                                # 1) forward pass: two heads
                                 class_logits, domain_logits = model(images, alpha=1.0)
-
-                                # 2) classification loss
-                                class_loss = criterion(class_logits, labels)
-
-                                # 3) domain loss (0=real, 1=fake)
-                                B = labels.size(0)
-                                domain_labels = torch.zeros(B, dtype=torch.long, device=DEVICE)
-                                # if you interleave generated samples in the same loader you need a flag per-sample;
-                                # for now this will assume your loader is real‐only, so all zeros
-                                domain_loss = nn.CrossEntropyLoss()(domain_logits, domain_labels)
-
-                                # 4) total loss
-                                loss = class_loss + 0.5 * domain_loss
-
-                                loss.backward()
-                                optimizer.step()
-                                if SCHEDULER:
-                                    scheduler.step()
-
-                                total_loss += float(loss.item() * images.size(0))
-                                total_images += float(images.size(0))
+                                logits = class_logits
                             else:
                                 if classifier in ["ScatterNet", "ScatterResNet"]:
                                     logits = model(scat)
@@ -1267,30 +1161,15 @@ for gen_model_name in gen_model_names:
                                 else:
                                     logits = model(images)
 
-                                # Collapse spatial maps to [B, C] if the model returns [B, C, H, W]
-                                if logits.ndim == 4:
-                                    print(f"Collapsing logits from shape {logits.shape} to [B, C]")
-                                    logits = torch.nn.functional.adaptive_avg_pool2d(logits, (1, 1)).squeeze(-1).squeeze(-1)
-                                elif logits.ndim == 3:  # rare: [B, C, H]
-                                    print(f"Collapsing logits from shape {logits.shape} to [B, C]")
-                                    logits = logits.mean(dim=-1)
+                            logits = collapse_logits(logits, num_classes, MULTILABEL)
+                            labels = labels.float() if MULTILABEL else labels.long()
+                            loss = criterion(logits, labels)
 
-                                # Keep binary 2-logit shape for CE
-                                if logits.ndim == 1:
-                                    print(f"Expanding logits from shape {logits.shape} to [B, C]")
-                                    logits = logits.unsqueeze(1)
-                                if logits.shape[1] == 1 and num_classes == 2:
-                                    print(f"Expanding logits from shape {logits.shape} to [B, 2]")
-                                    logits = torch.cat([-logits, logits], dim=1)
-
-
-                                labels = labels.long()
-                                loss = criterion(logits, labels)
-
-                                loss.backward()
-                                optimizer.step()
-                                total_loss += float(loss.item() * images.size(0))
-                                total_images += float(images.size(0))
+                            loss.backward()
+                            scheduler.step() if SCHEDULER else None
+                            optimizer.step()
+                            total_loss += float(loss.item() * images.size(0))
+                            total_images += float(images.size(0))
 
                         average_loss = total_loss / total_images
                         loss_key = f"{gen_model_name}_loss_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"
@@ -1300,7 +1179,7 @@ for gen_model_name in gen_model_names:
                         val_total_loss = 0
                         val_total_images = 0
 
-                        with torch.no_grad(): # Validate on validation data
+                        with torch.inference_mode(): # Validate on validation data
                             for i, (images, scat, _rest) in enumerate(valid_loader):
                                 if images is None or len(images) == 0:
                                     print(f"Empty batch at index {i}. Skipping...")
@@ -1310,7 +1189,11 @@ for gen_model_name in gen_model_names:
                                     meta = meta.to(DEVICE)  # Send metadata to device
                                 else:
                                     labels = _rest
-                                images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
+                                #images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
+                                images  = images.to(DEVICE, non_blocking=True)
+                                scat    = scat.to(DEVICE, non_blocking=True)
+                                labels  = labels.to(DEVICE, non_blocking=True)
+
                                 if classifier == "DANN":
                                     logits, _ = model(images, alpha=1.0)
                                 else:
@@ -1321,23 +1204,12 @@ for gen_model_name in gen_model_names:
                                     else:
                                         logits = model(images)
 
-                                # Collapse spatial maps to [B, C] if the model returns [B, C, H, W]
-                                if logits.ndim == 4:
-                                    logits = torch.nn.functional.adaptive_avg_pool2d(logits, (1, 1)).squeeze(-1).squeeze(-1)
-                                elif logits.ndim == 3:  # rare: [B, C, H]
-                                    logits = logits.mean(dim=-1)
-
-                                # Keep binary 2-logit shape for CE
-                                if logits.ndim == 1:
-                                    logits = logits.unsqueeze(1)
-                                if logits.shape[1] == 1 and num_classes == 2:
-                                    logits = torch.cat([-logits, logits], dim=1)
-
-                                labels = labels.long()
+                                logits = collapse_logits(logits, num_classes, MULTILABEL)
+                                labels = labels.float() if MULTILABEL else labels.long()
+                                if not MULTILABEL:
+                                    assert labels.dtype == torch.long, f"labels dtype {labels.dtype} must be long"
                                 loss = criterion(logits, labels)
-                                    
-                                # inside the training loop, just before loss = criterion(outputs, labels)
-                                assert labels.dtype == torch.long, f"labels dtype {labels.dtype} must be long"
+
                                 mn, mx = int(labels.min()), int(labels.max())
                                 assert 0 <= mn and mx < num_classes, f"label range [{mn},{mx}] not in [0,{num_classes-1}]"
 
@@ -1354,7 +1226,7 @@ for gen_model_name in gen_model_names:
                                 break
 
                     model.eval()
-                    with torch.no_grad(): # Evaluate on test data
+                    with torch.inference_mode(): # Evaluate on test data
                         key = f"{gen_model_name}_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}"
                         all_pred_probs[key] = []
                         all_pred_labels[key] = []
@@ -1369,7 +1241,11 @@ for gen_model_name in gen_model_names:
                                 meta = meta.to(DEVICE)  # Send metadata to device
                             else:
                                 labels = _rest
-                            images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
+                            #images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
+                            images  = images.to(DEVICE, non_blocking=True)
+                            scat    = scat.to(DEVICE, non_blocking=True)
+                            labels  = labels.to(DEVICE, non_blocking=True)
+
                             if classifier == "DANN":
                                 logits, _ = model(images, alpha=1.0)
                             else:
@@ -1380,51 +1256,50 @@ for gen_model_name in gen_model_names:
                                 else:
                                     logits = model(images)
 
-                            # Collapse spatial maps to [B, C] if the model returns [B, C, H, W]
-                            if logits.ndim == 4:
-                                logits = torch.nn.functional.adaptive_avg_pool2d(logits, (1, 1)).squeeze(-1).squeeze(-1)
-                            elif logits.ndim == 3:  # rare: [B, C, H]
-                                logits = logits.mean(dim=-1)
+                            logits = collapse_logits(logits, num_classes, MULTILABEL)
 
-                            # Keep binary 2-logit shape for CE
-                            if logits.ndim == 1:
-                                logits = logits.unsqueeze(1)
-                            if logits.shape[1] == 1 and num_classes == 2:
-                                logits = torch.cat([-logits, logits], dim=1)
+                            if MULTILABEL:
+                                probs = torch.sigmoid(logits).cpu().numpy()           # [B,2]
+                                preds = (probs >= THRESHOLD).astype(int)              # [B,2]
+                                trues = labels.cpu().numpy().astype(int)              # [B,2]
+                                all_pred_probs[key].extend(probs)
+                                all_pred_labels[key].extend(preds)
+                                all_true_labels[key].extend(trues)
+                            else:
+                                probs = torch.softmax(logits, dim=1).cpu().numpy()
+                                trues = labels.cpu().numpy()
+                                preds = np.argmax(probs, axis=1)
+                                all_pred_probs[key].extend(probs)
+                                all_pred_labels[key].extend(preds)
+                                all_true_labels[key].extend(trues)
 
-
-                            pred_probs = torch.softmax(logits, dim=1).cpu().numpy()
-
-                            true_labels = labels.cpu().numpy()
-                            #true_labels = torch.argmax(labels, dim=1).cpu().numpy()
-                            pred_labels = np.argmax(pred_probs, axis=1)
-                            all_pred_probs[key].extend(pred_probs)
-                            all_pred_labels[key].extend(pred_labels)
-                            all_true_labels[key].extend(true_labels)
-
-                            
+                            # collect misclassified examples (final experiment only)
                             if SHOWIMGS and experiment == num_experiments - 1:
-                                mask = pred_labels != true_labels
-                                mis_images.append(images.cpu()[mask])
-                                mis_trues .append(true_labels[mask])
-                                mis_preds .append(pred_labels[mask])
-                                
-                                if galaxy_classes == [52, 53]:
-                                    cm = confusion_matrix(all_true_labels[key], all_pred_labels[key], labels=[0,1])
-                                    plt.figure(figsize=(4,4))
-                                    sns.heatmap(cm, annot=True, fmt='d',
-                                                xticklabels=['RH (52)','RR (53)'],
-                                                yticklabels=['RH (52)','RR (53)'])
-                                    plt.xlabel('Predicted')
-                                    plt.ylabel('True')
-                                    plt.title(f'Confusion Matrix — {classifier_name}')
-                                    plt.savefig(f"./{galaxy_classes}_{classifier_name}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_confusion_matrix.pdf", dpi=150)
-                                    plt.close()
+                                wrong_mask = (preds != trues).any(axis=1) if MULTILABEL else (preds != trues)
+                                if np.any(wrong_mask):
+                                    mask_t = torch.as_tensor(wrong_mask, dtype=torch.bool)
+                                    mis_images.append(images.detach().cpu()[mask_t])
+                                    mis_trues.append(trues[wrong_mask])
+                                    mis_preds.append(preds[wrong_mask])
 
-                        accuracy = accuracy_score(all_true_labels[key], all_pred_labels[key])
-                        precision = precision_score(all_true_labels[key], all_pred_labels[key], average='macro', zero_division=0)
-                        recall = recall_score(all_true_labels[key], all_pred_labels[key], average='macro', zero_division=0)
-                        f1 = f1_score(all_true_labels[key], all_pred_labels[key], average='macro', zero_division=0)
+
+                        y_true = np.array(all_true_labels[key])
+                        y_pred = np.array(all_pred_labels[key])
+
+                        if MULTILABEL:
+                            accuracy = accuracy_score(y_true, y_pred)
+                            precision = precision_score(y_true, y_pred, average='macro', zero_division=0)
+                            recall    = recall_score(y_true, y_pred,    average='macro', zero_division=0)
+                            f1        = f1_score(y_true, y_pred,        average='macro', zero_division=0)
+                        else:
+                            accuracy = accuracy_score(y_true, y_pred)
+                            precision = precision_score(y_true, y_pred, average='macro', zero_division=0) if num_classes > 2 \
+                                        else precision_score(y_true, y_pred, average='binary', zero_division=0)
+                            recall    = recall_score(y_true, y_pred,    average='macro', zero_division=0) if num_classes > 2 \
+                                        else recall_score(y_true, y_pred,    average='binary', zero_division=0)
+                            f1        = f1_score(y_true, y_pred,        average='macro', zero_division=0) if num_classes > 2 \
+                                        else f1_score(y_true, y_pred,        average='binary', zero_division=0)
+
 
                         update_metrics(metrics, gen_model_name, subset_size, fold, experiment, lr, reg, accuracy, precision, recall, f1, lambda_generate, crop_size, downsample_size, ver_key)
 
@@ -1440,7 +1315,6 @@ for gen_model_name in gen_model_names:
                             mis_trues  = np.concatenate(mis_trues)[:36]
                             mis_preds  = np.concatenate(mis_preds)[:36]
 
-                            import matplotlib.pyplot as plt
                             fig, axes = plt.subplots(6, 6, figsize=(12, 12))
                             axes = axes.flatten()
 
@@ -1486,14 +1360,17 @@ for gen_model_name in gen_model_names:
                         file.write(f"Time taken to train the model on fold {fold}: {elapsed_time:.2f} seconds \n")
             
             generated_features = []
-            with torch.no_grad():
-                for images, scat, _ in test_loader:
+            with torch.inference_mode():
+                for images, scat, _rest in test_loader:
                     if EXTRAVARS:
                         meta, labels = _rest
-                        meta = meta.to(DEVICE)  # Send metadata to device
                     else:
                         labels = _rest
-                    images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
+                    images  = images.to(DEVICE, non_blocking=True)
+                    scat    = scat.to(DEVICE, non_blocking=True)
+                    labels  = labels.to(DEVICE, non_blocking=True)
+                    #images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
+
                     if classifier == "DANN":
                         class_logits, _ = model(images, alpha=1.0)
                         outputs = class_logits.cpu().detach().numpy()
@@ -1522,7 +1399,7 @@ for gen_model_name in gen_model_names:
         for subset_size in dataset_sizes[fold]:
             for experiment in range(num_experiments):
                                 
-                metrics_save_path = f'{directory}{classifier}_{galaxy_classes}_{gen_model_name}_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{lambda_generate}_metrics_data.pkl'
+                metrics_save_path = f'./classifier/4.1.runs/{runname}_sz{subset_size}_f{fold}_e{experiment}_lam{lambda_generate}_metrics_data.pkl'
 
                 # Build robust, per-setting summaries using empirical percentiles
                 robust_summary = {}   # { base_key: {metric: {'n', 'p16','p50','p84','sigma68'} } }
@@ -1554,17 +1431,38 @@ for gen_model_name in gen_model_names:
                         vmin, vmax = vmin - eps, vmax + eps
                     edges = np.linspace(vmin, vmax, 21)  # 20 bins across [min, max]
 
+                    import matplotlib.patches as mpatches
+
+                    # compute stats
+                    mean = float(np.mean(vals))
+                    std = float(np.std(vals, ddof=0))
+                    p16, p50, p84 = float(p16), float(p50), float(p84)
+
                     plt.figure(figsize=(5,3.2))
-                    plt.hist(vals, bins=edges, edgecolor='none', alpha=0.8)
-                    for x, style in [(p16, ':'), (p50, '-'), (p84, ':')]:
-                        plt.axvline(x, linestyle=style)
-                    plt.xlim(vmin, vmax)  # force axis to the observed range
-                    plt.title(key)
-                    plt.xlabel(metric_name)
-                    plt.ylabel("count")
+                    counts, bins, patches = plt.hist(vals, bins=edges, edgecolor='black', color='green', alpha=0.45)
+
+                    # vertical lines: mean (solid), median (dashed), p16/p84 (dotted)
+                    mean_line, = plt.plot([mean, mean], [0, counts.max()], linestyle='-', color='blue', linewidth=2, label=f"Mean = {mean:.3f}, σ = {std:.3f}")
+                    median_line, = plt.plot([p50, p50], [0, counts.max()], linestyle='--', color='orange', linewidth=2, label=f"Median = {p50:.3f}")
+                    p16_line = plt.plot([p16, p16], [0, counts.max()], color='green', linestyle=':', linewidth=1)
+                    p84_line = plt.plot([p84, p84], [0, counts.max()], color='green', linestyle=':', linewidth=1)
+                    mean_plus_std_line = plt.plot([mean + std, mean + std], [0, counts.max()], color='blue', linestyle='--', linewidth=1)
+                    mean_minus_std_line = plt.plot([mean - std, mean - std], [0, counts.max()], color='blue', linestyle='--', linewidth=1)
+
+                    # shaded central 68% credibility region (p16--p84)
+                    ymax = counts.max()
+                    region_patch = plt.fill_betweenx([0, ymax], p16, p84, alpha=0.12, facecolor='green')
+
+                    plt.xlim(vmin, vmax)
+                    plt.xlabel(metric_name.capitalize())
+                    plt.ylabel("Count")
+
+                    # assemble legend: use created artists and the shaded patch
+                    legend_handles = [median_line, mean_line, mpatches.Patch(facecolor='green', alpha=0.12, label=f"68% interval [{p16:.3f}, {p84:.3f}]")]
+                    plt.legend(handles=legend_handles, loc='best', frameon=False, fontsize='small')
+
                     plt.tight_layout()
 
-                    # save one file per metric so nothing gets overwritten
                     save_path_hist = (
                         f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_"
                         f"{dataset_sizes[folds[-1]][-1]}_{metric_name}_histogram.pdf"
@@ -1585,17 +1483,18 @@ for gen_model_name in gen_model_names:
                 # Also write a tidy CSV so you can scan summaries quickly
                 summary_csv = f'{directory}{classifier}_{galaxy_classes}_{gen_model_name}_percentile_summary.csv'
                 pd.DataFrame(rows).to_csv(summary_csv, index=False)
-
+                
                 with open(metrics_save_path, 'wb') as f:
                     pickle.dump({
                         "models": models,
                         "history": history,
-                        "metrics": metrics,                 # raw per-run values remain
+                        "metrics": metrics,
                         "metric_colors": metric_colors,
                         "all_true_labels": all_true_labels,
                         "all_pred_labels": all_pred_labels,
                         "training_times": training_times,
                         "all_pred_probs": all_pred_probs,
-                        "percentile_summary": robust_summary  # new robust summaries
+                        "percentile_summary": robust_summary
                     }, f)
+                print(f"Saved metrics PKL to {os.path.abspath(metrics_save_path)}")
                     
