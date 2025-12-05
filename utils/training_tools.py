@@ -23,58 +23,6 @@ def reset_weights(m):
     '''
     if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
         m.reset_parameters()
-        
-
-def old_initialize_history(history, model_name, dataset_sizes, num_experiments):
-    history[model_name] = {}
-    for subset_size in dataset_sizes:
-        for experiment in range(num_experiments):
-            history[model_name][f"{model_name}_loss_{subset_size}_{experiment}"] = []
-            history[model_name][f"{model_name}_val_loss_{subset_size}_{experiment}"] = []
-            history[model_name][f"{model_name}_accuracy_{subset_size}_{experiment}"] = []
-            history[model_name][f"{model_name}_precision_{subset_size}_{experiment}"] = []
-            history[model_name][f"{model_name}_recall_{subset_size}_{experiment}"] = []
-            history[model_name][f"{model_name}_f1_{subset_size}_{experiment}"] = []
-            history[model_name][f"{model_name}_auc_{subset_size}_{experiment}"] = []
-
-# Initialize history dictionary
-def initialize_history(history, model_name, dataset_sizes):
-    if model_name not in history:
-        history[model_name] = {}
-
-    for subset_size in dataset_sizes:
-        loss_key = f"{model_name}_loss_{subset_size}"
-        val_loss_key = f"{model_name}_val_loss_{subset_size}"
-        
-        # Initialize lists to store losses
-        if loss_key not in history[model_name]:
-            history[model_name][loss_key] = []
-        if val_loss_key not in history[model_name]:
-            history[model_name][val_loss_key] = []
-
-
-def initialize_metrics(metrics, model_name, dataset_sizes):
-    if model_name not in metrics:
-        metrics[model_name] = {}
-
-    for subset_size in dataset_sizes:
-        acc_key = f"{model_name}_accuracy_{subset_size}"
-        prec_key = f"{model_name}_precision_{subset_size}"
-        rec_key = f"{model_name}_recall_{subset_size}"
-        f1_key = f"{model_name}_f1_{subset_size}"
-        
-        # Initialize lists to store metrics
-        if acc_key not in metrics[model_name]:
-            metrics[model_name][acc_key] = []
-        if prec_key not in metrics[model_name]:
-            metrics[model_name][prec_key] = []
-        if rec_key not in metrics[model_name]:
-            metrics[model_name][rec_key] = []
-        if f1_key not in metrics[model_name]:
-            metrics[model_name][f1_key] = []
-
-
-
 
 def display_examples(X, y_true, y_pred, indices, title):
     plt.figure(figsize=(12, 3))
@@ -182,46 +130,3 @@ class EarlyStopping:
         if self.verbose:
             print(f'Validation loss decreased ({self.best_loss:.6f} --> {val_loss:.6f}). Saving model...')
         torch.save(model.state_dict(), model_path)
-        
-        
-"""
-def load_model(path, scatshape=scatshape, hidden_dim1=hidden_dim1, hidden_dim2=hidden_dim2, latent_dim=latent_dim, num_classes=num_classes):
-    print(f"Loading model from {path}")
-    name = path.split('_')[-2].split('.')[0]
-    checkpoint = torch.load(path, map_location=DEVICE)
-    state_dict = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
-    model = get_model(name=name, scatshape=scatshape, hidden_dim1=hidden_dim1, hidden_dim2=hidden_dim2, latent_dim=latent_dim, num_classes=num_classes, J=J)
-
-
-    # Adapt the state_dict to match model's state_dict
-    model_state_dict = model.state_dict()
-    adapted_state_dict = {}
-    for key in model_state_dict.keys():
-        if key in state_dict and model_state_dict[key].shape == state_dict[key].shape:
-            adapted_state_dict[key] = state_dict[key]
-        else:
-            print(f"Skipping {key} due to size mismatch or missing key")
-
-    # Load the adapted state dict
-    model.load_state_dict(adapted_state_dict, strict=False)
-    model.to(DEVICE)
-    return model
-        
-def generate_from_noise(model, latent_dim=64, num_samples=1000, num_classes=1, NORMALISE_GENERATED_IMAGES=True, DEVICE='cuda'):
-                print(f"Generating {num_generate} images from noise...")
-                model.eval()
-                with torch.no_grad():
-                    noise = torch.randn(num_samples, latent_dim).to(DEVICE)
-                    if hasattr(model, 'decoder') and 'conditional' in str(type(model.decoder)).lower():
-                        #labels = torch.ones(num_samples, dtype=torch.long).to(DEVICE)  # Assuming label '0'
-                        labels = torch.arange(0, 100) % train_labels.size(1)
-                        labels = torch.nn.functional.one_hot(labels, num_classes=num_classes).float()  # One-hot encode the labels
-                        generated_images = model.decoder(noise, labels)
-                    else:
-                        generated_images = model.decoder(noise)
-                    generated_images = generated_images.view(-1, *img_shape)                    
-                if NORMALISE_GENERATED_IMAGES:
-                    generated_images = normalize_to_0_1(generated_images)
-                    
-                return generated_images"""
-

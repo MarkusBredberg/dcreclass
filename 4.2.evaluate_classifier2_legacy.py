@@ -43,6 +43,7 @@ classifier = ["TinyCNN", "Rustige", "SCNN", "CNNSqueezeNet", "DualCNNSqueezeNet"
 print("Classifier:", classifier)
 crop_size = (512, 512)  # Crop size for the images
 
+#Saved metrics PKL to /capstor/scratch/cscs/mbredber/classifier/4.1.runs/[50, 51]_lr0.001_reg0.001_lo30_hi99_cs512x512_ds128x128_verRAW_f0_sz1160_f0_e1_metrics_data.pkl
 #Saved metrics PKL to /capstor/scratch/cscs/mbredber/classifier/4.1.runs/[50, 51]_DDPM_lr0.001_reg0.001_lo30_hi99_cs512x512_sz1160_f0_e0_lam0_metrics_data.pkl
 
 

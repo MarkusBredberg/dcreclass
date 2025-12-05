@@ -1513,562 +1513,91 @@ def reduce_by_class(images, labels, sample_size, num_classes):
     
     return reduced_images, reduced_labels
 
-def redistribute_excess(train_images, train_labels,
-                        eval_images,  eval_labels,
-                        target_classes,
+def redistribute_excess(train_images, eval_images, train_labels, eval_labels,
                         train_filenames=None, eval_filenames=None):
-
-    # 1) Pool everything
-    all_imgs = list(train_images) + list(eval_images)
-    all_lbls = list(train_labels) + list(eval_labels)
-    # only build filenames if provided, otherwise pad with None
-    all_fnames = (list(train_filenames) if train_filenames else []) \
-               + (list(eval_filenames)  if eval_filenames  else [])
-    if not all_fnames:
-        all_fnames = [None] * len(all_imgs)
-
-    # 2) Group by class, keeping filenames together
-    bins = defaultdict(list)
-    for img, lbl, fname in zip(all_imgs, all_lbls, all_fnames):
-        bins[int(lbl)].append((img, fname))
-        
-    # 3) Compute how many per class to put in eval:
-    total = len(all_imgs)
-    n_cls = len(target_classes)
-    per_class = math.ceil((total * 0.10) / n_cls)
-    per_class = min(per_class, min(len(bins[c]) for c in target_classes))
+    """
+    Balance the evaluation set by moving excess images from the larger class(es) 
+    to the training set, ensuring equal representation of each class in eval.
+    """
     
-    # 4) Split each bin by hash, preserving both img+fname
-    new_eval_imgs, new_eval_lbls, new_eval_fnames = [], [], []
-    new_train_imgs, new_train_lbls, new_train_fnames = [], [], []
+    # Work with tensors directly
+    if isinstance(train_labels, list):
+        train_labels = torch.tensor(train_labels, dtype=torch.long)
+    if isinstance(eval_labels, list):
+        eval_labels = torch.tensor(eval_labels, dtype=torch.long)
+    
+    train_fnames = train_filenames if train_filenames else []
+    eval_fnames = eval_filenames if eval_filenames else []
 
+    # Group eval samples by class using tensor operations
+    eval_bins = defaultdict(list)
+    for i in range(len(eval_images)):
+        lbl = int(eval_labels[i].item())
+        eval_bins[lbl].append(i)
+    
+    target_classes = sorted(set(eval_labels.tolist()))
+    
+    # Print before
+    print(f"Samples per each unique class in the evaluation set before redistribution: "
+          f"{Counter(eval_labels.tolist())}")
+    
+    # Find minimum class size
+    min_count = min(len(eval_bins[cls]) for cls in target_classes if cls in eval_bins)
+    keep_idxs, move_idxs = [], []
     for cls in target_classes:
-        items = bins[cls]
-        items_sorted = sorted(items, key=lambda x: img_hash(x[0]))
-        ev = items_sorted[:per_class]
-        tr = items_sorted[per_class:]
-        new_eval_imgs   += [x[0] for x in ev]
-        new_eval_lbls   += [cls]*len(ev)
-        new_eval_fnames += [x[1] for x in ev]
-        new_train_imgs   += [x[0] for x in tr]
-        new_train_lbls   += [cls]*len(tr)
-        new_train_fnames += [x[1] for x in tr]
-    
-    # 5) Convert back to original types
-    # — Images —
-    if isinstance(train_images, torch.Tensor):
-        # preserve shape if no examples
-        train_imgs2 = (torch.stack(new_train_imgs)
-                       if new_train_imgs
-                       else torch.empty((0,)+train_images.shape[1:]))
-    else:
-        train_imgs2 = new_train_imgs
-
-    if isinstance(eval_images, torch.Tensor):
-        eval_imgs2 = (torch.stack(new_eval_imgs)
-                      if new_eval_imgs
-                      else torch.empty((0,)+eval_images.shape[1:]))
-    else:
-        eval_imgs2 = new_eval_imgs
-
-    # — Labels —
-    if isinstance(train_labels, torch.Tensor):
-        train_lbls2 = torch.tensor(new_train_lbls, dtype=train_labels.dtype)
-    else:
-        train_lbls2 = new_train_lbls
-
-    if isinstance(eval_labels, torch.Tensor):
-        eval_lbls2 = torch.tensor(new_eval_lbls, dtype=eval_labels.dtype)
-    else:
-        eval_lbls2 = new_eval_lbls
+        if cls not in eval_bins:
+            continue
         
+        idxs = eval_bins[cls]
+        
+        # CRITICAL: Sort by filename hash for DETERMINISTIC selection
+        # This ensures the SAME samples are kept across all folds/modes
+        items_sorted = sorted(idxs, key=lambda i: hashlib.sha1(
+            str(eval_fnames[i] if eval_fnames else f"idx_{i}").encode("utf-8")).hexdigest())
+        
+        # Debug: Print which samples are being kept/moved
+        if eval_fnames:
+            kept_names = [eval_fnames[items_sorted[j]] for j in range(min(min_count, len(items_sorted)))]
+            moved_names = [eval_fnames[items_sorted[j]] for j in range(min_count, len(items_sorted))]
+            print(f"Class {cls}: Keeping {len(kept_names)} samples: {kept_names[:5]}{'...' if len(kept_names) > 5 else ''}")
+            if moved_names:
+                print(f"Class {cls}: Moving {len(moved_names)} samples to train: {moved_names[:5]}{'...' if len(moved_names) > 5 else ''}")
+        
+        keep_idxs.extend(items_sorted[:min_count])
+        move_idxs.extend(items_sorted[min_count:])
+    
+    # Use tensor indexing - much faster than list operations
+    new_eval_imgs = eval_images[keep_idxs]
+    new_eval_lbls = eval_labels[keep_idxs]
+    new_eval_fnames = [eval_fnames[i] for i in keep_idxs] if eval_fnames else []
+    
+    # Move excess to train using cat
+    if move_idxs:
+        to_move_imgs = eval_images[move_idxs]
+        to_move_lbls = eval_labels[move_idxs]
+        to_move_fnames = [eval_fnames[i] for i in move_idxs] if eval_fnames else []
+        
+        final_train_imgs = torch.cat([train_images, to_move_imgs], dim=0)
+        final_train_lbls = torch.cat([train_labels, to_move_lbls], dim=0)
+        final_train_fnames = (list(train_fnames) if train_fnames else []) + to_move_fnames
+    else:
+        final_train_imgs = train_images
+        final_train_lbls = train_labels
+        final_train_fnames = train_fnames if train_fnames else []
+    
+    # Print after
+    print(f"Samples per each unique class in evaluation set after redistribution: "
+          f"{Counter(new_eval_lbls.tolist())}")
+    
     return (
-        train_imgs2, train_lbls2,
-        new_train_fnames if train_filenames else [],
-        eval_imgs2,  eval_lbls2,
-        new_eval_fnames  if eval_filenames  else [],
+        final_train_imgs, new_eval_imgs, 
+        final_train_lbls, new_eval_lbls,
+        final_train_fnames, new_eval_fnames
     )
     
 ##########################################################################################
 ################################## SPECIFIC DATASET LOADER ###############################
 ##########################################################################################
-
-
-def load_galaxy10(path=root_path + 'Galaxy10.h5', sample_size=300, target_classes=[4], 
-                  crop_size=(3, 256, 256), downsample_size=(3, 256, 256), fold=None, island=True, train=False):
-    print("Loading Galaxy10 data...")
-
-    try:
-        with h5py.File(path, 'r') as F:
-            images = np.array(F['images'])
-            labels = np.array(F['ans']).astype(int)
-
-            all_images, all_labels = [], []
-            for cls in target_classes:
-                class_indices = np.where(labels == cls)[0]
-                print(f"Number of images in class {cls}: {len(class_indices)}")
-                
-                if len(class_indices) == 0:
-                    continue
-
-                selected_images = 2 * (images[class_indices].astype(np.float32) / 255.0 - .5)
-                if crop_size[-3] == 1:  
-                    selected_images = np.mean(selected_images, axis=-1, keepdims=True)
-
-                filtered_images = isolate_galaxy_batch(selected_images)
-                print(f"Number of images remaining after isolate_galaxy_batch: {len(filtered_images)} \n")
-
-                class_images, class_labels = [], []
-                selected_images = np.moveaxis(selected_images, -1, 1)
-
-                for image in filtered_images:
-                    image = torch.tensor(image, dtype=torch.float)
-                    if crop_size != 256:
-                        image = apply_formatting(image, crop_size, downsample_size)
-                    class_images.append(image)
-                    class_labels.append(cls)
-
-                all_images.append(torch.stack(class_images))
-                all_labels.append(torch.tensor(class_labels))
-
-            if all_images:
-                all_images = torch.cat(all_images).clone().detach()
-                all_labels = torch.cat(all_labels).clone().detach()
-
-            print(f"Total number of images: {len(all_images)}")
-            print(f"Total number of labels: {len(all_labels)}")
-
-            if len(all_images) == 0 or len(all_labels) == 0:
-                raise ValueError("No data available after filtering.")
-
-            skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
-
-            if fold is None or fold < 0 or fold >= 5:
-                raise ValueError("Fold must be an integer between 0 and 4")
-
-            for fold_idx, (train_idx, test_idx) in enumerate(skf.split(all_images, all_labels)):
-                if fold_idx == fold:
-                    train_images = all_images[train_idx]
-                    train_labels = all_labels[train_idx]
-                    eval_images = all_images[test_idx]
-                    eval_labels = all_labels[test_idx]
-                    break
-
-            # Ensure all images have consistent shape (cropping and resizing)
-            train_images = [apply_formatting(img, crop_size, downsample_size) for img in train_images]
-            eval_images = [apply_formatting(img, crop_size, downsample_size) for img in eval_images]
-                
-            # Limit by sample size
-            if sample_size is not None and sample_size > 0:
-                if len(train_images) > 10:
-                    train_images, train_labels = reduce_by_class(train_images, train_labels, sample_size, len(target_classes))
-                if len(eval_images) > 10:
-                    eval_images, eval_labels = reduce_by_class(eval_images, eval_labels, int(sample_size*0.2), len(target_classes))
-
-    except OSError as e:
-        print(f"Failed to open the file: {e}")
-
-    if not train:
-        return train_images, train_labels
-    
-    return train_images, train_labels, eval_images, eval_labels
-
-
-def load_FIRST(path=None, fold=0, target_classes=None, crop_size=(1, 300, 300), downsample_size=(300, 300), sample_size=300,
-               island=False, REMOVEOUTLIERS=True, BALANCE=False, AUGMENT=False, train=True):
-    print("Loading FIRST data...")
-    
-    class_mapping = {10: 'FRI', 11: 'FRII', 12: 'Compact', 13: 'Bent'}
-    target_classes_names = [class_mapping.get(tc, tc) for tc in target_classes]
-    if len(downsample_size) == 3:
-        downsample_size = downsample_size[1:]
-    if len(crop_size) == 3:
-        crop_size = crop_size[1:]
-    
-    def get_data(data):
-        images, labels = [], []
-        for item in data:
-            images.append(item[0])
-            labels.append(item[1])
-        return images, labels
-
-    if fold is not None and fold >= 0 and fold < 6:
-        if fold == 5:
-            train_data = FIRSTGalaxyData(root="./.cache", selected_split="train", input_data_list=[f"galaxy_data_h5.h5"],
-                                        selected_classes=target_classes_names, is_PIL=True, is_RGB=False, transform=transforms.ToTensor())
-            if train:
-                eval_data = FIRSTGalaxyData(root="./.cache", selected_split="valid", input_data_list=[f"galaxy_data_h5.h5"],
-                                            selected_classes=target_classes_names, is_PIL=True, is_RGB=False, transform=transforms.ToTensor())
-            else:
-                eval_data = FIRSTGalaxyData(root="./.cache", selected_split="test", input_data_list=[f"galaxy_data_h5.h5"],
-                                            selected_classes=target_classes_names, is_PIL=True, is_RGB=False, transform=transforms.ToTensor())
-        else:
-            train_data = FIRSTGalaxyData(root="./.cache", selected_split="train", input_data_list=[f"galaxy_data_crossvalid_{fold}_h5.h5"],
-                                         selected_classes=target_classes_names, is_PIL=True, is_RGB=False, transform=transforms.ToTensor())
-            if train:
-                eval_data = FIRSTGalaxyData(root="./.cache", selected_split="valid", input_data_list=[f"galaxy_data_crossvalid_{fold}_h5.h5"],
-                                            selected_classes=target_classes_names, is_PIL=True, is_RGB=False, transform=transforms.ToTensor())
-            else:
-                eval_data = FIRSTGalaxyData(root="./.cache", selected_split="test", input_data_list=["galaxy_data_crossvalid_test_h5.h5"],
-                                            selected_classes=target_classes_names, is_PIL=True, is_RGB=False, transform=transforms.ToTensor()) # Smaller sample of test data
-
-            
-        train_images, train_labels = get_data(train_data)
-        eval_images, eval_labels = get_data(eval_data)
-        
-        # Add 10 to the labels to match the class mapping
-        train_labels = [lbl + 10 for lbl in train_labels]
-        eval_labels  = [lbl + 10 for lbl in eval_labels]
-
-        if len(eval_images) == 0:
-            raise ValueError("No valid images found. Check the dataset and loading process.")
-
-                
-        train_images = torch.stack(train_images)
-        eval_images = torch.stack(eval_images)
-        train_labels = torch.tensor(train_labels, dtype=torch.long)
-        eval_labels  = torch.tensor(eval_labels,  dtype=torch.long)
-
-        return train_images, train_labels, eval_images, eval_labels
-
-    else:
-        raise ValueError("Fold must be an integer between 0 and 5")
-
-def load_MNIST(target_classes=[19], fold=0, crop_size=(1, 28, 28), downsample_size=(1, 28, 28), sample_size=60000, train=False, batch_size=32):
-    print("Loading MNIST data...")
-    train_data = datasets.MNIST(root=root_path, train=True, download=True, transform=transforms.ToTensor())
-    train_loader = DataLoader(train_data, REMOVEOUTLIERS=True, batch_size=batch_size, shuffle=True)
-
-    train_images = []
-    train_labels = []
-
-    if set(target_classes) & {18} & {19}:
-        digit_classes = list(range(10))  # Include all digits if 18 or 19 is in target_classes
-    else:
-        digit_classes = [tc % 10 for tc in target_classes]  # Map each target_class to a digit
-
-    for batch_images, batch_labels in train_loader:
-        for i, label in enumerate(batch_labels):
-            if label.item() in digit_classes:
-                image = batch_images[i]
-                if crop_size[1] != 28:
-                    image = apply_formatting(image, crop_size, downsample_size)
-                train_images.append(image)
-                train_labels.append(label.item())
-                if len(train_images) >= sample_size:
-                    break
-        if len(train_images) >= sample_size:
-            break
-
-    train_images = torch.stack(train_images).clone().detach()
-    train_labels = torch.tensor(train_labels, dtype=torch.long)
-
-    if not train:
-        return train_images, train_labels
-    else:
-        test_data = datasets.MNIST(root='./data', train=False, download=True, transform=transforms.ToTensor())
-        test_loader = DataLoader(test_data, batch_size=batch_size, shuffle=False)
-
-        test_images = []
-        test_labels = []
-
-        for batch_images, batch_labels in test_loader:
-            for i, label in enumerate(batch_labels):
-                if label.item() in digit_classes:
-                    image = batch_images[i]
-                    if crop_size[1] != 28:
-                        image = apply_formatting(image, crop_size, island=False)
-                    test_images.append(image)
-                    test_labels.append(label.item())
-                    if len(test_images) >= int(0.15 * sample_size):
-                        break
-            if len(test_images) >= int(0.15 * sample_size):
-                break
-
-        test_images = torch.stack(test_images).clone().detach()
-        test_labels = torch.tensor(test_labels, dtype=torch.long)
-
-        return train_images, train_labels, test_images, test_labels
-    
-    
-def load_RGZ10k(path=root_path + "RGZ_10k", fold=5, target_classes=None, crop_size=(1, 132, 132), sample_size=300, train=True, random_state=SEED):
-    print("Loading rgz10k data...")
-    """
-    Returns splits from the RGZ10k dataset.
-
-    All images (7,702 total) are now assumed to be in the path.
-    The allowed labels are defined in the function.
-
-    For fold values 0–4, a standard 5‑fold stratified split is performed:
-      - The training set is the union of 4 folds,
-      - The validation set is the remaining fold.
-
-    For fold == 5, a final test split is created by removing a balanced test set,
-    consisting of 150 images per allowed class, from the overall dataset.
-    The remaining images form the training set.
-
-    Additionally, if sample_size is provided (>0), the training set is reduced so that 
-    each class contains at most sample_size images, and the evaluation set is reduced 
-    to at most int(sample_size*0.2) images per class.
-
-    Parameters:
-      - fold: An integer between 0 and 5.
-          * 0–4: 5-fold cross validation.
-          * 5: Final test split with a balanced test set (150 images per allowed class).
-      - path: Path to the folder containing all images and the subfolder "annotation".
-      - random_state: For reproducible shuffling/sampling.
-      - sample_size: Maximum number of images per class (for training; eval set uses sample_size*0.2).
-      - REMOVEOUTLIERS: If True, remove outlier images similar to the FIRST function.
-    
-    Returns:
-      - train_images: List of PyTorch tensors for training images.
-      - train_labels: List of labels corresponding to train_images.
-      - eval_images:  List of PyTorch tensors for evaluation images (validation or test set).
-      - eval_labels:  List of labels corresponding to eval_images.
-    """
-    import xml.etree.ElementTree as ET
-    # (Assumes that augment_images, reduce_by_class, remove_outliers, and plot_cut_flow_for_all_filters are imported)
-    
-    # Full set of allowed labels in the dataset.
-    allowed_labels_all = ["1_1", "1_2", "1_3", "2_2", "2_3", "3_3"]
-
-    # If target_classes is None, use default mapping (all classes).
-    if target_classes is None:
-        target_classes = [31, 32, 33, 34, 35, 36]
-        
-    mapping = {31: "1_1", 32: "1_2", 33: "1_3", 34: "2_2", 35: "2_3", 36: "3_3"}
-    target_allowed_labels = {mapping[num] for num in target_classes}
-
-    # Define folder path for annotations.
-    annotation_folder = os.path.join(path, "annotation")
-    
-    # ------------------------------------------------------------
-    # Step 1. Build a mapping from image filename (from XML) to its XML file.
-    # ------------------------------------------------------------
-    xml_mapping = {}  # key: image filename; value: XML file path
-    xml_files = glob.glob(os.path.join(annotation_folder, "*.xml"))
-    for xml_file in xml_files:
-        try:
-            tree = ET.parse(xml_file)
-            root = tree.getroot()
-            filename_elem = root.find("filename")
-            if filename_elem is None:
-                continue
-            img_filename = filename_elem.text.strip()
-            if img_filename not in xml_mapping:
-                xml_mapping[img_filename] = xml_file
-        except Exception as e:
-            print(f"Error processing {xml_file}: {e}")
-    
-    # ------------------------------------------------------------
-    # Step 2. Define a helper to extract a label from an XML file.
-    # (Return the first allowed label encountered.)
-    # ------------------------------------------------------------
-    def get_label_from_xml(xml_file):
-        try:
-            tree = ET.parse(xml_file)
-            root = tree.getroot()
-            for obj in root.findall("object"):
-                name_elem = obj.find("name")
-                if name_elem is None:
-                    continue
-                label = name_elem.text.strip()
-                if label in allowed_labels_all:
-                    return label
-            return None
-        except Exception as e:
-            print(f"Error processing XML {xml_file}: {e}")
-            return None
-    
-    # ------------------------------------------------------------
-    # Step 3. Process all PNG images in the path.
-    # ------------------------------------------------------------
-    def process_folder(folder):
-        data = []  # Will hold tuples: (image_path, label)
-        png_files = glob.glob(os.path.join(folder, "*.png"))
-        for png_path in png_files:
-            png_filename = os.path.basename(png_path)
-            # Adjust the filename if needed (remove suffix variations).
-            base_name = re.sub(r"(_logminmax|_infraredctmask)?\.png$", ".png", png_filename)
-            xml_file = None
-            if base_name in xml_mapping:
-                xml_file = xml_mapping[base_name]
-            elif png_filename in xml_mapping:
-                xml_file = xml_mapping[png_filename]
-            if not xml_file:
-                continue  # No matching XML annotation found.
-            label = get_label_from_xml(xml_file)
-            if label is None:
-                continue
-            data.append((png_path, label))
-        return data
-
-    # ------------------------------------------------------------
-    # Step 4: Process the entire dataset (all images are now in path).
-    # ------------------------------------------------------------
-    all_data = process_folder(path)
-    if len(all_data) == 0:
-        raise ValueError(f"No images found in path {path}. Check your folder and XML annotations.")
-
-
-    # Filter the dataset to include only images whose label is in the target set.
-    all_data = [(img, lbl) for img, lbl in all_data if lbl in target_allowed_labels]
-
-    # Organize data by label.
-    data_by_label = {label: [] for label in target_allowed_labels}
-    
-    # ------------------------------------------------------------
-    # Step 5. Split the dataset.
-    # ------------------------------------------------------------
-    if fold == 5:
-        # For fold==5, create a final test split by sampling 150 images per allowed class.
-        # The remaining images will be used for training.
-        for img_path, label in all_data:
-            data_by_label[label].append((img_path, label))
-        test_set = []
-        random.seed(random_state)
-        for label in target_allowed_labels:
-            items = data_by_label[label]
-            if len(items) < 150:
-                raise ValueError(f"Not enough images for label {label}: need 150 but got {len(items)}")
-            sampled = random.sample(items, 150)
-            test_set.extend(sampled)
-        test_paths = set(x[0] for x in test_set)
-        train_set = [item for item in all_data if item[0] not in test_paths]
-        
-        train_images = [x[0] for x in train_set]
-        train_labels  = [x[1] for x in train_set]
-        eval_images = [x[0] for x in test_set]
-        eval_labels  = [x[1] for x in test_set]
-    elif 0 <= fold < 5:
-        # Standard 5-fold cross validation using stratified splitting.
-        X = [item[0] for item in all_data]
-        y = [item[1] for item in all_data]
-        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
-        splits = list(skf.split(X, y))
-        try:
-            train_idx, valid_idx = splits[fold]
-        except IndexError:
-            raise ValueError(f"Could not obtain fold {fold} from the dataset splits.")
-        train_images = [X[i] for i in train_idx]
-        train_labels  = [y[i] for i in train_idx]
-        eval_images = [X[i] for i in valid_idx]
-        eval_labels  = [y[i] for i in valid_idx]
-    else:
-        raise ValueError("fold must be an integer between 0 and 5 (0-4 for CV, 5 for final test).")
-    
-    # ------------------------------------------------------------
-    # Step 6. Load and preprocess images.
-    # ------------------------------------------------------------
-    # Load and reshape train images.
-    images = []
-    for img_path in train_images:
-        # Load the image in grayscale.
-        img_data = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-        if img_data is None:
-            raise ValueError(f"Failed to load image: {img_path}")
-        # Resize if needed.
-        img_data = cv2.resize(img_data, (crop_size[-2], crop_size[-1]))
-        # Reshape to the desired shape.
-        img_data = img_data.reshape(crop_size)
-        images.append(img_data)
-    train_images = np.stack(images, axis=0)
-    
-    # Do the same for eval_images
-    images = []
-    for img_path in eval_images:
-        img_data = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-        if img_data is None:
-            raise ValueError(f"Failed to load image: {img_path}")
-        img_data = cv2.resize(img_data, (crop_size[-2], crop_size[-1]))
-        img_data = img_data.reshape(crop_size)
-        images.append(img_data)
-    eval_images = np.stack(images, axis=0)
-    
-    # Convert NumPy arrays to lists of PyTorch tensors.
-    train_images = [torch.tensor(img, dtype=torch.float32) / 255.0 for img in train_images]
-    eval_images = [torch.tensor(img, dtype=torch.float32) / 255.0 for img in eval_images]
-    
-    # Rename the labels to integer values.
-    label_mapping = {label: idx for idx, label in enumerate(target_allowed_labels)}
-    train_labels = [label_mapping[lbl] for lbl in train_labels]
-    eval_labels = [label_mapping[lbl] for lbl in eval_labels]
-    
-    
-    return train_images, train_labels, eval_images, eval_labels
-
-
-
-def load_MGCLS(path='/users/mbredber/data/MGCLS/classified_crops_1600/',  # Path to MGCLS data
-               fold=None,
-               target_classes=[40],
-               crop_size=(1600, 1600),
-               downsample_size=(128, 128),
-               sample_size=300,
-               BALANCE=False, AUGMENT=False,
-               train=False):
-
-
-    print("Loading MGCLS diffuse data…")
-
-    # build a map tag→folder
-    classes_map = {c['tag']: c['description'] for c in get_classes()}
-
-    images, labels, filenames = [], [], []
-    for cls in target_classes:
-        folder = classes_map.get(cls)
-        if folder is None:
-            continue
-        class_dir = os.path.join(path, folder)
-        for fn in os.listdir(class_dir):
-            if fn.lower().endswith((".jpg", ".jpeg", ".png")):
-                with Image.open(os.path.join(class_dir, fn)) as img:
-                    pil_gray = img.convert("L")
-                    tensor = transforms.ToTensor()(pil_gray)
-                    tensor = apply_formatting(tensor, crop_size, downsample_size)
-                images.append(tensor)
-                labels.append(cls)
-                filenames.append(fn)
-
-    if not images:
-        raise ValueError("No images loaded. Check the path and file extensions.")
-    
-    # throttle total loaded images
-    if sample_size is not None and len(images) > sample_size:
-        images, labels, filenames = (
-            list(images)[:sample_size],
-            list(labels)[:sample_size],
-            list(filenames)[:sample_size],
-        )
-
-    # === GROUP-AWARE SPLIT ===
-    # 1) extract group key (everything before the final underscore)
-    groups = [fn.rsplit('_', 1)[0] for fn in filenames]
-
-    # 2) unique groups and one label per group
-    unique_groups, inverse_idxs = np.unique(groups, return_inverse=True)
-    # pick the first occurrence of each group to get its label
-    group_labels = [labels[groups.index(g)] for g in unique_groups]
-
-    # 3) split groups, stratified by their class
-    train_groups, test_groups = train_test_split(
-        unique_groups,
-        test_size=0.2,
-        stratify=group_labels,
-        random_state=SEED
-    )
-
-    # 4) assign each file to train/test based on its group
-    train_idx = [i for i, g in enumerate(groups) if g in train_groups]
-    test_idx  = [i for i, g in enumerate(groups) if g in test_groups]
-
-    train_images = [images[i] for i in train_idx]
-    train_labels = [labels[i] for i in train_idx]
-    eval_images  = [images[i] for i in test_idx]
-    eval_labels  = [labels[i] for i in test_idx]
-
-    return train_images, train_labels, eval_images, eval_labels
-
 
 def load_PSZ2(
     path = root_path + "PSZ2/classified/",
@@ -2077,7 +1606,7 @@ def load_PSZ2(
     versions = "T100kpcSUB",          # string or list/tuple; list => Multiple versions
     crop_size = (1, 512, 512),        # (C,Hc,Wc) — angular FoV is taken from the ref version
     downsample_size = (1, 128, 128),  # (C,Ho,Wo) — output per frame
-    fold = 5,                         # 0..4 = CV folds, 5 = last split
+    fold = 0,                         # 0..9 = CV folds
     train = False,                    # Not implemented
     processed_dir = "/users/mbredber/scratch/create_image_sets_outputs/processed_psz2_fits", # directory for preformatted images
     prefer_processed = True,   # whether to prefer processed images when available
@@ -2089,15 +1618,16 @@ def load_PSZ2(
     # Format and taper data with taper_tools.create_image_sets.py
     # This is the data loader for any version of the processed data
 
-    print("Parameters:")
-    print("  path:", path)
-    print("  versions:", versions)
-    print("  crop_size:", crop_size)
-    print("  downsample_size:", downsample_size)
-    print("  target_classes:", target_classes)
-    print("  processed_dir:", processed_dir)
-    print("  prefer_processed:", prefer_processed)
-    print("  gate_with:", gate_with)
+    if fold == 0 and train == True:
+        print("Parameters:")
+        print("  path:", path)
+        print("  versions:", versions)
+        print("  crop_size:", crop_size)
+        print("  downsample_size:", downsample_size)
+        print("  target_classes:", target_classes)
+        print("  processed_dir:", processed_dir)
+        print("  prefer_processed:", prefer_processed)
+        print("  gate_with:", gate_with)
 
     def _kpc_tag(v):
         # Find the canonical kpc tag for a version string
@@ -2615,8 +2145,8 @@ def load_PSZ2(
 
 
 def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=None, crop_size=None, downsample_size=None, sample_size=None, DEBUG=False,
-                  REMOVEOUTLIERS=True, BALANCE=False, AUGMENT=False, USE_GLOBAL_NORMALISATION=False, GLOBAL_NORM_MODE="percentile", STRETCH=False, percentile_lo=30, percentile_hi=99,
-                 NORMALISE=True, NORMALISETOPM=False, PREFER_PROCESSED=True, EXTRADATA=False, PRINTFILENAMES=False, SAVE_IMAGES=False, train=None):
+                  REMOVEOUTLIERS=True, BALANCE=False, AUGMENT=False, USE_GLOBAL_NORMALISATION=False, GLOBAL_NORM_MODE="percentile", STRETCH=False, alpha=10.0,
+                  percentile_lo=30, percentile_hi=99, NORMALISE=True, NORMALISETOPM=False, PREFER_PROCESSED=True, EXTRADATA=False, PRINTFILENAMES=False, SAVE_IMAGES=False, train=None):
     """
     Master loader that delegates to specific dataset loaders and returns zero-based labels.
     """
@@ -2633,26 +2163,7 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
     max_class = get_max_class(galaxy_classes)
 
     # Delegate to specific loaders based on class range
-    if max_class < 10:
-        path = root_path + 'Galaxy10.h5'
-        target_classes = galaxy_classes if isinstance(galaxy_classes, list) else [galaxy_classes]
-        data = load_galaxy10(path=path, target_classes=target_classes, **clean_kwargs)
-    elif max_class < 14:
-        if clean_kwargs.get('crop_size') is not None:
-            clean_kwargs['crop_size'] = np.squeeze(clean_kwargs['crop_size'])
-        path = root_path + 'firstgalaxydata/'
-        target_classes = galaxy_classes if isinstance(galaxy_classes, list) else [galaxy_classes]
-        data = load_FIRST(path=path, target_classes=target_classes, **clean_kwargs)
-    elif max_class < 30:
-        target_classes = galaxy_classes if isinstance(galaxy_classes, list) else [galaxy_classes]
-        data = load_MNIST(target_classes=target_classes, **clean_kwargs)
-    elif max_class < 37:
-        target_classes = galaxy_classes if isinstance(galaxy_classes, list) else [galaxy_classes]
-        data = load_RGZ10k(target_classes=target_classes, **clean_kwargs)
-    elif max_class < 50:
-        target_classes = galaxy_classes if isinstance(galaxy_classes, list) else [galaxy_classes]
-        data = load_MGCLS(target_classes=target_classes, **clean_kwargs)
-    elif max_class <= 59:
+    if max_class <= 59 and max_class >= 50:
         target_classes = galaxy_classes if isinstance(galaxy_classes, list) else [galaxy_classes]
         data = load_PSZ2(target_classes=target_classes, **clean_kwargs)
     else:
@@ -2704,8 +2215,8 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
     if BALANCE:
         train_images, train_labels = balance_classes(train_images, train_labels) # Remove excess images from the largest class
             
-    sample_indices = {}
     # Convert labels to a list if they are tensors
+    sample_indices = {}
     if isinstance(train_labels, torch.Tensor):
         train_labels = train_labels.tolist()
     for cls in sorted(set(train_labels)):
@@ -2726,8 +2237,10 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
 
     if NORMALISE:
         if isinstance(train_images, list):
+            print("Converting train_images list to tensor for normalisation.")
             train_images = torch.stack(train_images)
         if isinstance(eval_images, list):
+            print("Converting eval_images list to tensor for normalisation.")
             eval_images = torch.stack(eval_images)
         all_images = torch.cat([train_images, eval_images], dim=0)
         #all_images = normalise_images(all_images, out_min=0, out_max=1)  
@@ -2770,24 +2283,15 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
 
     if STRETCH:
         # Concatenate so train/eval get the exact same mapping
-        alpha = 10.0
         all_images = torch.cat([train_images, eval_images], dim=0)
-        
-        # THIS IS THE SAME AS IN DL2
-        images = np.stack([img.squeeze().numpy() for img in all_images], axis=0)
-        pct = torch.from_numpy(images).float()     
-        images = asinh_stretch(pct, alpha=10) #Alt: log_stretch
-        train_images = images[:len(train_images)]
-        eval_images  = images[len(train_images):]
-        
-        if False: # This is in DL1
-            # Asinh stretch (elementwise), preserves shape/device/dtype
-            stretched = torch.asinh(all_images * alpha) / math.asinh(alpha)
+                
+        # Asinh stretch (elementwise), preserves shape/device/dtype
+        stretched = torch.asinh(all_images * alpha) / math.asinh(alpha)
 
-            # Split back
-            n_tr = train_images.shape[0]
-            train_images = stretched[:n_tr]
-            eval_images  = stretched[n_tr:]
+        # Split back
+        n_tr = train_images.shape[0]
+        train_images = stretched[:n_tr]
+        eval_images  = stretched[n_tr:]
         
         if DEBUG:
             print("Applying asinh stretch")
@@ -2795,8 +2299,7 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
             plot_class_images(eval_images,  eval_labels,  eval_filenames,  set_name='eval_3.after_stretching')
 
     # Always redistribute excess images for the test data, for fair evaluation
-    classes_present = torch.unique(torch.cat([torch.tensor(train_labels), torch.tensor(eval_labels)])).tolist()
-    train_images, train_labels, train_filenames, eval_images, eval_labels, eval_filenames = redistribute_excess(train_images, train_labels, eval_images, eval_labels, classes_present, train_filenames, eval_filenames)
+    train_images,  eval_images, train_labels, eval_labels, train_filenames, eval_filenames = redistribute_excess(train_images, eval_images, train_labels, eval_labels, train_filenames, eval_filenames)
     
     if SAVE_IMAGES:
         for kind, imgs, lbls in (
@@ -2866,5 +2369,169 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
         eval_data  = torch.tensor(np.stack(eval_data),  dtype=torch.float32)
         return train_images, train_labels, eval_images, eval_labels, train_data, eval_data
     
-    
     return train_images, train_labels, eval_images, eval_labels
+
+
+def load_halos_and_relics(
+    galaxy_classes,
+    versions=('RAW',),
+    fold=5,
+    crop_size=(1, 128, 128),
+    downsample_size=(1, 128, 128),
+    sample_size=1_000_000,
+    REMOVEOUTLIERS=True,
+    BALANCE=False,
+    STRETCH=False,
+    percentile_lo=1,
+    percentile_hi=99,
+    AUGMENT=False,
+    NORMALISE=True,
+    NORMALISETOPM=False,
+    USE_GLOBAL_NORMALISATION=False,
+    GLOBAL_NORM_MODE='percentile',
+    PRINTFILENAMES=False,
+    train=True,
+):
+    """
+    Unifies dataset loading so the training driver can call a single entry point.
+    Returns:
+      train=True:
+        4-tuple: (train_images, train_labels, valid_images, valid_labels)
+        6-tuple if PRINTFILENAMES: (..., train_fns, valid_fns)
+      train=False:
+        4-tuple: (empty_images, empty_labels, test_images, test_labels)
+        6-tuple if PRINTFILENAMES: (..., test_fns)
+    Notes:
+      * Labels are left as original class tags (e.g. 52, 53). The driver relabels later.
+      * If multiple `versions` are provided (e.g. ['RAW','T50kpc']), PSZ2 returns a tesseract [T,1,H,W] per sample.
+    """
+
+    # -------- 1) Load raw images/labels (+ optional filenames) ----------
+    # Decide dataset family from class tags
+    is_psz2  = any(50 <= int(c) <= 58 for c in galaxy_classes)
+    is_first = any(10 <= int(c) <= 13 for c in galaxy_classes)
+
+    images = labels = filenames = None
+
+    if is_psz2:
+        raw = load_PSZ2(
+            path = root_path + "PSZ2/classified/",
+            sample_size = sample_size,              # per class in training set; eval uses sample_size*0.2
+            target_classes = galaxy_classes,  # list of int class tags to load
+            versions = versions,          # string or list/tuple; list => Multiple versions
+            crop_size = crop_size,        # (C,Hc,Wc) — angular FoV is taken from the ref version
+            downsample_size = downsample_size,  # (C,Ho,Wo) — output per frame
+        )
+        
+        if len(raw) == 6:
+            tr_imgs, tr_lbls, ev_imgs, ev_lbls, tr_fns, ev_fns = raw
+        elif len(raw) == 4:
+            tr_imgs, tr_lbls, ev_imgs, ev_lbls = raw
+            tr_fns, ev_fns = [], []
+        else:
+            raise RuntimeError(f"load_PSZ2 returned unexpected shape (len={len(raw)})")
+        # combine so we can stratify/split here
+        def _as_list(x):
+            return [x[i] for i in range(len(x))] if torch.is_tensor(x) else list(x)
+        images    = _as_list(tr_imgs) + _as_list(ev_imgs)
+        labels    = (tr_lbls.cpu().tolist() if torch.is_tensor(tr_lbls) else list(tr_lbls)) + \
+                    (ev_lbls.cpu().tolist() if torch.is_tensor(ev_lbls) else list(ev_lbls))
+        filenames = list(tr_fns) + list(ev_fns)
+    else:
+        raise ValueError("load_galaxies: unsupported class set; add a branch for your dataset.")
+
+    # Ensure list types
+    if isinstance(images, torch.Tensor):
+        images = [img for img in images]
+    if isinstance(labels, torch.Tensor):
+        labels = labels.cpu().tolist()
+
+    # -------- 2) Optional image-level transforms (percentile stretch, asinh, normalise) ----------
+    def _maybe_proc(img):
+        x = img
+        if STRETCH:
+            # per-image percentile stretch then asinh, like the driver expects
+            x = percentile_stretch(x, lo=percentile_lo, hi=percentile_hi)
+            x = asinh_stretch(x, alpha=10)
+        if NORMALISE:
+            if NORMALISETOPM:
+                x = normalise_images(x, -1, 1)
+            else:
+                x = normalise_images(x, 0, 1)
+        return x
+
+    images = [_maybe_proc(x) for x in images]
+
+    # -------- 3) Optional class balancing (undersample to min class size) ----------
+    if BALANCE:
+        from collections import defaultdict
+        byc = defaultdict(list)
+        for i, lbl in enumerate(labels):
+            byc[int(lbl)].append(i)
+        min_n = min(len(v) for v in byc.values())
+        keep = []
+        for v in byc.values():
+            keep.extend(v[:min_n])
+        keep = sorted(keep)
+        images   = [images[i] for i in keep]
+        labels   = [labels[i] for i in keep]
+        filenames = [filenames[i] for i in keep] if filenames else []
+
+    # -------- 4) Optional augmentation (pre-split, like your current driver when LATE_AUG=False) ----------
+    if AUGMENT:
+        imgs_t = torch.stack(images)
+        lbls_t = torch.tensor(labels, dtype=torch.long)
+        imgs_t, lbls_t = augment_images(imgs_t, lbls_t)
+        images = [imgs_t[i] for i in range(len(imgs_t))]
+        labels = lbls_t.cpu().tolist()
+        if filenames:
+            # replicate filenames n_aug times
+            n_aug = len(images) // max(1, len(filenames))
+            filenames = [fn for fn in filenames for _ in range(n_aug)]
+
+    # -------- 5) Stratified split into train/valid (or build test only) ----------
+    y = np.array(labels)
+    idx_all = np.arange(len(y))
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
+    splits = list(skf.split(idx_all, y))
+    # Map fold==5 to "last split" for your driver’s convention
+    split_idx = fold if fold in [0,1,2,3,4] else 4
+    tr_idx, va_idx = splits[split_idx]
+
+    def _take(idxs):
+        ims = [images[i] for i in idxs]
+        lbs = torch.tensor([labels[i] for i in idxs], dtype=torch.long)
+        fns = [filenames[i] for i in idxs] if filenames else []
+        # stack if 3D or 4D tensors, else leave as-is
+        try:
+            ims = torch.stack(ims)
+        except Exception:
+            pass
+        return ims, lbs, fns
+
+    train_images, train_labels, train_fns = _take(tr_idx)
+    valid_images, valid_labels, valid_fns = _take(va_idx)
+
+    # Optionally bound per-class sample sizes
+    if isinstance(sample_size, int) and sample_size > 0:
+        # limit train set per class
+        cls_counts = {c:0 for c in sorted(set(labels))}
+        keep = []
+        for i, lbl in enumerate(train_labels.tolist()):
+            if cls_counts[lbl] < sample_size:
+                keep.append(i); cls_counts[lbl] += 1
+        train_images = train_images[keep]
+        train_labels = train_labels[keep]
+        if train_fns:
+            train_fns = [train_fns[i] for i in keep]
+
+    if not train:
+        empty_imgs = torch.empty((0,)+tuple(train_images.shape[1:])) if isinstance(train_images, torch.Tensor) else []
+        empty_lbls = torch.empty((0,), dtype=torch.long)
+        if PRINTFILENAMES:
+            return empty_imgs, empty_lbls, valid_images, valid_labels, [], valid_fns
+        return empty_imgs, empty_lbls, valid_images, valid_labels
+
+    if PRINTFILENAMES:
+        return train_images, train_labels, valid_images, valid_labels, train_fns, valid_fns
+    return train_images, train_labels, valid_images, valid_labels

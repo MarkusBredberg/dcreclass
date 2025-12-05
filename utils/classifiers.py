@@ -17,7 +17,7 @@ def grad_reverse(x, lambd=1.0):
 
 
 class TinyCNN(nn.Module):
-    def __init__(self, input_shape, num_classes=4):
+    def __init__(self, input_shape, num_classes=2):
         super(TinyCNN, self).__init__()
         # Define basic convolutional layers
         self.feature_extractor = nn.Sequential(
@@ -49,7 +49,8 @@ class TinyCNN(nn.Module):
     def forward(self, x):
         x = self.feature_extractor(x)
         x = self.classifier(x)
-        return torch.softmax(x)
+        return x
+    
 
 
 class NEWRustigeClassifier(nn.Module):

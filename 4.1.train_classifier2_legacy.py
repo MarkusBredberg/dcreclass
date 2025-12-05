@@ -1,6 +1,5 @@
 import os, re, time, random, pickle, hashlib, itertools, torch
-#from utils.data_loader import load_galaxies, get_classes, get_synthetic, augment_images
-from utils.data_loader2_old import load_galaxies, get_classes, augment_images
+from utils.data_loader import load_galaxies, get_classes, get_synthetic, augment_images
 from utils.classifiers import RustigeClassifier, TinyCNN, MLPClassifier, SCNN, CNNSqueezeNet, ScatterResNet, DANNClassifier, BinaryClassifier, ScatterSqueezeNet, ScatterSqueezeNet2, DualCNNSqueezeNet
 from utils.training_tools import EarlyStopping, reset_weights
 from utils.calc_tools import cluster_metrics, normalise_images, check_tensor, fold_T_axis, compute_scattering_coeffs, custom_collate
@@ -17,9 +16,9 @@ import pandas as pd
 from tqdm import tqdm
 import matplotlib
 matplotlib.use('Agg')
-import matplotlib.pyplot as plts
+import matplotlib.pyplot as plt
 
-SEED = 41  # Set a seed for reproducibility # Original: 42
+SEED = 42  # Set a seed for reproducibility # Original: 42
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -31,7 +30,7 @@ def set_seed(seed):
 
 set_seed(SEED)
 
-print("Running script 4.1train_classifier_edit.py. Latest version with seed", SEED)
+print("Running script 4.1 with dl1 Latest version with seed", SEED)
 
 #EDIT: Allow for max_num_galaxies as None
 
@@ -51,88 +50,41 @@ classifier = ["TinyCNN", # Very Simple CNN
               "ScatterNet", "ScatterSqueezeNet", "ScatterSqueezeNet2",
               "Binary", "ScatterResNet"][-4]
 gen_model_names = ['DDPM'] #['ST', 'DDPM', 'wGAN', 'GAN', 'Dual', 'CNN', 'STMLP', 'lavgSTMLP', 'ldiffSTMLP'] # Specify the generative model_name
-num_epochs_cuda = 200
+num_epochs_cuda = 100
 num_epochs_cpu = 100
 learning_rates = [1e-3]
 regularization_params = [1e-3]  
 label_smoothing = 0.2  
-num_experiments = 100 
-folds = [5] # 0-4 for 5-fold cross validation, 5 for only one training
+num_experiments = 10
+folds = [0] # 0-4 for 5-fold cross validation, 5 for only one training
+#folds = [0]
 lambda_values = [0]  # Ratio between generated images and original images per class. 8 is reserfved for TRAINONGENERATED
 percentile_lo = 30 # Percentile stretch lower bound
 percentile_hi = 99  # Percentile stretch upper bound
 versions = 'RAW' # any mix of loadable and runtime-tapered planes. 'rt50' or 'rt100' for tapering. Square brackets for stacking
 
-DL2 = True  # Whether to use the DL2 data loader 
+PREFER_PROCESSED = False  
+STRETCH = True  # Arcsinh stretch
+USE_GLOBAL_NORMALISATION = False           # single on/off switch . False - image-by-image normalisation 
+GLOBAL_NORM_MODE = "percentile"           # "percentile" or "flux". Becomes "none" if USE_GLOBAL_NORMALISATION is 
+NORMALISEIMGS = True  # Normalise images to [0, 1]
+NORMALISEIMGSTOPM = False  # Normalise images to [-1, 1] 
+NORMALISESCS = False  # Normalise scattering coefficients to [0, 1]
+NORMALISESCSTOPM = False  # Normalise scattering coefficients to [-1, 1]
+FILTERED = True  # Remove in training and validation for the classifier
+FILTERGEN = False  # Remove generated images that are too similar to other generated images
+AUGMENT = True  # Use classical data augmentation (flips, rotations)
+PRINTFILENAMES = True
+USE_CLASS_WEIGHTS = True  # Set to False to disable class weights
+TRAINONGENERATED = False  # Train only on generated data, validate on real data
+ES, patience = True, 5  # Use early stopping
+SCHEDULER = True  # Use a learning rate scheduler
+SHOWIMGS = True  # Show some generated images for each class (Tool for control)
+USE_MEMMAP = False  # Use memory-mapped files for large datasets (slower but less RAM)
 
-if DL2:
-    FLUX_CLIPPING = False  # Clip the flux of the images
-    STRETCH = True  # Stretch the images with mathematical morphology
-    ES, patience = True, 10  # Use early stopping
-    SCHEDULER = False  # Use a learning rate scheduler
-    SHOWIMGS = True  # Show some generated images for each class (Tool for control)
-    NORMALISEIMGS = True  # Globally normalise images to [0, 1]
-    NORMALISEIMGSTOPM = False  # Globally normalise images to [-1, 1] 
-    NORMALISESCS = False  # Normalise scattering coefficients to [0, 1]
-    NORMALISESCSTOPM = False  # Normalise scattering coefficients to [-1, 1]
-    BALANCE = True if galaxy_classes == [52, 53] else False  # Balance the dataset by undersampling the majority class
-    USE_CLASS_WEIGHTS = True  # Set to False to disable class weights
-    FILTERED = True  # Remove in training, validation and test data for the classifier
-    FILTERGEN = False  # Remove generated images that are too similar to other generated images
-    HISTOGRAMMATCHING = False  # Histogram matching for generated images
-    USE_MEMMAP = False  # Use memmap for scattering coefficients
-    SIGMACLIPPONDDPM = False  # Apply sigma clipping to DDPM data
-    LATE_AUG = False  # Apply augmentations after PSF matching
-    PRINTFILENAMES = False  # Print filenames when loading data
-    
-    TRAINONGENERATED = False  # Use generated data as testdata
-    USE_GLOBAL_NORMALISATION = False           # single on/off switch . False - image-by-image normalisation 
-    GLOBAL_NORM_MODE = "percentile"           # "percentile" or "flux". Becomes "none" if USE_GLOBAL_NORMALISATION is 
-    PREFER_PROCESSED = False  # For data_loader2 (dl2)
-    
-else:
-    # For data_loader (not dl2)
-    PREFER_PROCESSED = False  
-    STRETCH = True  # Arcsinh stretch
-    USE_GLOBAL_NORMALISATION = False           # single on/off switch . False - image-by-image normalisation 
-    GLOBAL_NORM_MODE = "percentile"           # "percentile" or "flux". Becomes "none" if USE_GLOBAL_NORMALISATION is 
-    NORMALISEIMGS = True  # Normalise images to [0, 1]
-    NORMALISEIMGSTOPM = False  # Normalise images to [-1, 1] 
-    NORMALISESCS = False  # Normalise scattering coefficients to [0, 1]
-    NORMALISESCSTOPM = False  # Normalise scattering coefficients to [-1, 1]
-    FILTERED = True  # Remove in training, validation and test data for the classifier
-    FILTERGEN = False  # Remove generated images that are too similar to other generated images
-    USE_CLASS_WEIGHTS = True  # Set to False to disable class weights
-    TRAINONGENERATED = False  # Use generated data as testdata
-    ES, patience = True, 10  # Use early stopping
-    SCHEDULER = False  # Use a learning rate scheduler
-    SHOWIMGS = True  # Show some generated images for each class (Tool for control)
-    USE_MEMMAP = False  # Use memmap for scattering coefficients
-    
-    BALANCE = True if galaxy_classes == [52, 53] else False  # Balance the dataset by undersampling the majority class
-    LATE_AUG = False  # Apply augmentations after PSF matching
-    
 
 #PREFER_PROCESSED = True if versions != 'RAW' else False  # Prefer processed images if available (constant n_beams)
 
-# -------------------------- GAN CONFIGURATION --------------------------
-gan_epoch = 5000           # e.g., epoch number to load from
-gan_gen_loss = 'MSE'       # e.g., generator loss value (as used in filename)
-gan_disc_loss = 'BCE'      # e.g., discriminator loss value (as used in filename)
-gan_latent_dim = 128
-gan_sample_size = 100
-lr_gen = 1e-3
-lr_disc = 1e-4
-gan_adam_beta = (0.5, 0.999)
-gan_weight_decay = 0
-gan_label_smoothing = 0.7
-gan_lambda_div = 0
-gan_type = ['Simple', 'Advanced'][0]
-gan_data_version = 'clean' if FILTERED else 'full'  # 'full' or 'clean'
-
-# ---------------------------- VAE CONFIGURATION -----------------------------
-VAE_train_size = 1101128
-forbidden_classes = 12  # Generated bent sources look awful
 
 #####################################################################################
 ########################### AUTOMATIC CONFIGURATION #################################
@@ -190,8 +142,6 @@ else:
 _loader = load_halos_and_relics if galaxy_classes == [52, 53] else load_galaxies
 BALANCE = True if galaxy_classes == [52, 53] else False  # Balance the dataset by undersampling the majority class
 EXTRAVARS = False  # Use extra features (redshift, mass, size) for the classifier. Will automatically be true if test_meta is not None.
-LATE_AUG =  True if any(v.startswith('rt') for v in versions) else False  # Apply augmentations after tapering
-PRINTFILENAMES = True if any(v.startswith('rt') for v in versions) else False  # Print filenames if rt versions are used
 GLOBAL_NORM_MODE = "none" if not USE_GLOBAL_NORMALISATION else GLOBAL_NORM_MODE
     
 if EXTRAVARS:
@@ -252,27 +202,12 @@ def collapse_logits(logits, num_classes, multilabel):
         logits = torch.cat([-logits, logits], dim=1)
     return logits
 
-def replicate_list(x, n):
-    return [v for v in x for _ in range(int(n))]
-
 def shuffle_with_filenames(images, labels, filenames=None):
     perm = torch.randperm(images.size(0))
     images, labels = images[perm], labels[perm]
     if filenames is not None:
         filenames = [filenames[i] for i in perm.tolist()]
     return images, labels, filenames
-
-def late_augment(images, labels, filenames=None, *, st_aug=False):
-    """
-    Apply your normal augmentations AFTER tapering.
-    Returns (imgs_aug, labels_aug, filenames_aug).
-    The replication factor n_aug is inferred from sizes.
-    """
-    imgs_aug, labels_aug = augment_images(images, labels, ST_augmentation=st_aug)
-    n_aug = imgs_aug.size(0) // max(1, images.size(0))     # infer n_aug (e.g. 8 for 4 rotations × 2 flips)
-    if filenames is not None:
-        filenames = replicate_list(filenames, n_aug)
-    return imgs_aug, labels_aug, filenames
 
 
 ###############################################
@@ -314,7 +249,6 @@ def update_metrics(metrics,
     metrics.setdefault(f"{key_base}_precision", []).append(precision)
     metrics.setdefault(f"{key_base}_recall", []).append(recall)
     metrics.setdefault(f"{key_base}_f1_score", []).append(f1)
-
 
 def initialize_history(history, model_name, subset_size, fold, experiment, lr, reg, lambda_generate):
     if model_name not in history:
@@ -380,45 +314,25 @@ for gen_model_name in gen_model_names:
     hidden_dim2 = 128
     vae_latent_dim = 64
     
-    if DL2:
-        _versions_to_load = versions
-        _out = _loader(galaxy_classes=galaxy_classes,
-                    versions=_versions_to_load or ['raw'], 
-                    fold=max(folds), #Any fold other than 5 gives me the test data for the five fold cross validation
-                    crop_size=crop_size,
-                    downsample_size=downsample_size,
-                    sample_size=max_num_galaxies, 
-                    REMOVEOUTLIERS=FILTERED,
-                    BALANCE=BALANCE,           # Reduce the larger classes to the size of the smallest class
-                    FLUX_CLIPPING=FLUX_CLIPPING,
-                    STRETCH=STRETCH,
-                    percentile_lo=percentile_lo,  # Percentile stretch lower bound
-                    percentile_hi=percentile_hi,  # Percentile stretch upper bound
-                    AUGMENT=not LATE_AUG,
-                    NORMALISE=NORMALISEIMGS,
-                    NORMALISETOPM=NORMALISEIMGSTOPM,
-                    PRINTFILENAMES=PRINTFILENAMES,
-                    train=False)
-    else:
-        _out  = _loader(galaxy_classes=galaxy_classes,
-                    versions=versions, 
-                    fold=max(folds), #Any fold other than 5 gives me the test data for the five fold cross validation
-                    crop_size=crop_size,
-                    downsample_size=downsample_size,
-                    sample_size=max_num_galaxies, 
-                    REMOVEOUTLIERS=FILTERED,
-                    BALANCE=BALANCE,           # Reduce the larger classes to the size of the smallest class
-                    STRETCH=STRETCH,
-                    percentile_lo=percentile_lo,  # Percentile stretch lower bound
-                    percentile_hi=percentile_hi,  # Percentile stretch upper bound
-                    AUGMENT=not LATE_AUG,
-                    NORMALISE=NORMALISEIMGS,
-                    NORMALISETOPM=NORMALISEIMGSTOPM,
-                    USE_GLOBAL_NORMALISATION=USE_GLOBAL_NORMALISATION,
-                    GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
-                    PRINTFILENAMES=PRINTFILENAMES,
-                    PREFER_PROCESSED=PREFER_PROCESSED,
-                    train=False)
+    _out  = _loader(galaxy_classes=galaxy_classes,
+                versions=versions, 
+                fold=max(folds), #Any fold other than 5 gives me the test data for the five fold cross validation
+                crop_size=crop_size,
+                downsample_size=downsample_size,
+                sample_size=max_num_galaxies, 
+                REMOVEOUTLIERS=FILTERED,
+                BALANCE=BALANCE,           # Reduce the larger classes to the size of the smallest class
+                STRETCH=STRETCH,
+                percentile_lo=percentile_lo,  # Percentile stretch lower bound
+                percentile_hi=percentile_hi,  # Percentile stretch upper bound
+                AUGMENT=AUGMENT,
+                NORMALISE=NORMALISEIMGS,
+                NORMALISETOPM=NORMALISEIMGSTOPM,
+                USE_GLOBAL_NORMALISATION=USE_GLOBAL_NORMALISATION,
+                GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
+                PRINTFILENAMES=PRINTFILENAMES,
+                PREFER_PROCESSED=PREFER_PROCESSED,
+                train=False)  # Obtain the test set
 
     if len(_out) == 4:
         train_images, train_labels, test_images, test_labels = _out
@@ -431,6 +345,15 @@ for gen_model_name in gen_model_names:
 
     else:
         raise ValueError(f"load_galaxies returned {len(_out)} values, expected 4 or 6")
+    
+    # Print all the source names in the TEST set:
+    #if test_fns is not None:
+    #    print("\nTEST filenames:")
+    #    for fn in test_fns:
+    #        print(" -", fn)
+    #    print("")
+    #else:
+    #    print("No test filenames available to print.\n")
 
     train_labels = relabel(train_labels)  # Will be used for the sanity check below
     test_labels  = relabel(test_labels)   # [0,1,...] aligning with galaxy_classes
@@ -446,7 +369,7 @@ for gen_model_name in gen_model_names:
             train_mask = as_index_labels(train_labels) == i
             test_mask  = as_index_labels(test_labels)  == i
 
-        check_tensor(f"Train images for class {cls} (idx={i})", train_images[train_mask])
+        check_tensor(f"Trainval images for class {cls} (idx={i})", train_images[train_mask])
         check_tensor(f"Test images for class {cls} (idx={i})",  test_images[test_mask])
 
     def img_hash(img: torch.Tensor) -> str:
@@ -461,7 +384,6 @@ for gen_model_name in gen_model_names:
     common = train_hss & test_hashes
     assert not common, f"Overlap detected: {len(common)} images appear in both train and test validation!"
     # ————————————————————————
-
 
     # Produce an empty tensor to occupy the not used component of the datasets. 
     mock_tensor = torch.zeros_like(test_images)
@@ -557,44 +479,25 @@ for gen_model_name in gen_model_names:
                 valid_fns = permute_like(valid_fns, perm_valid)
 
         else:
-            if DL2:
-                _out = _loader(galaxy_classes=galaxy_classes,
-                            versions=_versions_to_load or ['raw'], 
-                            fold=max(folds), #Any fold other than 5 gives me the test data for the five fold cross validation
-                            crop_size=crop_size,
-                            downsample_size=downsample_size,
-                            sample_size=max_num_galaxies, 
-                            REMOVEOUTLIERS=FILTERED,
-                            BALANCE=BALANCE,           # Reduce the larger classes to the size of the smallest class
-                            FLUX_CLIPPING=FLUX_CLIPPING,
-                            STRETCH=STRETCH,
-                            percentile_lo=percentile_lo,  # Percentile stretch lower bound
-                            percentile_hi=percentile_hi,  # Percentile stretch upper bound
-                            AUGMENT=not LATE_AUG,
-                            NORMALISE=NORMALISEIMGS,
-                            NORMALISETOPM=NORMALISEIMGSTOPM,
-                            PRINTFILENAMES=PRINTFILENAMES,
-                            train=False)
-            else:
-                _out  = _loader(galaxy_classes=galaxy_classes,
-                            versions=versions, 
-                            fold=max(folds), #Any fold other than 5 gives me the test data for the five fold cross validation
-                            crop_size=crop_size,
-                            downsample_size=downsample_size,
-                            sample_size=max_num_galaxies, 
-                            REMOVEOUTLIERS=FILTERED,
-                            BALANCE=BALANCE,           # Reduce the larger classes to the size of the smallest class
-                            STRETCH=STRETCH,
-                            percentile_lo=percentile_lo,  # Percentile stretch lower bound
-                            percentile_hi=percentile_hi,  # Percentile stretch upper bound
-                            AUGMENT=not LATE_AUG,
-                            NORMALISE=NORMALISEIMGS,
-                            NORMALISETOPM=NORMALISEIMGSTOPM,
-                            USE_GLOBAL_NORMALISATION=USE_GLOBAL_NORMALISATION,
-                            GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
-                            PRINTFILENAMES=PRINTFILENAMES,
-                            PREFER_PROCESSED=PREFER_PROCESSED,
-                            train=False)
+            _out  = _loader(galaxy_classes=galaxy_classes,
+                        versions=versions, 
+                        fold=fold, #Any fold other than 5 gives me the test data for the five fold cross validation
+                        crop_size=crop_size,
+                        downsample_size=downsample_size,
+                        sample_size=max_num_galaxies, 
+                        REMOVEOUTLIERS=FILTERED,
+                        BALANCE=BALANCE,           # Reduce the larger classes to the size of the smallest class
+                        STRETCH=STRETCH,
+                        percentile_lo=percentile_lo,  # Percentile stretch lower bound
+                        percentile_hi=percentile_hi,  # Percentile stretch upper bound
+                        AUGMENT=AUGMENT,
+                        NORMALISE=NORMALISEIMGS,
+                        NORMALISETOPM=NORMALISEIMGSTOPM,
+                        USE_GLOBAL_NORMALISATION=USE_GLOBAL_NORMALISATION,
+                        GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
+                        PRINTFILENAMES=PRINTFILENAMES,
+                        PREFER_PROCESSED=PREFER_PROCESSED,
+                        train=True)
 
             if len(_out) == 4:
                 train_images, train_labels, valid_images, valid_labels = _out
@@ -611,13 +514,6 @@ for gen_model_name in gen_model_names:
                     train_images, train_labels, valid_images, valid_labels, train_fns, valid_fns = _out
                 else:
                     print("Not implemented extradata yet")
-                    
-                if LATE_AUG:
-                    before = len(train_images)
-                    train_images, train_labels, train_fns = late_augment(train_images, train_labels, train_fns)
-                    valid_images, valid_labels, valid_fns = late_augment(valid_images, valid_labels, valid_fns)
-                    n_aug = len(train_images) // max(1, before)
-                    print(f"[AUG] late_augment replicated train by ~x{n_aug} ({before} → {len(train_images)})")
                 
                 if EXTRAVARS:
                     train_data = train_fns
@@ -859,7 +755,7 @@ for gen_model_name in gen_model_names:
                     train_images_cls2.cpu(),
                     title1=f"Class {galaxy_classes[0]}",
                     title2=f"Class {galaxy_classes[1]}",
-                    save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_histogram.pdf"
+                    save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[0]][-1]}_histogram.pdf"
                 )
 
                 plot_background_histogram(
@@ -867,7 +763,7 @@ for gen_model_name in gen_model_names:
                     train_images_cls2.cpu(),
                     img_shape=(1, 128, 128),
                     title="Background histograms",
-                    save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_background_hist.pdf"
+                    save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[0]][-1]}_background_hist.pdf"
                 )
 
                 for cls in galaxy_classes:
@@ -877,12 +773,12 @@ for gen_model_name in gen_model_names:
                     plot_image_grid(
                         orig_imgs.cpu(),
                         num_images=36,
-                        save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_train_grid.pdf"
+                        save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[0]][-1]}_{cls}_train_grid.pdf"
                     )
                     plot_image_grid(
                         test_imgs.cpu(),
                         num_images=36,
-                        save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_test_grid.pdf"
+                        save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[0]][-1]}_{cls}_test_grid.pdf"
                     )
 
                     # summed-intensity histogram helper unchanged...
@@ -910,21 +806,21 @@ for gen_model_name in gen_model_names:
                         plot_image_grid(
                             gen_imgs,
                             num_images=36,
-                            save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_generated_grid.pdf"
+                            save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[0]][-1]}_{cls}_generated_grid.pdf"
                         )
                         plot_histograms(
                             gen_imgs,
                             orig_imgs.cpu(),
                             title1="Generated Images",
                             title2="Train Images",
-                            save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_histogram.pdf"
+                            save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[0]][-1]}_{cls}_histogram.pdf"
                         )
                         plot_background_histogram(
                             orig_imgs,
                             gen_imgs,
                             img_shape=(1, 128, 128),
                             title="Background histograms",
-                            save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_{cls}_background_hist.pdf"
+                            save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[0]][-1]}_{cls}_background_hist.pdf"
                         )
 
         
@@ -954,7 +850,7 @@ for gen_model_name in gen_model_names:
                 imgs,
                 labels=lbls,
                 num_images=5,
-                save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_example_train_data.pdf"
+                save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[0]][-1]}_example_train_data.pdf"
             )
         # Prepare input data
         mock_tensor = torch.zeros_like(train_images)
@@ -1037,7 +933,7 @@ for gen_model_name in gen_model_names:
         if SHOWIMGS and lambda_generate not in [0, 8]: 
             if classifier in ['TinyCNN', 'SCNN', 'CNNSqueezeNet', 'Rustige', 'ScatterSqueezeNet', 'ScatterSqueezeNet2', 'Binary']:
                 #save_images_tensorboard(generated_images[:36], save_path=f"./classifier/{gen_model_name}_{galaxy_classes}_generated.pdf", nrow=6)
-                plot_histograms(pristine_train_images, valid_images, title1="Train images", title2="Valid images", imgs3=generated_images, imgs4=test_images, title3='Generated images', title4='Test images', save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_histograms.pdf")
+                plot_histograms(pristine_train_images, valid_images, title1="Train images", title2="Valid images", imgs3=generated_images, imgs4=test_images, title3='Generated images', title4='Test images', save_path=f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[0]][-1]}_histograms.pdf")
 
         
         ###############################################
@@ -1103,9 +999,6 @@ for gen_model_name in gen_model_names:
                 criterion = nn.BCEWithLogitsLoss() if num_classes == 2 else nn.CrossEntropyLoss() 
 
         optimizer = AdamW(models[classifier_name]["model"].parameters(), lr=lr, weight_decay=reg)
-        if SCHEDULER:
-            scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=10*lr, 
-                                    steps_per_epoch=len(train_loader), epochs=num_epochs)
 
         for classifier_name, model_details in models.items():
             model = model_details["model"].to(DEVICE)
@@ -1131,6 +1024,15 @@ for gen_model_name in gen_model_names:
                     subset_train_dataset = Subset(train_dataset, subset_indices)
                     eff_bs = max(2, min(batch_size, len(subset_train_dataset)))
                     subset_train_loader = DataLoader(subset_train_dataset, batch_size=eff_bs, shuffle=False, num_workers=0, collate_fn=custom_collate, drop_last=True)
+                    if SCHEDULER:
+                        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                            optimizer,
+                            max_lr=lr * 3,
+                            steps_per_epoch=len(subset_train_loader),
+                            epochs=num_epochs,
+                            pct_start=0.3,  # Spend 30% of training warming up
+                            anneal_strategy='cos'
+                        )
 
                     early_stopping = EarlyStopping(patience=patience, verbose=False) if ES else None
 
@@ -1166,8 +1068,10 @@ for gen_model_name in gen_model_names:
                             loss = criterion(logits, labels)
 
                             loss.backward()
-                            scheduler.step() if SCHEDULER else None
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # Gradient clipping to prevent gradients that are too large
                             optimizer.step()
+                            if SCHEDULER:
+                                scheduler.step()
                             total_loss += float(loss.item() * images.size(0))
                             total_images += float(images.size(0))
 
@@ -1221,9 +1125,12 @@ for gen_model_name in gen_model_names:
                         history[gen_model_name][val_loss_key].append(val_average_loss)
                         
                         if ES:
-                            early_stopping(val_average_loss, model, f'./classifier/trained_models/{gen_model_name}_best_model.pth')
+                            early_stopping(val_average_loss, model, f'./classifier/trained_models/best_model.pth')
                             if early_stopping.early_stop:
-                                break
+                                break 
+
+                    if ES: # Load the best model saved by early stopping
+                        model.load_state_dict(torch.load(f'./classifier/trained_models/best_model.pth'))
 
                     model.eval()
                     with torch.inference_mode(): # Evaluate on test data
@@ -1329,7 +1236,7 @@ for gen_model_name in gen_model_names:
                             for ax in axes[len(mis_images):]:
                                 ax.axis('off')
 
-                            out_path = f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[-1]][-1]}_misclassified.pdf"
+                            out_path = f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_{dataset_sizes[folds[0]][-1]}_misclassified.pdf"
                             fig.savefig(out_path, dpi=150, bbox_inches='tight')
                             plt.close(fig)
 
@@ -1465,7 +1372,7 @@ for gen_model_name in gen_model_names:
 
                     save_path_hist = (
                         f"./classifier/{galaxy_classes}_{classifier}_{gen_model_name}_"
-                        f"{dataset_sizes[folds[-1]][-1]}_{metric_name}_histogram.pdf"
+                        f"{dataset_sizes[folds[0]][-1]}_{metric_name}_histogram.pdf"
                     )
                     plt.savefig(save_path_hist, dpi=150)
                     plt.close()
