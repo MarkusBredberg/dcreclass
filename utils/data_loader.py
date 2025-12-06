@@ -847,7 +847,7 @@ def img_hash(img: torch.Tensor) -> str:
     return returnval
         
 def augment_images(
-    images, labels, rotations=[0, 90, 180, 270],
+    images, labels, rotations = [0, 90, 180, 270],    #rotations = np.arange(0, 360, 20).tolist(),
     flips = [(False, False), (True, False)], mem_threshold=1000,
     #translations = [(10, 0), (-10, 0), (0, 10), (0, -10)], #[(5, 0), (-5, 0), (0, 5), (0, -5)],
     translations = [(0, 0)], 

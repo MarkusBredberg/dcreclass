@@ -1,57 +1,138 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.autograd import Function
 
-class GradReverse(Function):
-    @staticmethod
-    def forward(ctx, x, lambd):
-        ctx.lambd = lambd
-        return x.clone()
-    @staticmethod
-    def backward(ctx, grad_out):
-        return grad_out.neg() * ctx.lambd, None
-
-def grad_reverse(x, lambd=1.0):
-    return GradReverse.apply(x, lambd)
+###############################################
+####### Multilayer Perceptron #################
+###############################################
 
 
-class TinyCNN(nn.Module):
-    def __init__(self, input_shape, num_classes=2):
-        super(TinyCNN, self).__init__()
-        # Define basic convolutional layers
-        self.feature_extractor = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=5, padding=2), 
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Conv2d(32, 64, kernel_size=5, padding=2),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Conv2d(64, 64, kernel_size=5, padding=2),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2)
+# Scattering classifier
+class MLPClassifier_legacy(nn.Module):
+    def __init__(self, input_dim, num_classes=4, hidden_dim=120):
+        super(MLPClassifier_legacy, self).__init__()
+        # Compute second layer dimension such that when hidden_dim=120, fc2 becomes 84.
+        fc2_dim = int(hidden_dim * 0.7)
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, fc2_dim)
+        self.fc3 = nn.Linear(fc2_dim, num_classes)
+        self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout(0.5)
+        #self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)  # Flatten input if necessary
+        x = self.fc1(x)
+        x = self.relu(x)
+        x = self.fc2(x)
+        x = self.relu(x)
+        x = self.dropout(x)
+        x = self.fc3(x)
+        #x = self.sigmoid(x)
+        #return torch.softmax(x)
+        return x # logits for BCE loss
+
+class MLPClassifier(nn.Module):
+    def __init__(self, input_dim, num_classes=2, hidden_dim=128):
+        """
+        Lightweight MLP for scattering coefficients.
+        Uses adaptive pooling to reduce spatial dimensions first.
+        
+        Args:
+            input_dim: Expected flattened dimension (for validation) - NOT USED with adaptive pooling
+            num_classes: Number of output classes
+            hidden_dim: Hidden layer size (default 128)
+        """
+        super(MLPClassifier, self).__init__()
+        
+        # Adaptive pooling to reduce spatial dimensions
+        # From [B, 169, 32, 32] -> [B, 169, 4, 4]
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((4, 4))
+        
+        # New input dimension after pooling: 169 * 4 * 4 = 2704
+        pooled_dim = 169 * 4 * 4
+        
+        # Smaller network appropriate for the task
+        self.fc1 = nn.Linear(pooled_dim, hidden_dim)
+        self.bn1 = nn.BatchNorm1d(hidden_dim)
+        self.dropout1 = nn.Dropout(0.4)
+        
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim // 2)
+        self.bn2 = nn.BatchNorm1d(hidden_dim // 2)
+        self.dropout2 = nn.Dropout(0.3)
+        
+        self.fc3 = nn.Linear(hidden_dim // 2, num_classes)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        # Expected input: [B, C, H, W] e.g., [16, 169, 32, 32]
+        
+        # Apply adaptive pooling to reduce spatial dimensions
+        # [B, 169, 32, 32] -> [B, 169, 4, 4]
+        if x.dim() == 4:
+            x = self.adaptive_pool(x)
+        
+        # Flatten: [B, 169, 4, 4] -> [B, 2704]
+        x = x.view(x.size(0), -1)
+        
+        # Forward through network
+        x = self.fc1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.dropout1(x)
+        
+        x = self.fc2(x)
+        x = self.bn2(x)
+        x = self.relu(x)
+        x = self.dropout2(x)
+        
+        x = self.fc3(x)
+        return x
+
+  
+
+################################################
+#### Simple Convolutional Classifiers ##########
+################################################
+
+class RustigeClassifier(nn.Module):
+    # From https://github.com/floriangriese/wGAN-supported-augmentation/blob/main/src/Classifiers/SimpleClassifiers/Classifiers.py
+    def __init__(self, n_output_nodes=4):
+        super(RustigeClassifier, self).__init__()
+
+        self.conv_model = nn.Sequential(
+            nn.Conv2d(1, 8, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.LayerNorm([64, 64]),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(8, 16, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.LayerNorm([32, 32]),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.LayerNorm([16, 16]),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(32, 32, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.LayerNorm([8, 8]),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(32, 16, kernel_size=2, stride=1, padding=0, bias=False)
         )
 
-        # Dummy input to calculate the output size after feature extraction
-        dummy_input = torch.zeros(1, *input_shape)
-        dummy_feature_output = self.feature_extractor(dummy_input)
-        output_size = dummy_feature_output.view(dummy_feature_output.size(0), -1).shape[1]
-        
-        # Fully connected layers
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(output_size, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),  # Dropout for regularization
-            nn.Linear(128, num_classes)
+        self.fc_model = nn.Sequential(
+            nn.Linear(16 * 7 * 7, 100),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(100, n_output_nodes),
+            nn.ReLU(True)
         )
 
     def forward(self, x):
-        x = self.feature_extractor(x)
-        x = self.classifier(x)
-        return x
-    
+        # image dimensions [128, 128]
+        x = self.conv_model(x)
+        # dimensions after convolution [7,7]
 
+        # flatten for FC
+        x = x.view(-1, x.size(1) * x.size(2) * x.size(3))
+
+        x = self.fc_model(x)
+        return x
 
 class NEWRustigeClassifier(nn.Module):
     def __init__(self, input_shape, num_classes=4):
@@ -121,11 +202,10 @@ class NEWRustigeClassifier(nn.Module):
         x = self.softmax(x)
         return x
 
-
 #Original
-class BinaryClassifier(nn.Module):
+class BinaryClassifier_legacy(nn.Module):
     def __init__(self, input_shape, num_classes=2):
-        super(BinaryClassifier, self).__init__()
+        super(BinaryClassifier_legacy, self).__init__()
 
         # Parse (channels, height, width) from input_shape
         in_channels = input_shape[0]
@@ -182,57 +262,59 @@ class BinaryClassifier(nn.Module):
         # logits = sigmoid(logits)
         return logits
     
-
-class ResidualBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, stride=1):
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn1   = nn.BatchNorm2d(out_ch)
-        self.act   = nn.LeakyReLU(inplace=True)
-        self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn2   = nn.BatchNorm2d(out_ch)
-        self.down = nn.Sequential()
-        if stride != 1 or in_ch != out_ch:
-            self.down = nn.Sequential(
-                nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(out_ch)
-            )
-
-    def forward(self, x):
-        identity = self.down(x)
-        out = self.act(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        return self.act(out + identity)
-
-class BinaryClassifier(nn.Module):
+    
+class TinyCNN(nn.Module):
+    """Fixed version - replaces 524k param FC layer with additional conv layers."""
     def __init__(self, input_shape, num_classes=2):
-        super().__init__()
-        in_channels = input_shape[0]
-
+        super(TinyCNN, self).__init__()
+        
         self.features = nn.Sequential(
-            nn.Conv2d(in_channels, 32, kernel_size=7, stride=2, padding=3, bias=False),
+            # Block 1: 128→64
+            nn.Conv2d(1, 16, kernel_size=5, stride=2, padding=2),
+            nn.BatchNorm2d(16),
+            nn.ReLU(),
+            nn.Dropout2d(0.2),
+            
+            # Block 2: 64→32
+            nn.Conv2d(16, 32, kernel_size=5, stride=2, padding=2),
             nn.BatchNorm2d(32),
-            nn.LeakyReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
-            # Could try with convolutional layer here instead of maxpool
-            #ResidualBlock(32,  32, stride=1),
-
-            ResidualBlock(32,  64, stride=2),
-            ResidualBlock(64, 128, stride=2),
-            ResidualBlock(128,256, stride=2),
-            ResidualBlock(256,256, stride=2),
+            nn.ReLU(),
+            nn.Dropout2d(0.3),
+            
+            # Block 3: 32→16
+            nn.Conv2d(32, 32, kernel_size=5, stride=2, padding=2),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.Dropout2d(0.4),
+            
+            # ADD: Block 4: 16→8 (critical addition!)
+            nn.Conv2d(32, 48, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(48),
+            nn.ReLU(),
+            nn.Dropout2d(0.5),
+            
+            # ADD: Block 5: 8→4 (even more reduction!)
+            nn.Conv2d(48, 48, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(48),
+            nn.ReLU(),
+            nn.Dropout2d(0.5),
+            
+            # Global Average Pooling instead of flatten
+            nn.AdaptiveAvgPool2d(1)
         )
-
-        self.gap = nn.AdaptiveAvgPool2d(1)
-        self.dropout = nn.Dropout(p=0.5)
-        self.fc      = nn.Linear(256, 2)
-
+        
+        # Tiny classifier
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(0.5),
+            nn.Linear(48, num_classes)  # 48→2 instead of 8192→64!
+        )
+    
     def forward(self, x):
         x = self.features(x)
-        x = self.gap(x).view(x.size(0), -1)
-        x = self.dropout(x)
-        return self.fc(x)
-
+        return self.classifier(x)
+    
+    
 
 class SCNN(nn.Module):
     def __init__(self, input_shape, num_classes=4):
@@ -293,244 +375,59 @@ class SCNN(nn.Module):
         return torch.softmax(logits, dim=1)
 
 
+##########################################################
+######### Residual Network Classifiers ###################
+##########################################################
 
-class RustigeClassifier(nn.Module):
-    # From https://github.com/floriangriese/wGAN-supported-augmentation/blob/main/src/Classifiers/SimpleClassifiers/Classifiers.py
-    def __init__(self, n_output_nodes=4):
-        super(RustigeClassifier, self).__init__()
-
-        self.conv_model = nn.Sequential(
-            nn.Conv2d(1, 8, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.LayerNorm([64, 64]),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(8, 16, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.LayerNorm([32, 32]),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.LayerNorm([16, 16]),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(32, 32, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.LayerNorm([8, 8]),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(32, 16, kernel_size=2, stride=1, padding=0, bias=False)
-        )
-
-        self.fc_model = nn.Sequential(
-            nn.Linear(16 * 7 * 7, 100),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(100, n_output_nodes),
-            nn.ReLU(True)
-        )
-
-    def forward(self, x):
-        # image dimensions [128, 128]
-        x = self.conv_model(x)
-        # dimensions after convolution [7,7]
-
-        # flatten for FC
-        x = x.view(-1, x.size(1) * x.size(2) * x.size(3))
-
-        x = self.fc_model(x)
-        return x
-
-
-# DANN classifier
-
-class DANNClassifier(nn.Module):
-    def __init__(self, input_shape, num_classes=4):
-        super(DANNClassifier, self).__init__()
-        
-        # shared feature extractor (conv → norm → act → flatten → FC)
-        C, H, W = input_shape
-        self.feature_extractor = nn.Sequential(
-            nn.Conv2d(C, 8, 3, 2, 1),
-            nn.LayerNorm([8, H//2,  W//2]),
-            nn.LeakyReLU(),
-            nn.Conv2d(8, 16, 3, 2, 1),
-            nn.LayerNorm([16, H//4, W//4]),
-            nn.LeakyReLU(),
-            nn.Conv2d(16, 32, 3, 2, 1),
-            nn.LayerNorm([32, H//8, W//8]),
-            nn.LeakyReLU(),
-            nn.Conv2d(32, 16, 3, 2, 1),
-            nn.LayerNorm([16, H//16, W//16]),
-            nn.LeakyReLU(),
-            nn.Conv2d(16, 16, 2, 2),
-            nn.LayerNorm([16, H//32, W//32]),
-            nn.LeakyReLU(),
-            nn.Flatten(),
-            nn.Linear(16*(H//32)*(W//32), 100),
-            nn.LeakyReLU()
-        )
-
-        # two heads: one for your galaxy‐class, one for real/fake domain
-        self.classifier_head = nn.Linear(100, num_classes)
-        self.domain_head     = nn.Linear(100, 2)
-
-
-    def forward(self, x, alpha=1.0):
-        feat = self.feature_extractor(x)                 # [B,100]
-        class_logits  = self.classifier_head(feat)       # [B,num_classes]
-        dom_feat      = grad_reverse(feat, lambd=alpha)  # GRL on feature
-        domain_logits = self.domain_head(dom_feat)       # [B,2]
-        return class_logits, domain_logits
-
-
-# Scattering classifier
-class MLPClassifier(nn.Module):
-    def __init__(self, input_dim, num_classes=4, hidden_dim=120):
-        super(MLPClassifier, self).__init__()
-        # Compute second layer dimension such that when hidden_dim=120, fc2 becomes 84.
-        fc2_dim = int(hidden_dim * 0.7)
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, fc2_dim)
-        self.fc3 = nn.Linear(fc2_dim, num_classes)
-        self.relu = nn.ReLU(inplace=True)
-        self.dropout = nn.Dropout(0.5)
-        #self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        x = x.view(x.size(0), -1)  # Flatten input if necessary
-        x = self.fc1(x)
-        x = self.relu(x)
-        x = self.fc2(x)
-        x = self.relu(x)
-        x = self.dropout(x)
-        x = self.fc3(x)
-        #x = self.sigmoid(x)
-        #return torch.softmax(x)
-        return x # logits for BCE loss
-
-
-class DualClassifier(nn.Module):
-    def __init__(self, img_shape, scat_shape, num_classes, 
-                 hidden_dim1=256, hidden_dim2=128, classifier_hidden_dim=256, 
-                 dropout_rate=0.3, J=2):
-        """
-        Args:
-            img_shape: Tuple (channels, height, width) of the full image.
-            scat_shape: Tuple (channels, height, width) of the scattering coefficients.
-            num_classes: Number of output classes.
-            hidden_dim1, hidden_dim2: Dimensions for intermediate features.
-            classifier_hidden_dim: Dimension for the hidden FC layer before classification.
-            dropout_rate: Dropout probability.
-            J: Determines the number of downsampling blocks for the scattering branch.
-        """
-        super(DualClassifier, self).__init__()
-
-        # ----------------------
-        # Image Branch Encoder
-        # ----------------------
-        self.cnn_encoder = nn.Sequential(
-            nn.Conv2d(img_shape[0], 32, kernel_size=5, stride=1, padding=2, bias=True),
-            nn.BatchNorm2d(32),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1, bias=True),
-            nn.BatchNorm2d(64),
-            nn.LeakyReLU(0.2),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Conv2d(64, 128, kernel_size=5, stride=1, padding=2, bias=True),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2)
-        )
-
-        self.conv_to_latent_img = nn.Sequential(
-            nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1, bias=True),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1, bias=True),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1, bias=True),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1, bias=True),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2)
-        )
-
-        # -------------------------------
-        # Scattering Coefficients Branch
-        # -------------------------------
-        # Define a helper function for a conv block.
-        def conv_block(in_channels, out_channels, kernel_size=3, stride=1, padding=1):
-            return nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=True),
-                nn.BatchNorm2d(out_channels),
-                nn.LeakyReLU(0.2)
+class ResidualBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, stride=1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1   = nn.BatchNorm2d(out_ch)
+        self.act   = nn.LeakyReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2   = nn.BatchNorm2d(out_ch)
+        self.down = nn.Sequential()
+        if stride != 1 or in_ch != out_ch:
+            self.down = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_ch)
             )
-        
-        # Determine the number of downsampling blocks based on J.
-        if J == 4:
-            downsample_blocks = 1
-        elif J == 3:
-            downsample_blocks = 2
-        elif J == 2:
-            downsample_blocks = 3
-        elif J == 1:
-            downsample_blocks = 4
-        else:
-            raise ValueError("Invalid value for J. Supported values are 1, 2, 3, or 4.")
-        
-        # Build the scattering branch.
-        scat_in_channels = scat_shape[0]
-        conv_blocks = []
-        for _ in range(downsample_blocks):
-            conv_blocks.append(conv_block(hidden_dim2, hidden_dim2, kernel_size=3, stride=1, padding=1))
-            conv_blocks.append(conv_block(hidden_dim2, hidden_dim2, kernel_size=3, stride=2, padding=1))
-        
-        self.conv_to_latent_scat = nn.Sequential(
-            conv_block(scat_in_channels, hidden_dim2, kernel_size=3, stride=1, padding=1),
-            *conv_blocks
+
+    def forward(self, x):
+        identity = self.down(x)
+        out = self.act(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        return self.act(out + identity)
+
+class ResNet(nn.Module):
+    def __init__(self, input_shape, num_classes=2):
+        super().__init__()
+        in_channels = input_shape[0]
+
+        self.features = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+            # Could try with convolutional layer here instead of maxpool
+            #ResidualBlock(32,  32, stride=1),
+
+            ResidualBlock(32,  64, stride=2),
+            ResidualBlock(64, 128, stride=2),
+            ResidualBlock(128,256, stride=2),
+            ResidualBlock(256,256, stride=2),
         )
-        
-        # -------------------------------------------
-        # Determine Combined Feature Dimensions
-        # -------------------------------------------
-        # Use dummy inputs to compute the flattened dimensions from both branches.
-        with torch.no_grad():
-            dummy_img = torch.zeros(1, *img_shape)
-            dummy_scat = torch.zeros(1, *scat_shape)
-            img_feat = self.cnn_encoder(dummy_img)
-            img_feat = self.conv_to_latent_img(img_feat)
-            scat_feat = self.conv_to_latent_scat(dummy_scat)
-            img_flat_dim = img_feat.view(1, -1).size(1)
-            scat_flat_dim = scat_feat.view(1, -1).size(1)
-            combined_dim = img_flat_dim + scat_flat_dim
-        
-        # ----------------------
-        # Fully Connected Layers
-        # ----------------------
-        self.FC_input = nn.Linear(combined_dim, 384, bias=True)
-        self.bn1 = nn.BatchNorm1d(384)
-        self.FC_hidden = nn.Linear(384, classifier_hidden_dim, bias=True)
-        self.bn2 = nn.BatchNorm1d(classifier_hidden_dim)
-        self.FC_classifier = nn.Linear(classifier_hidden_dim, num_classes, bias=True)
-        self.LeakyReLU = nn.LeakyReLU(0.2)
-        self.dropout = nn.Dropout(dropout_rate)
-        
-    def forward(self, img, scat):
-        # Process the image branch.
-        cnn_features = self.cnn_encoder(img)
-        img_features = self.conv_to_latent_img(cnn_features)
-        
-        # Process the scattering branch.
-        scat_features = self.conv_to_latent_scat(scat)
-        
-        # Concatenate along the channel dimension.
-        # (Assuming that the spatial dimensions of img_features and scat_features match.)
-        combined = torch.cat([img_features, scat_features], dim=1)
-        combined = combined.view(combined.size(0), -1)  # Flatten
-        
-        # Pass through fully connected layers.
-        h = self.FC_input(combined)
-        h = self.LeakyReLU(self.bn1(h))
-        h = self.dropout(h)
-        h = self.FC_hidden(h)
-        h = self.LeakyReLU(self.bn2(h))
-        h = self.dropout(h)
-        logits = self.FC_classifier(h)
-        return logits
+
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.dropout = nn.Dropout(p=0.5)
+        self.fc      = nn.Linear(256, 2)
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.gap(x).view(x.size(0), -1)
+        x = self.dropout(x)
+        return self.fc(x)
 
 class ScatterResNet(nn.Module):
     def __init__(self, scat_shape, num_classes=2):
@@ -555,7 +452,12 @@ class ScatterResNet(nn.Module):
         return self.fc(x)
 
 
-class SEB(nn.Module):
+############################################################
+## Dual Input Squeeze-and-Excitation Network Classifiers ###
+############################################################
+
+
+class SEBlock(nn.Module):
     """
     Squeeze-and-Excitation block for channel-wise attention.
     """
@@ -572,104 +474,10 @@ class SEB(nn.Module):
     def forward(self, x):
         return x * self.fc(self.pool(x))
 
-    
-class CNNSqueezeNet(nn.Module):
-    def __init__(self, input_shape, num_classes=4):
-        super(CNNSqueezeNet, self).__init__()
-
-        # Parse (channels, height, width) from input_shape
-        in_channels = input_shape[0]
-        height = input_shape[1]
-        width = input_shape[2]
-
-        # Convolutional block 1
-        self.conv1 = nn.Conv2d(
-            in_channels=in_channels,
-            out_channels=8,
-            kernel_size=3,
-            stride=2,
-            padding=1
-        )
-        self.ln1  = nn.LayerNorm([8, height // 2, width // 2])
-        self.bn1  = nn.BatchNorm2d(8)
-        self.act1 = nn.LeakyReLU()
-        self.se1  = SEB(8)
-
-        # Convolutional block 2
-        self.conv2 = nn.Conv2d(8, 16, kernel_size=3, stride=2, padding=1)
-        self.ln2  = nn.LayerNorm([16, height // 4, width // 4])
-        self.bn2 = nn.BatchNorm2d(16)
-        self.act2 = nn.LeakyReLU()
-        self.se2  = SEB(16)
-
-        # Convolutional block 3
-        self.conv3 = nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1)
-        self.ln3  = nn.LayerNorm([32, height // 8, width // 8])
-        self.bn3  = nn.BatchNorm2d(32)
-        self.act3 = nn.LeakyReLU()
-        self.se3  = SEB(32)
-
-        # Convolutional block 4
-        self.conv4 = nn.Conv2d(32, 16, kernel_size=3, stride=2, padding=1)
-        self.ln4  = nn.LayerNorm([16, height // 16, width // 16])
-        self.bn4  = nn.BatchNorm2d(16)
-        self.act4 = nn.LeakyReLU()
-        self.se4  = SEB(16)
-
-        # Convolutional block 5
-        self.conv5 = nn.Conv2d(16, 16, kernel_size=2, stride=2)
-        self.ln5   = nn.LayerNorm([16, height // 32, width // 32])
-        self.bn5   = nn.BatchNorm2d(16)
-        self.act5 = nn.LeakyReLU()
-        self.se5   = SEB(16)
-
-        # Fully connected layers
-        # For (1, 128, 128) input, final size is (16, 4, 4) => 16 * 4 * 4 = 256
-        self.fc1   = nn.Linear(16 * (height // 32) * (width // 32), 100)
-        self.act6  = nn.LeakyReLU()
-        self.num_classes = num_classes
-        self.fc2 = nn.Linear(100, num_classes)
-    
-    def forward(self, x): # Layernorm performs better than BatchNorm
-        x = self.act1(self.ln1(self.conv1(x)))
-        x = self.se1(x)
-        x = self.act2(self.ln2(self.conv2(x)))
-        x = self.se2(x)
-        x = self.act3(self.ln3(self.conv3(x)))
-        x = self.se3(x)
-        x = self.act4(self.ln4(self.conv4(x)))
-        x = self.se4(x)
-        x = self.act5(self.ln5(self.conv5(x)))
-        x = self.se5(x)
-        x = x.view(x.size(0), -1)
-        x = self.act6(self.fc1(x))
-        logits = self.fc2(x)
-        return torch.softmax(logits, dim=1)
-
-
-class SEBlock(nn.Module):
-    """
-    Squeeze-and-Excitation block for channel-wise attention.
-    """
-    def __init__(self, channels, reduction=16):
-        super().__init__()
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Sequential(
-            nn.Conv2d(channels, channels // reduction, 1, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels // reduction, channels, 1, bias=False),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        return x * self.fc(self.pool(x))
-    
-    
-
-class ScatterSqueezeNet(nn.Module):
+class ScatterSqueezeNet(nn.Module): #DualSSN
     def __init__(self, img_shape, scat_shape, num_classes,
-                 hidden_dim1=256, hidden_dim2=128, classifier_hidden_dim=256,
-                 dropout_rate=0.3, J=2):
+                 hidden_dim1=128, hidden_dim2=64, classifier_hidden_dim=128,
+                 dropout_rate=0.5, J=2):
         super(ScatterSqueezeNet, self).__init__()
         C_img, H_img, W_img = img_shape
         C_scat, H_scat, W_scat = scat_shape
@@ -681,37 +489,45 @@ class ScatterSqueezeNet(nn.Module):
             nn.Conv2d(C_img, 32, kernel_size=5, stride=1, padding=2, bias=True),
             nn.BatchNorm2d(32),
             nn.LeakyReLU(0.2),
+            nn.Dropout(0.2),
             nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1, bias=True),
             nn.BatchNorm2d(64),
             nn.LeakyReLU(0.2),
+            nn.Dropout(0.2),
             nn.MaxPool2d(kernel_size=2, stride=2),
             nn.Conv2d(64, 128, kernel_size=5, stride=1, padding=2, bias=True),
             nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2)
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.2)
         )
         self.conv_to_latent_img = nn.Sequential(
             nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1, bias=True),
             nn.BatchNorm2d(128),
             nn.LeakyReLU(0.2),
+            nn.Dropout(0.2),
             nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1, bias=True),
             nn.BatchNorm2d(128),
             nn.LeakyReLU(0.2),
+            nn.Dropout(0.2),
             nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1, bias=True),
             nn.BatchNorm2d(128),
             nn.LeakyReLU(0.2),
+            nn.Dropout(0.2),
             nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1, bias=True),
             nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2)
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.2)
         )
 
         # -------------------------------
         # Scattering Branch with SE attention
         # -------------------------------
-        def conv_block(in_ch, out_ch, k, s, p):
+        def conv_block(in_ch, out_ch, k, s, p, dropout_p=0.2):
             return nn.Sequential(
                 nn.Conv2d(in_ch, out_ch, k, stride=s, padding=p, bias=True),
                 nn.BatchNorm2d(out_ch),
-                nn.LeakyReLU(0.2)
+                nn.LeakyReLU(0.2),
+                nn.Dropout(dropout_p)
             )
 
         # Determine number of downsampling stages
@@ -729,13 +545,14 @@ class ScatterSqueezeNet(nn.Module):
         # Build scattering branch with SE blocks
         scat_blocks = []
         # initial conv + SE
-        scat_blocks.append(conv_block(C_scat, hidden_dim2, 3, 1, 1))
+        scat_blocks.append(conv_block(C_scat, hidden_dim2, 3, 1, 1, dropout_p=0.2))
         scat_blocks.append(SEBlock(hidden_dim2))
         # repeated downsampling + SE
-        for _ in range(downsample_blocks):
-            scat_blocks.append(conv_block(hidden_dim2, hidden_dim2, 3, 1, 1))
+        for i in range(downsample_blocks):
+            dropout_p = 0.2 + i * 0.1  # Increase dropout with depth
+            scat_blocks.append(conv_block(hidden_dim2, hidden_dim2, 3, 1, 1, dropout_p=dropout_p))
             scat_blocks.append(SEBlock(hidden_dim2))
-            scat_blocks.append(conv_block(hidden_dim2, hidden_dim2, 3, 2, 1))
+            scat_blocks.append(conv_block(hidden_dim2, hidden_dim2, 3, 2, 1, dropout_p=dropout_p))
             scat_blocks.append(SEBlock(hidden_dim2))
 
         self.conv_to_latent_scat = nn.Sequential(*scat_blocks)
@@ -758,12 +575,12 @@ class ScatterSqueezeNet(nn.Module):
         # ----------------------
         self.FC_input       = nn.Linear(combined_dim, hidden_dim1)
         self.bn1            = nn.BatchNorm1d(hidden_dim1)
+        self.dropout1       = nn.Dropout(dropout_rate)
         self.FC_hidden      = nn.Linear(hidden_dim1, classifier_hidden_dim)
         self.bn2            = nn.BatchNorm1d(classifier_hidden_dim)
+        self.dropout2       = nn.Dropout(dropout_rate)
         self.FC_classifier  = nn.Linear(classifier_hidden_dim, num_classes)
-        #self.FC_classifier = nn.Linear(classifier_hidden_dim, 1) # if using Binary Cross-entropy loss
         self.act            = nn.LeakyReLU(0.2)
-        self.dropout        = nn.Dropout(dropout_rate)
 
     def forward(self, img, scat):
         # Image path
@@ -777,33 +594,139 @@ class ScatterSqueezeNet(nn.Module):
         x = torch.cat([x_img, x_scat], dim=1)
         # MLP head
         x = self.act(self.bn1(self.FC_input(x)))
-        x = self.dropout(x)
+        x = self.dropout1(x)
         x = self.act(self.bn2(self.FC_hidden(x)))
-        x = self.dropout(x)
+        x = self.dropout2(x)
         #return torch.softmax(self.FC_classifier(x), dim=1)  # Return probabilities for multi-class classification
         return self.FC_classifier(x)  # Return logits directly for multi-class classification
+    
 
-
-class DISSN(ScatterSqueezeNet):
-    """
-    Dual-Input ScatterSqueezeNet:
-    - first input: RAW image  (shape ~ [B, 1, H, W])
-    - second input: scattering coefficients of the *second* version (e.g. T50kpc)
-    This is functionally identical to ScatterSqueezeNet, but named for clarity.
-    """
+class TinyScatterSqueezeNet(nn.Module): # DualSSN
     def __init__(self, img_shape, scat_shape, num_classes,
-                 hidden_dim1=256, hidden_dim2=128, classifier_hidden_dim=256,
-                 dropout_rate=0.3, J=2):
-        super().__init__(img_shape=img_shape,
-                         scat_shape=scat_shape,
-                         num_classes=num_classes,
-                         hidden_dim1=hidden_dim1,
-                         hidden_dim2=hidden_dim2,
-                         classifier_hidden_dim=classifier_hidden_dim,
-                         dropout_rate=dropout_rate,
-                         J=J)
+                 hidden_dim1=32, hidden_dim2=16, classifier_hidden_dim=32,
+                 dropout_rate=0.5, J=2):  # Increase default dropout to 0.5
+        super(TinyScatterSqueezeNet, self).__init__()
+        C_img, H_img, W_img = img_shape
+        C_scat, H_scat, W_scat = scat_shape
 
+        # Image Branch with Dropout
+        self.cnn_encoder = nn.Sequential(
+            nn.Conv2d(C_img, 8, kernel_size=5, stride=1, padding=2, bias=True),
+            nn.BatchNorm2d(8),
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.2),  # ADD: Spatial dropout after first conv
+            
+            nn.Conv2d(8, 16, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(16),
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.2),  # ADD: Spatial dropout after second conv
+            
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            
+            nn.Conv2d(16, 32, kernel_size=5, stride=1, padding=2, bias=True),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.3)  # ADD: Spatial dropout after third conv
+        )
+        
+        self.conv_to_latent_img = nn.Sequential(
+            nn.Conv2d(32, 32, kernel_size=3, stride=2, padding=1, bias=True),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.3),  # ADD: Dropout in latent layers
+            
+            nn.Conv2d(32, 32, kernel_size=3, stride=2, padding=1, bias=True),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.3),  # ADD: Dropout in latent layers
+            
+            nn.Conv2d(32, 32, kernel_size=3, stride=2, padding=1, bias=True),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.3),  # ADD: Dropout in latent layers
+            
+            nn.Conv2d(32, 32, kernel_size=3, stride=2, padding=1, bias=True),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.4)  # ADD: Higher dropout near bottleneck
+        )
 
+        # Scattering branch conv_block helper
+        def conv_block(in_ch, out_ch, k, s, p, dropout_p=0.2):  # MODIFY: Add dropout parameter
+            return nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, k, stride=s, padding=p, bias=True),
+                nn.BatchNorm2d(out_ch),
+                nn.LeakyReLU(0.2),
+                nn.Dropout2d(dropout_p)  # ADD: Dropout in conv blocks
+            )
+
+        # Determine number of downsampling stages
+        if J == 4:
+            downsample_blocks = 1
+        elif J == 3:
+            downsample_blocks = 2
+        elif J == 2:
+            downsample_blocks = 3
+        elif J == 1:
+            downsample_blocks = 4
+        else:
+            raise ValueError("J must be 1, 2, 3, or 4")
+
+        # Build scattering branch with SE blocks and dropout
+        scat_blocks = []
+        # initial conv + SE
+        scat_blocks.append(conv_block(C_scat, hidden_dim2, 3, 1, 1, dropout_p=0.2))
+        scat_blocks.append(SEBlock(hidden_dim2))
+        # repeated downsampling + SE
+        for i in range(downsample_blocks):
+            dropout_p = 0.2 + i * 0.1  # Increase dropout as we go deeper
+            scat_blocks.append(conv_block(hidden_dim2, hidden_dim2, 3, 1, 1, dropout_p=dropout_p))
+            scat_blocks.append(SEBlock(hidden_dim2))
+            scat_blocks.append(conv_block(hidden_dim2, hidden_dim2, 3, 2, 1, dropout_p=dropout_p))
+            scat_blocks.append(SEBlock(hidden_dim2))
+
+        self.conv_to_latent_scat = nn.Sequential(*scat_blocks)
+
+        # Compute combined feature size (unchanged)
+        with torch.no_grad():
+            dummy_img  = torch.zeros(1, C_img, H_img, W_img)
+            dummy_scat = torch.zeros(1, C_scat, H_scat, W_scat)
+            img_f = self.cnn_encoder(dummy_img)
+            img_f = self.conv_to_latent_img(img_f)
+            scat_f = self.conv_to_latent_scat(dummy_scat)
+            img_dim  = img_f.view(1, -1).size(1)
+            scat_dim = scat_f.view(1, -1).size(1)
+            combined_dim = img_dim + scat_dim
+
+        # Classifier Head - CRITICAL: Increase dropout here
+        self.FC_input       = nn.Linear(combined_dim, hidden_dim1)
+        self.bn1            = nn.BatchNorm1d(hidden_dim1)
+        self.dropout1       = nn.Dropout(0.5)  # MODIFY: Separate dropout layer
+        self.FC_hidden      = nn.Linear(hidden_dim1, classifier_hidden_dim)
+        self.bn2            = nn.BatchNorm1d(classifier_hidden_dim)
+        self.dropout2       = nn.Dropout(0.5)  # MODIFY: Separate dropout layer
+        self.FC_classifier  = nn.Linear(classifier_hidden_dim, num_classes)
+        self.act            = nn.LeakyReLU(0.2)
+
+    def forward(self, img, scat):
+        # Image path
+        x_img = self.cnn_encoder(img)
+        x_img = self.conv_to_latent_img(x_img)
+        # Scattering path
+        x_scat = self.conv_to_latent_scat(scat)
+        # Flatten and concat
+        x_img = x_img.view(x_img.size(0), -1)
+        x_scat = x_scat.view(x_scat.size(0), -1)
+        x = torch.cat([x_img, x_scat], dim=1)
+        # MLP head - MODIFY: Use separate dropout layers
+        x = self.act(self.bn1(self.FC_input(x)))
+        x = self.dropout1(x)  # MODIFY: Use self.dropout1
+        x = self.act(self.bn2(self.FC_hidden(x)))
+        x = self.dropout2(x)  # MODIFY: Use self.dropout2
+        return self.FC_classifier(x)
+    
+
+# This classifier is similar to ScatterSqueezeNet but with SE blocks in the image branch as well.
 class ScatterSqueezeNet2(nn.Module):
     def __init__(self, img_shape, scat_shape, num_classes,
                  hidden_dim1=256, hidden_dim2=128, classifier_hidden_dim=256,
@@ -935,21 +858,7 @@ class ScatterSqueezeNet2(nn.Module):
         return self.FC_classifier(x)  # Return logits directly for multi-class classification
     
 
-class InceptionBlock(nn.Module):
-    def __init__(self, in_ch):
-        super().__init__()
-        self.b1 = nn.Conv2d(in_ch, 16, kernel_size=1, padding=0, bias=False)
-        self.b2 = nn.Conv2d(in_ch, 16, kernel_size=3, padding=1, bias=False)
-        self.b3 = nn.Conv2d(in_ch, 16, kernel_size=5, padding=2, bias=False)
-        self.bn = nn.BatchNorm2d(48)
-        self.act = nn.LeakyReLU(0.2)
-    def forward(self, x):
-        x1 = self.b1(x)
-        x2 = self.b2(x)
-        x3 = self.b3(x)
-        return self.act(self.bn(torch.cat([x1, x2, x3], dim=1)))
-
-class DualInputConvolutionalSqueezeNet(nn.Module):
+class DualCNNSqueezeNet_legacy(nn.Module):
     """
     Two-branch CNN classifier with SE attention in each branch,
     both processing the same input tensor but using global pooling
@@ -966,23 +875,23 @@ class DualInputConvolutionalSqueezeNet(nn.Module):
                 nn.Conv2d(C, 8, kernel_size=3, stride=2, padding=1),
                 nn.BatchNorm2d(8),
                 nn.LeakyReLU(),
-                SEB(8, reduction),
+                SEBlock(8, reduction),
                 nn.Conv2d(8, 16, kernel_size=3, stride=2, padding=1),
                 nn.BatchNorm2d(16),
                 nn.LeakyReLU(),
-                SEB(16, reduction),
+                SEBlock(16, reduction),
                 nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
                 nn.BatchNorm2d(32),
                 nn.LeakyReLU(),
-                SEB(32, reduction),
+                SEBlock(32, reduction),
                 nn.Conv2d(32, 16, kernel_size=3, stride=2, padding=1),
                 nn.BatchNorm2d(16),
                 nn.LeakyReLU(),
-                SEB(16, reduction),
+                SEBlock(16, reduction),
                 nn.Conv2d(16, 16, kernel_size=2, stride=2),
                 nn.BatchNorm2d(16),
                 nn.LeakyReLU(),
-                SEB(16, reduction),
+                SEBlock(16, reduction),
                 nn.AdaptiveAvgPool2d(1)
             )
 
@@ -995,31 +904,6 @@ class DualInputConvolutionalSqueezeNet(nn.Module):
                 nn.BatchNorm2d(64), nn.LeakyReLU(0.2),
                 nn.Conv2d(64, 32, kernel_size=3, stride=2, padding=1, bias=False),
                 nn.BatchNorm2d(32), nn.LeakyReLU(0.2),
-                nn.AdaptiveAvgPool2d(1)
-            )
-            
-        def make_branch2_old():
-            return nn.Sequential(
-                nn.Conv2d(C, 8, kernel_size=3, stride=2, padding=2, dilation=2),
-                nn.LayerNorm([8, (H+1)//2, (W+1)//2]),
-                nn.LeakyReLU(),
-                SEB(8, reduction),
-                nn.Conv2d(8, 16, kernel_size=3, stride=2, padding=2, dilation=2),
-                nn.LayerNorm([16, (H+3)//4, (W+3)//4]),
-                nn.LeakyReLU(),
-                SEB(16, reduction),
-                nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=2, dilation=2),
-                nn.LayerNorm([32, (H+7)//8, (W+7)//8]),
-                nn.LeakyReLU(),
-                SEB(32, reduction),
-                nn.Conv2d(32, 16, kernel_size=3, stride=2, padding=2, dilation=2),
-                nn.LayerNorm([16, (H+15)//16, (W+15)//16]),
-                nn.LeakyReLU(),
-                SEB(16, reduction),
-                nn.Conv2d(16, 16, kernel_size=2, stride=2),
-                nn.LayerNorm([16, H//32, W//32]),
-                nn.LeakyReLU(),
-                SEB(16, reduction),
                 nn.AdaptiveAvgPool2d(1)
             )
 
@@ -1045,9 +929,9 @@ class DualInputConvolutionalSqueezeNet(nn.Module):
         self.act        = nn.LeakyReLU(0.2)
         self.dropout    = nn.Dropout(dropout_rate)
 
-    def forward(self, raw, t50):
-        x1 = self.branch1(raw).view(raw.size(0), -1)
-        x2 = self.branch2(t50).view(t50.size(0), -1)
+    def forward(self, x):
+        x1 = self.branch1(x).view(x.size(0), -1)
+        x2 = self.branch2(x).view(x.size(0), -1)
         x  = torch.cat([x1, x2], dim=1)
         x  = self.act(self.bn1(self.fc1(x)))
         x  = self.dropout(x)
@@ -1055,197 +939,159 @@ class DualInputConvolutionalSqueezeNet(nn.Module):
         x  = self.dropout(x)
         return self.classifier(x)
 
-    
 
 class DualCNNSqueezeNet(nn.Module):
     """
-    Two-branch CNN classifier with SE attention in each branch,
-    both processing the same input tensor but using global pooling
-    to reduce dimensionality before the MLP head.
-    """
-    def __init__(self, input_shape, num_classes=4,
-                 hidden_dim1=256, classifier_hidden_dim=256,
-                 dropout_rate=0.3, reduction=16):
-        super().__init__()
-        C, H, W = input_shape
-
-        def make_branch1():
-            return nn.Sequential(
-                nn.Conv2d(C, 8, kernel_size=3, stride=2, padding=1),
-                nn.BatchNorm2d(8),
-                nn.LeakyReLU(),
-                SEB(8, reduction),
-                nn.Conv2d(8, 16, kernel_size=3, stride=2, padding=1),
-                nn.BatchNorm2d(16),
-                nn.LeakyReLU(),
-                SEB(16, reduction),
-                nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
-                nn.BatchNorm2d(32),
-                nn.LeakyReLU(),
-                SEB(32, reduction),
-                nn.Conv2d(32, 16, kernel_size=3, stride=2, padding=1),
-                nn.BatchNorm2d(16),
-                nn.LeakyReLU(),
-                SEB(16, reduction),
-                nn.Conv2d(16, 16, kernel_size=2, stride=2),
-                nn.BatchNorm2d(16),
-                nn.LeakyReLU(),
-                SEB(16, reduction),
-                nn.AdaptiveAvgPool2d(1)
-            )
-
-        def make_branch2():
-            return nn.Sequential(
-                nn.Conv2d(C, 32, kernel_size=3, stride=2, padding=1, bias=False),
-                nn.BatchNorm2d(32), nn.LeakyReLU(0.2),
-                InceptionBlock(32),
-                nn.Conv2d(48, 64, kernel_size=3, stride=2, padding=1, bias=False),
-                nn.BatchNorm2d(64), nn.LeakyReLU(0.2),
-                nn.Conv2d(64, 32, kernel_size=3, stride=2, padding=1, bias=False),
-                nn.BatchNorm2d(32), nn.LeakyReLU(0.2),
-                nn.AdaptiveAvgPool2d(1)
-            )
-            
-        def make_branch2_old():
-            return nn.Sequential(
-                nn.Conv2d(C, 8, kernel_size=3, stride=2, padding=2, dilation=2),
-                nn.LayerNorm([8, (H+1)//2, (W+1)//2]),
-                nn.LeakyReLU(),
-                SEB(8, reduction),
-                nn.Conv2d(8, 16, kernel_size=3, stride=2, padding=2, dilation=2),
-                nn.LayerNorm([16, (H+3)//4, (W+3)//4]),
-                nn.LeakyReLU(),
-                SEB(16, reduction),
-                nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=2, dilation=2),
-                nn.LayerNorm([32, (H+7)//8, (W+7)//8]),
-                nn.LeakyReLU(),
-                SEB(32, reduction),
-                nn.Conv2d(32, 16, kernel_size=3, stride=2, padding=2, dilation=2),
-                nn.LayerNorm([16, (H+15)//16, (W+15)//16]),
-                nn.LeakyReLU(),
-                SEB(16, reduction),
-                nn.Conv2d(16, 16, kernel_size=2, stride=2),
-                nn.LayerNorm([16, H//32, W//32]),
-                nn.LeakyReLU(),
-                SEB(16, reduction),
-                nn.AdaptiveAvgPool2d(1)
-            )
-
-
-        self.branch1 = make_branch1()
-        self.branch2 = make_branch2()
-
-        # Compute flattened feature dimensions
-        with torch.no_grad():
-            dummy = torch.zeros(1, C, H, W)
-            f1 = self.branch1(dummy)
-            f2 = self.branch2(dummy)
-            dim1 = f1.view(1, -1).size(1)
-            dim2 = f2.view(1, -1).size(1)
-            combined_dim = dim1 + dim2
-
-        # Classifier head
-        self.fc1        = nn.Linear(combined_dim, hidden_dim1)
-        self.bn1        = nn.BatchNorm1d(hidden_dim1)
-        self.fc2        = nn.Linear(hidden_dim1, classifier_hidden_dim)
-        self.bn2        = nn.BatchNorm1d(classifier_hidden_dim)
-        self.classifier = nn.Linear(classifier_hidden_dim, num_classes)
-        self.act        = nn.LeakyReLU(0.2)
-        self.dropout    = nn.Dropout(dropout_rate)
-
-    def forward(self, x):
-        x1 = self.branch1(x).view(x.size(0), -1)
-        x2 = self.branch2(x).view(x.size(0), -1)
-        x  = torch.cat([x1, x2], dim=1)
-        x  = self.act(self.bn1(self.fc1(x)))
-        x  = self.dropout(x)
-        x  = self.act(self.bn2(self.fc2(x)))
-        x  = self.dropout(x)
-        return self.classifier(x)
-
-
-class OldDualCNNSqueezeNet(nn.Module): # Gives 60%
-    """
-    Two-branch CNN classifier with SE attention in each branch,
-    both processing the same input tensor but using global pooling
-    to reduce dimensionality before the MLP head.
-    """
-    def __init__(self, input_shape, num_classes=4,
-                 hidden_dim1=256, classifier_hidden_dim=256,
-                 dropout_rate=0.3, reduction=16):
-        super().__init__()
-        C, H, W = input_shape
-
-        def make_branch1():
-            return nn.Sequential(
-                nn.Conv2d(C, 8, kernel_size=3, stride=2, padding=1),
-                nn.BatchNorm2d(8),
-                nn.LeakyReLU(),
-                SEB(8, reduction),
-                nn.Dropout2d(0.2),
-                nn.Conv2d(8, 16, kernel_size=3, stride=2, padding=1),
-                nn.BatchNorm2d(16),
-                nn.LeakyReLU(),
-                SEB(16, reduction),
-                nn.Dropout2d(0.2),
-                nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
-                nn.BatchNorm2d(32),
-                nn.LeakyReLU(),
-                SEB(32, reduction),
-                nn.Dropout2d(0.2),
-                nn.Conv2d(32, 16, kernel_size=3, stride=2, padding=1),
-                nn.BatchNorm2d(16),
-                nn.LeakyReLU(),
-                SEB(16, reduction),
-                nn.Dropout2d(0.2),
-                nn.Conv2d(16, 16, kernel_size=2, stride=2),
-                nn.BatchNorm2d(16),
-                nn.LeakyReLU(),
-                SEB(16, reduction),
-                nn.Dropout2d(0.2),
-                nn.AdaptiveAvgPool2d(1)
-            )
-
-        def make_branch2():
-            return nn.Sequential(
-                nn.Conv2d(C, 32, kernel_size=3, stride=2, padding=1, bias=False),
-                nn.BatchNorm2d(32), nn.LeakyReLU(0.2),
-                InceptionBlock(32),
-                nn.Conv2d(48, 64, kernel_size=3, stride=2, padding=1, bias=False),
-                nn.BatchNorm2d(64), nn.LeakyReLU(0.2),
-                nn.Conv2d(64, 32, kernel_size=3, stride=2, padding=1, bias=False),
-                nn.BatchNorm2d(32), nn.LeakyReLU(0.2),
-                nn.AdaptiveAvgPool2d(1)
-            )
-
-
-        self.branch1 = make_branch1()
-        self.branch2 = make_branch2()
+    Dual-branch CNN directly analogous to TinyScatterSqueezeNet.
     
-        # Compute flattened feature dimensions
+    Architecture mirrors DualSSN but processes images in both branches:
+    - Branch 1 (img_branch): Mimics DualSSN's image encoder (5×5 and 3×3 kernels)
+    - Branch 2 (detail_branch): Mimics DualSSN's scattering branch (all 3×3 kernels)
+    
+    Key differences from failed DualCSN:
+    - 32 channels (not 16) to match DualSSN capacity
+    - Separate encoder + latent compression like DualSSN
+    - MLP classifier head with BatchNorm (not just Linear layers)
+    """
+    def __init__(self, input_shape, num_classes=2, hidden_dim1=32, classifier_hidden_dim=32):
+        super(DualCNNSqueezeNet, self).__init__()
+        
+        in_channels, H, W = input_shape
+        
+        # ==========================================
+        # Branch 1: Image Encoder (mimics DualSSN's cnn_encoder)
+        # Uses larger kernels (5×5, 3×3, 5×5) for broad features
+        # ==========================================
+        self.img_encoder = nn.Sequential(
+            # First conv: 5×5 kernel like DualSSN
+            nn.Conv2d(in_channels, 8, kernel_size=5, stride=1, padding=2, bias=True),
+            nn.BatchNorm2d(8),
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.2),
+            
+            # Second conv: 3×3 kernel
+            nn.Conv2d(8, 16, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(16),
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.2),
+            
+            # Spatial reduction with MaxPool
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            
+            # Third conv: 5×5 kernel like DualSSN
+            nn.Conv2d(16, 32, kernel_size=5, stride=1, padding=2, bias=True),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.3)
+        )
+        
+        # Compression to latent space (mimics conv_to_latent_img)
+        self.img_to_latent = nn.Sequential(
+            nn.Conv2d(32, 32, kernel_size=3, stride=2, padding=1, bias=True),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.3),
+            
+            nn.Conv2d(32, 32, kernel_size=3, stride=2, padding=1, bias=True),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.3),
+            
+            nn.Conv2d(32, 32, kernel_size=3, stride=2, padding=1, bias=True),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.3),
+            
+            nn.Conv2d(32, 32, kernel_size=3, stride=2, padding=1, bias=True),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.4)
+        )
+        
+        # ==========================================
+        # Branch 2: Detail Encoder (mimics DualSSN's scattering branch)
+        # Uses 3×3 kernels throughout with SE blocks
+        # ==========================================
+        # Helper function for conv blocks with dropout
+        def conv_block(in_ch, out_ch, k, s, p, dropout_p=0.2):
+            return nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, k, stride=s, padding=p, bias=True),
+                nn.BatchNorm2d(out_ch),
+                nn.LeakyReLU(0.2),
+                nn.Dropout2d(dropout_p)
+            )
+        
+        # Build detail branch with SE blocks (16 channels like DualSSN's hidden_dim2)
+        hidden_dim2 = 16
+        detail_blocks = []
+        
+        # Initial conv + SE
+        detail_blocks.append(conv_block(in_channels, hidden_dim2, 3, 1, 1, dropout_p=0.2))
+        detail_blocks.append(SEBlock(hidden_dim2))
+        
+        # Three downsampling stages (assuming 128×128 input)
+        # This mirrors DualSSN's scattering branch structure for J=2
+        for i in range(3):
+            dropout_p = 0.2 + i * 0.1
+            # Non-strided conv + SE
+            detail_blocks.append(conv_block(hidden_dim2, hidden_dim2, 3, 1, 1, dropout_p=dropout_p))
+            detail_blocks.append(SEBlock(hidden_dim2))
+            # Strided conv + SE (downsampling)
+            detail_blocks.append(conv_block(hidden_dim2, hidden_dim2, 3, 2, 1, dropout_p=dropout_p))
+            detail_blocks.append(SEBlock(hidden_dim2))
+        
+        self.detail_to_latent = nn.Sequential(*detail_blocks)
+        
+        # ==========================================
+        # Compute combined feature dimensions
+        # ==========================================
         with torch.no_grad():
-            dummy = torch.zeros(1, C, H, W)
-            f1 = self.branch1(dummy)
-            f2 = self.branch2(dummy)
-            dim1 = f1.view(1, -1).size(1)
-            dim2 = f2.view(1, -1).size(1)
-            combined_dim = dim1 + dim2
-
-        # Classifier head
-        self.fc1        = nn.Linear(combined_dim, hidden_dim1)
-        self.bn1        = nn.BatchNorm1d(hidden_dim1)
-        self.fc2        = nn.Linear(hidden_dim1, classifier_hidden_dim)
-        self.bn2        = nn.BatchNorm1d(classifier_hidden_dim)
-        self.classifier = nn.Linear(classifier_hidden_dim, num_classes)
-        self.act        = nn.LeakyReLU(0.2)
-        self.dropout    = nn.Dropout(dropout_rate)
-
+            dummy_input = torch.zeros(1, in_channels, H, W)
+            
+            # Branch 1 output
+            img_f = self.img_encoder(dummy_input)
+            img_f = self.img_to_latent(img_f)
+            img_dim = img_f.view(1, -1).size(1)
+            
+            # Branch 2 output
+            detail_f = self.detail_to_latent(dummy_input)
+            detail_dim = detail_f.view(1, -1).size(1)
+            
+            combined_dim = img_dim + detail_dim
+        
+        # ==========================================
+        # Classifier Head (exactly like DualSSN)
+        # ==========================================
+        self.FC_input = nn.Linear(combined_dim, hidden_dim1)
+        self.bn1 = nn.BatchNorm1d(hidden_dim1)
+        self.dropout1 = nn.Dropout(0.5)
+        
+        self.FC_hidden = nn.Linear(hidden_dim1, classifier_hidden_dim)
+        self.bn2 = nn.BatchNorm1d(classifier_hidden_dim)
+        self.dropout2 = nn.Dropout(0.5)
+        
+        self.FC_classifier = nn.Linear(classifier_hidden_dim, num_classes)
+        self.act = nn.LeakyReLU(0.2)
+    
     def forward(self, x):
-        x1 = self.branch1(x).view(x.size(0), -1)
-        x2 = self.branch2(x).view(x.size(0), -1)
-        x  = torch.cat([x1, x2], dim=1)
-        x  = self.act(self.bn1(self.fc1(x)))
-        x  = self.dropout(x)
-        x  = self.act(self.bn2(self.fc2(x)))
-        x  = self.dropout(x)
-        return self.classifier(x)
+        # Branch 1: Image encoding path
+        x_img = self.img_encoder(x)
+        x_img = self.img_to_latent(x_img)
+        
+        # Branch 2: Detail encoding path
+        x_detail = self.detail_to_latent(x)
+        
+        # Flatten both branches
+        x_img = x_img.view(x_img.size(0), -1)
+        x_detail = x_detail.view(x_detail.size(0), -1)
+        
+        # Concatenate features
+        x = torch.cat([x_img, x_detail], dim=1)
+        
+        # MLP classifier head (exactly like DualSSN)
+        x = self.act(self.bn1(self.FC_input(x)))
+        x = self.dropout1(x)
+        x = self.act(self.bn2(self.FC_hidden(x)))
+        x = self.dropout2(x)
+        
+        return self.FC_classifier(x)

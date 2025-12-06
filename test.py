@@ -1,8 +1,8 @@
 import os, re, time, random, pickle, hashlib, itertools, torch
 from utils.data_loader import load_galaxies, get_classes
 from utils.classifiers import (
-    RustigeClassifier, TinyCNN, MLPClassifier, SCNN, CNNSqueezeNet, ScatterResNet,
-    BinaryClassifier, ScatterSqueezeNet, ScatterSqueezeNet2, DualCNNSqueezeNet)
+    RustigeClassifier, TinyCNN, MLPClassifier, SCNN, ScatterResNet, 
+    ScatterSqueezeNet, TinyScatterSqueezeNet, DualCNNSqueezeNet)
 from utils.training_tools import EarlyStopping, reset_weights
 from utils.calc_tools import cluster_metrics, normalise_images, check_tensor, fold_T_axis, compute_scattering_coeffs, custom_collate
 from utils.plotting import plot_histograms, plot_images_by_class, plot_image_grid, plot_background_histogram
@@ -30,7 +30,7 @@ def set_seed(seed):
 
 set_seed(SEED)
 
-print("Running script test 4.1 with dl1 Latest version with seed", SEED)
+print("Running test.py with dl1 Latest version with seed", SEED)
 
 
 ###############################################
@@ -40,26 +40,28 @@ galaxy_classes    = [50, 51]
 max_num_galaxies  = 1000000  # Upper limit for the all-classes combined training data before classical augmentation
 dataset_portions  = [1]
 J, L, order       = 2, 12, 2
-num_epochs_cuda = 100
+num_epochs_cuda = 200
 num_epochs_cpu = 100
-learning_rates = [1e-3]
-regularization_params = [1e-2]  
-label_smoothing = 0.2
+learning_rates = [5e-5]
+regularization_params = [1e-1]  
+label_smoothing = 0.3
 num_experiments = 5
 folds = [0] # 0-9 for 10-fold cross validation, 10 for only one training
-percentile_lo = 60 # Percentile stretch lower bound
-percentile_hi = 90  # Percentile stretch upper bound
+percentile_lo = 30 # Percentile stretch lower bound
+percentile_hi = 99  # Percentile stretch upper bound
 versions = 'RAW' # any mix of loadable and runtime-tapered planes. 'rt50' or 'rt100' for tapering. Square brackets for stacking
 
-classifier = ["TinyCNN", # Very Simple CNN
-              "Rustige", # Simple CNN from Rustige et al. 2023, https://github.com/floriangriese/wGAN-supported-augmentation/blob/main/src/Classifiers/SimpleClassifiers/Classifiers.py
-              "SCNN", # Simple CNN similar to Rustige's
-              "CNNSqueezeNet", # SCNN with Squeeze-and-Excitation blocks
-              "DualCNNSqueezeNet", # Dual CNN with Squeeze-and-Excitation blocks
-              "ScatterNet", "ScatterSqueezeNet", "ScatterSqueezeNet2",
-              "Binary", "ScatterResNet"][-4]
+classifier = ["TinyCNN",     # 0.Very Simple CNN
+              "Rustige",     # 1.Simple CNN from Rustige et al. 2023, https://github.com/floriangriese/wGAN-supported-augmentation/blob/main/src/Classifiers/SimpleClassifiers/Classifiers.py
+              "SCNN",        # 2.Simple CNN similar to Rustige's
+              "DualCSN",     # 3.Dual input CNN with scattering coefficients as one input branch and Squeeze-and-Excitation blocks
+              "ScatterNet",  # 4.Scattering coefficients as input to MLP
+              "DualSSN",     # 5.Dual input CNN with scattering coefficients as one input branch and Squeeze-and-Excitation blocks
+              "SmallDualSSN",# 6.Smaller Dual input CNN with scattering coefficients as one input branch and Squeeze-and-Excitation blocks
+              "Binary",      # 7.Binary classifier (2-class only)
+              "ScatterResNet"][3]
 
-PREFER_PROCESSED = False
+PREFER_PROCESSED = True
 STRETCH = True  # Arcsinh stretch
 USE_GLOBAL_NORMALISATION = False           # single on/off switch . False - image-by-image normalisation 
 GLOBAL_NORM_MODE = "percentile"           # "percentile" or "flux". Becomes "none" if USE_GLOBAL_NORMALISATION is 
@@ -70,11 +72,12 @@ NORMALISESCSTOPM = False  # Normalise scattering coefficients to [-1, 1]
 FILTERED = True  # Remove in training and validation for the classifier
 FILTERGEN = False  # Remove generated images that are too similar to other generated images
 AUGMENT = True  # Use classical data augmentation (flips, rotations)
+MIXUP = False  # Use MixUp augmentation as a means to reduce overfitting
 PRINTFILENAMES = True
 USE_CLASS_WEIGHTS = True  # Set to False to disable class weights
 ES, patience = True, 30  # Use early stopping
 SCHEDULER = True  # Use a learning rate scheduler
-SHOWIMGS = True  # Show some generated images for each class (Tool for control)
+SHOWIMGS = False  # Show some generated images for each class (Tool for control)
 
 
 ########################################################################
@@ -83,6 +86,8 @@ SHOWIMGS = True  # Show some generated images for each class (Tool for control)
 
 os.makedirs('./classifier/trained_models', exist_ok=True)
 os.makedirs('./classifier/trained_models_filtered', exist_ok=True)
+os.makedirs('./classifier/figures', exist_ok=True)
+os.makedirs('./classifier/logfiles', exist_ok=True)
  
 if torch.cuda.is_available():
     DEVICE = "cuda"
@@ -130,9 +135,7 @@ def _verkey(v):
 ver_key = _verkey(versions)
 
 scattering = Scattering2D(J=J, L=L, shape=img_shape[-2:], max_order=order)      
-hidden_dim1 = 256
-hidden_dim2 = 128
-vae_latent_dim = 64
+
 
 ########################################################################
 ##################### HELPER FUNCTIONS #################################
@@ -233,7 +236,7 @@ def plot_training_history(history, base, experiment, save_dir='./classifier/test
     
     ax1.set_xlabel('Epoch', fontsize=12)
     ax1.set_ylabel('Loss', fontsize=12)
-    ax1.set_title(f'Training, Validation, and Test Loss\n{base}_exp{experiment}', fontsize=13)
+    ax1.set_title(f'Training, Validation, and Test Loss', fontsize=13)
     ax1.legend(fontsize=11)
     ax1.grid(True, alpha=0.3)
     
@@ -266,7 +269,7 @@ def plot_training_history(history, base, experiment, save_dir='./classifier/test
         
         ax2.set_xlabel('Epoch', fontsize=12)
         ax2.set_ylabel('Accuracy', fontsize=12)
-        ax2.set_title(f'Training, Validation, and Test Accuracy\n{base}_exp{experiment}', fontsize=13)
+        ax2.set_title(f'Training, Validation, and Test Accuracy', fontsize=13)
         ax2.legend(fontsize=11)
         ax2.grid(True, alpha=0.3)
         ax2.set_ylim([0, 1])
@@ -274,6 +277,8 @@ def plot_training_history(history, base, experiment, save_dir='./classifier/test
         ax2.text(0.5, 0.5, 'Accuracy data not available', 
                 ha='center', va='center', transform=ax2.transAxes, fontsize=12)
     
+    # Add a supertitle
+    fig.suptitle(f'Training History for {base} Experiment {experiment}', fontsize=16)
     plt.tight_layout()
     save_path = f"{save_dir}/{base}_exp{experiment}_training_curves_rs=41.pdf"
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -289,6 +294,37 @@ def _desc(name, x):
 # -------------------------------------------------------------
 # Data processing helpers
 # -------------------------------------------------------------
+
+def mixup_data(x1, x2, y, alpha=0.4):
+    """
+    Apply MixUp augmentation: create convex combinations of pairs of examples.
+    
+    Args:
+        x1: First input (images)
+        x2: Second input (scattering coefficients)
+        y: Labels
+        alpha: MixUp hyperparameter
+    
+    Returns:
+        Mixed inputs and targets
+    """
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+
+    batch_size = x1.size(0)
+    index = torch.randperm(batch_size).to(x1.device)
+
+    mixed_x1 = lam * x1 + (1 - lam) * x1[index]
+    mixed_x2 = lam * x2 + (1 - lam) * x2[index]
+    y_a, y_b = y, y[index]
+    
+    return mixed_x1, mixed_x2, y_a, y_b, lam
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    """Compute MixUp loss."""
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 def permute_like(x, perm):
     if x is None:
@@ -464,11 +500,11 @@ print("Labels of the test set after relabelling:", torch.unique(test_labels, ret
 ################# NORMALISE AND PACKAGE TEST DATA ############################
 ##############################################################################
 
-if classifier in ['Rustige', 'CNNSqueezeNet', 'SCNN', 'ScatterSqueezeNet', 'ScatterSqueezeNet2', 'Binary']:
+if classifier in ['Rustige', 'CSN', 'SCNN', 'SmallDualSSN', 'DualSSN', 'DualSSN2', 'Binary']:
     test_images = _as_5d(test_images).to(DEVICE)
 
 # Prepare input data
-if classifier in ['ScatterNet', 'ScatterResNet', 'ScatterSqueezeNet', 'ScatterSqueezeNet2']:
+if classifier in ['ScatterNet', 'ScatterResNet', 'SmallDualSSN', 'DualSSN', 'DualSSN2']:
     # Define cache paths (you can adjust these names as needed)
     test_cache_path = f"./.cache/test_scat_{galaxy_classes}_{dataset_portions[0]}_{FILTERED}.npy"
 
@@ -501,7 +537,7 @@ if classifier in ['ScatterNet', 'ScatterResNet', 'ScatterSqueezeNet', 'ScatterSq
         trainval_scat_coeffs, test_scat_coeffs = all_scat[:len(trainval_scat_coeffs)], all_scat[len(trainval_scat_coeffs):]
     if classifier in ['ScatterNet', 'ScatterResNet']:
         test_dataset = TensorDataset(mock_test, test_scat_coeffs, test_labels)
-    else: # if classifier in ['ScatterSqueezeNet', 'ScatterSqueezeNet2']:
+    else: # if classifier in ['DualSSN', 'DualSSN2']:
         test_dataset = TensorDataset(test_images, test_scat_coeffs, test_labels)
 else:
     if test_images.dim() == 5:
@@ -529,7 +565,7 @@ for fold, lr, reg in param_combinations:
     f"global_norm={USE_GLOBAL_NORMALISATION}, norm_mode={GLOBAL_NORM_MODE}, "
     f"PREFER_PROCESSED={PREFER_PROCESSED} ◀\n")
 
-    log_path = f"./classifier/log_{runname}.txt"
+    log_path = f"./classifier/logfiles/log_{runname}.txt"
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     _out = _loader(
             galaxy_classes=galaxy_classes,
@@ -615,7 +651,7 @@ for fold, lr, reg in param_combinations:
     ############ NORMALISE AND PACKAGE THE INPUT #############
     ##########################################################
 
-    if classifier in ['Rustige', 'CNNSqueezeNet', 'SCNN', 'ScatterSqueezeNet', 'ScatterSqueezeNet2', 'Binary']:
+    if classifier in ['Rustige', 'CSN', 'SCNN', 'SmallDualSSN', 'DualSSN', 'DualSSN2', 'Binary']:
         train_images = _as_5d(train_images).to(DEVICE)
         valid_images = _as_5d(valid_images).to(DEVICE)
     
@@ -628,7 +664,7 @@ for fold, lr, reg in param_combinations:
         print(f"[pos_weight] RH={pos_weight[0].item():.2f}, RR={pos_weight[1].item():.2f}")
 
     # Prepare input data
-    if classifier in ['ScatterNet', 'ScatterResNet', 'ScatterSqueezeNet', 'ScatterSqueezeNet2']:
+    if classifier in ['ScatterNet', 'ScatterResNet', 'SmallDualSSN', 'DualSSN', 'DualSSN2']:
         # Define cache paths (you can adjust these names as needed)
         train_cache_path = f"./.cache/train_scat_{galaxy_classes}_{fold}_{dataset_portions[0]}_{FILTERED}.npy"
         valid_cache_path = f"./.cache/valid_scat_{galaxy_classes}_{fold}_{dataset_portions[0]}_{FILTERED}.npy"
@@ -664,7 +700,7 @@ for fold, lr, reg in param_combinations:
         if classifier in ['ScatterNet', 'ScatterResNet']:
             train_dataset = TensorDataset(mock_train, train_scat_coeffs, train_labels)
             valid_dataset = TensorDataset(mock_valid, valid_scat_coeffs, valid_labels)
-        else: # if classifier in ['ScatterSqueezeNet', 'ScatterSqueezeNet2']:
+        else: # if classifier in ['DualSSN', 'DualSSN2']:
             train_dataset = TensorDataset(train_images, train_scat_coeffs, train_labels)
             valid_dataset = TensorDataset(valid_images, valid_scat_coeffs, valid_labels)
     else:
@@ -673,6 +709,8 @@ for fold, lr, reg in param_combinations:
             valid_images = fold_T_axis(valid_images)
         for x,name in [(train_images,"train"), (valid_images,"valid")]:
             assert x.dim() == 4, f"{name}_images should be [B,C,H,W], got {tuple(x.shape)}"
+        mock_train = torch.zeros_like(train_images)
+        mock_valid = torch.zeros_like(valid_images)
         train_dataset = TensorDataset(train_images, mock_train, train_labels)
         valid_dataset = TensorDataset(valid_images, mock_valid, valid_labels)
 
@@ -692,7 +730,7 @@ for fold, lr, reg in param_combinations:
             imgs,
             labels=lbls,
             num_images=5,
-            save_path=f"./classifier/{galaxy_classes}_{classifier}_{dataset_sizes[folds[0]][-1]}_{percentile_lo}_{percentile_hi}_example_train_data.pdf"
+            save_path=f"./classifier/figures/{galaxy_classes}_{classifier}_{dataset_sizes[folds[0]][-1]}_{percentile_lo}_{percentile_hi}_example_train_data.pdf"
         )     
         
         if len(galaxy_classes) == 2:
@@ -713,7 +751,7 @@ for fold, lr, reg in param_combinations:
                 train_images_cls2.cpu(),
                 title1=f"Class {galaxy_classes[0]}",
                 title2=f"Class {galaxy_classes[1]}",
-                save_path=f"./classifier/{galaxy_classes}_{classifier}_{dataset_sizes[folds[0]][-1]}_{percentile_lo}_{percentile_hi}_histogram_{ver_key}.pdf"
+                save_path=f"./classifier/figures/{galaxy_classes}_{classifier}_{dataset_sizes[folds[0]][-1]}_{percentile_lo}_{percentile_hi}_histogram_{ver_key}.pdf"
             )
             
             plot_background_histogram(
@@ -721,7 +759,7 @@ for fold, lr, reg in param_combinations:
                 train_images_cls2.cpu(),
                 img_shape=(1, 128, 128),
                 title="Background histograms",
-                save_path=f"./classifier/{galaxy_classes}_{classifier}_{dataset_sizes[folds[0]][-1]}_background_hist.pdf"
+                save_path=f"./classifier/figures/{galaxy_classes}_{classifier}_{dataset_sizes[folds[0]][-1]}_background_hist.pdf"
             )
             
             # Histogram for summed pixel values. One image is one point in the histogram.
@@ -734,7 +772,7 @@ for fold, lr, reg in param_combinations:
             plt.ylabel("Number of images")
             plt.title(f"Histogram of summed pixel values for classes {galaxy_classes[0]} and {galaxy_classes[1]}")
             plt.legend()
-            plt.savefig(f"./classifier/{galaxy_classes}_{classifier}_{dataset_sizes[folds[0]][-1]}_{percentile_lo}_{percentile_hi}_sum_histogram_{ver_key}.pdf")
+            plt.savefig(f"./classifier/figures/{galaxy_classes}_{classifier}_{dataset_sizes[folds[0]][-1]}_{percentile_lo}_{percentile_hi}_sum_histogram_{ver_key}.pdf")
             plt.close()
 
             for cls in galaxy_classes:
@@ -750,19 +788,19 @@ for fold, lr, reg in param_combinations:
                 imgs4plot = _ensure_4d(train_images)[sel_train].cpu()
                 plot_image_grid(
                     imgs4plot, num_images=36, titles=titles_train,
-                    save_path=f"./classifier/{galaxy_classes}_{classifier}_{dataset_sizes[folds[0]][-1]}_{percentile_lo}_{percentile_hi}_{cls}_train_grid_{ver_key}.pdf"
+                    save_path=f"./classifier/figures/{galaxy_classes}_{classifier}_{dataset_sizes[folds[0]][-1]}_{percentile_lo}_{percentile_hi}_{cls}_train_grid_{ver_key}.pdf"
                 )
 
                 imgs4plot = _ensure_4d(valid_images)[sel_valid].cpu()
                 plot_image_grid(
                     imgs4plot, num_images=36, titles=titles_valid,
-                    save_path=f"./classifier/{galaxy_classes}_{classifier}_{dataset_sizes[folds[0]][-1]}_{percentile_lo}_{percentile_hi}_{cls}_valid_grid_{ver_key}.pdf"
+                    save_path=f"./classifier/figures/{galaxy_classes}_{classifier}_{dataset_sizes[folds[0]][-1]}_{percentile_lo}_{percentile_hi}_{cls}_valid_grid_{ver_key}.pdf"
                 )
                 
                 imgs4plot = _ensure_4d(test_images)[sel_test].cpu()
                 plot_image_grid(
                     imgs4plot, num_images=36, titles=titles_test,
-                    save_path=f"./classifier/{galaxy_classes}_{classifier}_{dataset_sizes[folds[0]][-1]}_{percentile_lo}_{percentile_hi}_{cls}_test_grid_{ver_key}.pdf"
+                    save_path=f"./classifier/figures/{galaxy_classes}_{classifier}_{dataset_sizes[folds[0]][-1]}_{percentile_lo}_{percentile_hi}_{cls}_test_grid_{ver_key}.pdf"
                 )
 
                 # summed-intensity histogram helper unchanged...
@@ -773,35 +811,61 @@ for fold, lr, reg in param_combinations:
                     train_images_cls2.cpu(),
                     label1=tag_to_desc[get_classes()[galaxy_classes[0]]['tag']],
                     label2=tag_to_desc[get_classes()[galaxy_classes[1]]['tag']],
-                    save_path=f"./classifier/{galaxy_classes}_{classifier}_{dataset_sizes[folds[0]][-1]}_summed_intensity_histogram.pdf"
+                    save_path=f"./classifier/figures/{galaxy_classes}_{classifier}_{dataset_sizes[folds[0]][-1]}_summed_intensity_histogram.pdf"
                 )
                 
     ###############################################
     ############# DEFINE MODEL ####################
     ###############################################
     
+    # Right before defining models, add:
+    if classifier in ['ScatterNet', 'ScatterResNet', 'SmallDualSSN', 'DualSSN', 'DualSSN2']:
+        print(f"\n{'='*60}")
+        print(f"SCATTERING DIMENSION DEBUG")
+        print(f"{'='*60}")
+        print(f"train_scat_coeffs.shape = {train_scat_coeffs.shape}")
+        print(f"scatdim (from shape[1:]) = {scatdim}")
+        print(f"np.prod(scatdim) = {int(np.prod(scatdim))}")
+        
+        # Verify with actual batch
+        sample_batch = next(iter(train_loader))
+        _, scat_sample, _ = sample_batch
+        print(f"Actual batch scat shape = {scat_sample.shape}")
+        print(f"Flattened size = {scat_sample.view(scat_sample.size(0), -1).shape[1]}")
+        print(f"{'='*60}\n")
+    
     if classifier == "Rustige":
         models = {"RustigeClassifier": {"model": RustigeClassifier(n_output_nodes=num_classes).to(DEVICE)}} 
     elif classifier == "SCNN":
         models = {"SCNN": {"model": SCNN(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)}}
-    elif classifier == "CNNSqueezeNet":
-        models = {"CNNSqueezeNet": {"model": CNNSqueezeNet(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)}}
-    elif classifier == "DualCNNSqueezeNet":
-        models = {"DualCNNSqueezeNet": {"model": DualCNNSqueezeNet(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)}}
+    elif classifier == "CSN":
+        models = {"CSN": {"model": CNNSqueezeNet(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)}}
+    elif classifier == "DualCSN":
+        models = {"DualCSN": {"model": DualCNNSqueezeNet(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)}}
     elif classifier == "TinyCNN":
         models = {"TinyCNN": {"model": TinyCNN(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)}} 
     elif classifier == "ScatterNet":
-        models = {"ScatterNet": {"model": MLPClassifier(input_dim=int(np.prod(scatdim)), num_classes=num_classes).to(DEVICE)}}
+        #models = {"ScatterNet": {"model": MLPClassifier(input_dim=int(np.prod(scatdim)), num_classes=num_classes).to(DEVICE)}}
+        # scatdim should be a tuple like (173056, 32, 32) or similar
+        print(f"DEBUG: scatdim = {scatdim}")  # ADD: Debug print
+        input_dim = int(np.prod(scatdim))
+        print(f"DEBUG: Calculated input_dim = {input_dim}")  # ADD: Debug print
+        models = {"ScatterNet": {"model": MLPClassifier(
+            input_dim=input_dim, 
+            num_classes=num_classes
+        ).to(DEVICE)}}
     elif classifier == "ScatterResNet":
         models = {"ScatterResNet": {"model": ScatterResNet(scat_shape=scatdim, num_classes=num_classes).to(DEVICE)}}
-    elif classifier == "ScatterSqueezeNet":
-        models = {"ScatterSqueezeNet": {"model": ScatterSqueezeNet(img_shape=tuple(valid_images.shape[1:]), scat_shape=scatdim, num_classes=num_classes).to(DEVICE)}}
-    elif classifier == "ScatterSqueezeNet2":
-        models = {"ScatterSqueezeNet2": {"model": ScatterSqueezeNet2(img_shape=tuple(valid_images.shape[1:]), scat_shape=scatdim, num_classes=num_classes).to(DEVICE)}}
+    elif classifier == "DualSSN":
+        models = {"DualSSN": {"model": ScatterSqueezeNet(img_shape=tuple(valid_images.shape[1:]), scat_shape=scatdim, num_classes=num_classes).to(DEVICE)}}
+    elif classifier == "SmallDualSSN":
+        models = {"SmallDualSSN": {"model": TinyScatterSqueezeNet(img_shape=tuple(valid_images.shape[1:]), scat_shape=scatdim, num_classes=num_classes).to(DEVICE)}}
+    elif classifier == "DualSSN2":
+        models = {"DualSSN2": {"model": ScatterSqueezeNet2(img_shape=tuple(valid_images.shape[1:]), scat_shape=scatdim, num_classes=num_classes).to(DEVICE)}}
     elif classifier == 'Binary':
         models = {"BinaryClassifier": {"model": BinaryClassifier(input_shape=tuple(valid_images.shape[1:])).to(DEVICE)}}
     else:
-        raise ValueError("Model not found. Please select one of 'scatterMLP', 'smallSTMLP', or 'normalCNN'.")
+        raise ValueError(f"Unknown classifier: {classifier}")
 
     for classifier_name, model_details in models.items():
         if FIRSTTIME:
@@ -810,9 +874,7 @@ for fold, lr, reg in param_combinations:
                 summary(model_details["model"], input_size=(int(np.prod(scatdim)),), device=DEVICE)
             elif classifier == "ScatterResNet":
                 summary(model_details["model"], input_size=scatdim, device=DEVICE)
-            elif classifier == "ScatterSqueezeNet":
-                summary(model_details["model"], input_size=[valid_images.shape[1:], scatdim])
-            elif classifier == "ScatterSqueezeNet2":
+            elif classifier in ["DualSSN", "SmallDualSSN", "DualSSN2"]:
                 summary(model_details["model"], input_size=[valid_images.shape[1:], scatdim])
             else:
                 summary(model_details["model"], input_size=tuple(valid_images.shape[1:]), device=DEVICE)
@@ -891,16 +953,36 @@ for fold, lr, reg in param_combinations:
                         labels = _rest
                         images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
                         optimizer.zero_grad()
-                        if classifier in ["ScatterNet", "ScatterResNet"]:
-                            logits = model(scat)
-                        elif classifier in ["ScatterSqueezeNet", "ScatterSqueezeNet2"]:
-                            logits = model(images, scat)
-                        else:
-                            logits = model(images)
+                        
+                        # ADD MixUp here:
+                        if np.random.rand() > 0.5 and MIXUP:  # Apply MixUp 50% of the time
+                            images, scat, labels_a, labels_b, lam = mixup_data(images, scat, labels, alpha=0.4)
+                            
+                            if classifier in ["ScatterNet", "ScatterResNet"]:
+                                logits = model(scat)
+                            elif classifier in ['DualSSN', 'SmallDualSSN']:
+                                logits = model(images, scat)
+                            else:
+                                logits = model(images)
 
-                        logits = collapse_logits(logits, num_classes, MULTILABEL)
-                        labels = labels.float() if MULTILABEL else labels.long()
-                        loss = criterion(logits, labels)
+                            logits = collapse_logits(logits, num_classes, MULTILABEL)
+                            labels_a = labels_a.float() if MULTILABEL else labels_a.long()
+                            labels_b = labels_b.float() if MULTILABEL else labels_b.long()
+                            
+                            # CHANGE: Use MixUp criterion
+                            loss = mixup_criterion(criterion, logits, labels_a, labels_b, lam)
+                        else:
+                            # Normal forward pass without MixUp
+                            if classifier in ["ScatterNet", "ScatterResNet"]:
+                                logits = model(scat)
+                            elif classifier in ['DualSSN', 'SmallDualSSN']:
+                                logits = model(images, scat)
+                            else:
+                                logits = model(images)
+
+                            logits = collapse_logits(logits, num_classes, MULTILABEL)
+                            labels = labels.float() if MULTILABEL else labels.long()
+                            loss = criterion(logits, labels)
 
                         loss.backward()
                         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # Gradient clipping to prevent gradients that are too large
@@ -942,7 +1024,7 @@ for fold, lr, reg in param_combinations:
                             images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
                             if classifier in ["ScatterNet", "ScatterResNet"]:
                                 logits = model(scat)
-                            elif classifier in ["ScatterSqueezeNet", "ScatterSqueezeNet2"]:
+                            elif classifier in ['DualSSN', 'SmallDualSSN', 'DualSSN2']:
                                 logits = model(images, scat)
                             else:
                                 logits = model(images)
@@ -987,7 +1069,7 @@ for fold, lr, reg in param_combinations:
                             
                             if classifier in ["ScatterNet", "ScatterResNet"]:
                                 logits = model(scat)
-                            elif classifier in ["ScatterSqueezeNet", "ScatterSqueezeNet2"]:
+                            elif classifier in ['DualSSN', 'SmallDualSSN', 'DualSSN2']:
                                 logits = model(images, scat)
                             else:
                                 logits = model(images)
@@ -1023,6 +1105,17 @@ for fold, lr, reg in param_combinations:
                         f"Val Loss: {val_average_loss:.4f}, Val Acc: {val_epoch_acc:.4f} - "
                         f"Test Loss: {test_average_loss:.4f}, Test Acc: {test_epoch_acc:.4f}")
                     
+                    # Stop if overfitting is detected
+                    train_val_gap = train_epoch_acc - val_epoch_acc
+                    train_test_gap = train_epoch_acc - test_epoch_acc
+
+                    # Stop if overfitting becomes severe
+                    if train_epoch_acc > 0.95 and (train_val_gap > 0.25 or train_test_gap > 0.25):  # 25% gap threshold
+                        print(f"⚠️  Severe overfitting detected at epoch {epoch+1}")
+                        print(f"   Train-Val gap: {train_val_gap:.4f}, Train-Test gap: {train_test_gap:.4f}")
+                        print(f"   Stopping early to prevent further overfitting")
+                        break
+                    
                     if ES:
                         early_stopping(val_average_loss, model, f'./classifier/trained_models/{base}_best_model.pth')
                         if early_stopping.early_stop:
@@ -1049,7 +1142,9 @@ for fold, lr, reg in param_combinations:
                         labels = _rest
                         images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
                         
-                        if classifier in ["ScatterSqueezeNet", "ScatterSqueezeNet2"]:
+                        if classifier in ["ScatterNet", "ScatterResNet"]:
+                            logits = model(scat)
+                        elif classifier in ['DualSSN', 'SmallDualSSN', 'DualSSN2']:
                             logits = model(images, scat)
                         else:
                             logits = model(images)
@@ -1077,7 +1172,7 @@ for fold, lr, reg in param_combinations:
                         images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
                         if classifier in ["ScatterNet", "ScatterResNet"]:
                             logits = model(scat)
-                        elif classifier in ["ScatterSqueezeNet", "ScatterSqueezeNet2"]:
+                        elif classifier in ['DualSSN', 'SmallDualSSN', 'DualSSN2']:
                             logits = model(images, scat)
                         else:
                             logits = model(images)
@@ -1111,7 +1206,7 @@ for fold, lr, reg in param_combinations:
                         images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
                         if classifier in ["ScatterNet", "ScatterResNet"]:
                             logits = model(scat)
-                        elif classifier in ["ScatterSqueezeNet", "ScatterSqueezeNet2"]:
+                        elif classifier in ['DualSSN', 'SmallDualSSN', 'DualSSN2']:
                             logits = model(images, scat)
                         else:
                             logits = model(images)
@@ -1185,7 +1280,7 @@ for fold, lr, reg in param_combinations:
                         for ax in axes[len(mis_images):]:
                             ax.axis('off')
 
-                        out_path = f"./classifier/{galaxy_classes}_{classifier}_{dataset_sizes[folds[0]][-1]}_{percentile_lo}_{percentile_hi}_misclassified_{ver_key}.pdf"
+                        out_path = f"./classifier/figures/{galaxy_classes}_{classifier}_{dataset_sizes[folds[0]][-1]}_{percentile_lo}_{percentile_hi}_misclassified_{ver_key}.pdf"
                         fig.savefig(out_path, dpi=150, bbox_inches='tight')
                         plt.close(fig)
 
@@ -1371,7 +1466,7 @@ for fold, lr, reg in param_combinations:
                 plt.tight_layout()
 
                 save_path_hist = (
-                    f"./classifier/{galaxy_classes}_{classifier}_"
+                    f"./classifier/figures/{galaxy_classes}_{classifier}_"
                     f"{dataset_sizes[folds[0]][-1]}_{metric_name}_histogram.pdf"
                 )
                 plt.savefig(save_path_hist, dpi=150)
