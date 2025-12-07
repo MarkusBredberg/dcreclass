@@ -1,7 +1,7 @@
 import os, re, time, random, pickle, hashlib, itertools, torch
 from utils.data_loader import load_galaxies, get_classes
 from utils.classifiers import (
-    RustigeClassifier, TinyCNN, MLPClassifier, SCNN, ScatterResNet, 
+    RustigeClassifier, TinyCNN, ScatterNet, ScatterResNet, 
     ScatterSqueezeNet, TinyScatterSqueezeNet, DualCNNSqueezeNet)
 from utils.training_tools import EarlyStopping, reset_weights
 from utils.calc_tools import cluster_metrics, normalise_images, check_tensor, fold_T_axis, compute_scattering_coeffs, custom_collate
@@ -44,22 +44,20 @@ num_epochs_cuda = 200
 num_epochs_cpu = 100
 learning_rates = [6e-5]
 regularization_params = [1e-1]  
-label_smoothing = 0.3
+label_smoothing = 0.1
 num_experiments = 5
 folds = [0] # 0-9 for 10-fold cross validation, 10 for only one training
 percentile_lo = 30 # Percentile stretch lower bound
 percentile_hi = 99  # Percentile stretch upper bound
 versions = 'RAW' # any mix of loadable and runtime-tapered planes. 'rt50' or 'rt100' for tapering. Square brackets for stacking
 
-classifier = ["TinyCNN",     # 0.Very Simple CNN
+classifier = ["CNN",         # 0.Very Simple CNN
               "Rustige",     # 1.Simple CNN from Rustige et al. 2023, https://github.com/floriangriese/wGAN-supported-augmentation/blob/main/src/Classifiers/SimpleClassifiers/Classifiers.py
-              "SCNN",        # 2.Simple CNN similar to Rustige's
-              "DualCSN",     # 3.Dual input CNN with Squeeze-and-Excitation blocks
-              "ScatterNet",  # 4.Scattering coefficients as input to MLP
-              "DualSSN",     # 5.Dual input CNN with scattering coefficients as one input branch and Squeeze-and-Excitation blocks
-              "SmallDualSSN",# 6.Smaller Dual input CNN with scattering coefficients as one input branch and Squeeze-and-Excitation blocks
-              "Binary",      # 7.Binary classifier (2-class only)
-              "ScatterResNet"][3]
+              "DualCSN",     # 2.Dual input CNN with scattering coefficients as one input branch and Squeeze-and-Excitation blocks
+              "ScatterNet",  # 3.Scattering coefficients as input to MLP
+              "DualSSN",     # 4.Dual input CNN with scattering coefficients as one input branch and Squeeze-and-Excitation blocks
+              "SmallDualSSN",# 5.Smaller Dual input CNN with scattering coefficients as one input branch and Squeeze-and-Excitation blocks
+              "ScatterResNet"][0]
 
 PREFER_PROCESSED = True
 STRETCH = True  # Arcsinh stretch
@@ -500,11 +498,11 @@ print("Labels of the test set after relabelling:", torch.unique(test_labels, ret
 ################# NORMALISE AND PACKAGE TEST DATA ############################
 ##############################################################################
 
-if classifier in ['Rustige', 'CSN', 'SCNN', 'SmallDualSSN', 'DualSSN', 'DualSSN2', 'Binary']:
+if classifier in ['Rustige', 'CSN', 'SmallDualSSN', 'Binary']:
     test_images = _as_5d(test_images).to(DEVICE)
 
 # Prepare input data
-if classifier in ['ScatterNet', 'ScatterResNet', 'SmallDualSSN', 'DualSSN', 'DualSSN2']:
+if classifier in ['ScatterNet', 'ScatterResNet', 'SmallDualSSN']:
     # Define cache paths (you can adjust these names as needed)
     test_cache_path = f"./.cache/test_scat_{galaxy_classes}_{dataset_portions[0]}_{FILTERED}.npy"
 
@@ -651,7 +649,7 @@ for fold, lr, reg in param_combinations:
     ############ NORMALISE AND PACKAGE THE INPUT #############
     ##########################################################
 
-    if classifier in ['Rustige', 'CSN', 'SCNN', 'SmallDualSSN', 'DualSSN', 'DualSSN2', 'Binary']:
+    if classifier in ['Rustige', 'CSN', 'SmallDualSSN', 'DualSSN']:
         train_images = _as_5d(train_images).to(DEVICE)
         valid_images = _as_5d(valid_images).to(DEVICE)
     
@@ -664,7 +662,7 @@ for fold, lr, reg in param_combinations:
         print(f"[pos_weight] RH={pos_weight[0].item():.2f}, RR={pos_weight[1].item():.2f}")
 
     # Prepare input data
-    if classifier in ['ScatterNet', 'ScatterResNet', 'SmallDualSSN', 'DualSSN', 'DualSSN2']:
+    if classifier in ['ScatterNet', 'ScatterResNet', 'SmallDualSSN', 'DualSSN']:
         # Define cache paths (you can adjust these names as needed)
         train_cache_path = f"./.cache/train_scat_{galaxy_classes}_{fold}_{dataset_portions[0]}_{FILTERED}.npy"
         valid_cache_path = f"./.cache/valid_scat_{galaxy_classes}_{fold}_{dataset_portions[0]}_{FILTERED}.npy"
@@ -819,7 +817,7 @@ for fold, lr, reg in param_combinations:
     ###############################################
     
     # Right before defining models, add:
-    if classifier in ['ScatterNet', 'ScatterResNet', 'SmallDualSSN', 'DualSSN', 'DualSSN2']:
+    if classifier in ['ScatterNet', 'ScatterResNet', 'SmallDualSSN', 'DualSSN']:
         print(f"\n{'='*60}")
         print(f"SCATTERING DIMENSION DEBUG")
         print(f"{'='*60}")
@@ -836,34 +834,18 @@ for fold, lr, reg in param_combinations:
     
     if classifier == "Rustige":
         models = {"RustigeClassifier": {"model": RustigeClassifier(n_output_nodes=num_classes).to(DEVICE)}} 
-    elif classifier == "SCNN":
-        models = {"SCNN": {"model": SCNN(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)}}
-    elif classifier == "CSN":
-        models = {"CSN": {"model": CNNSqueezeNet(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)}}
     elif classifier == "DualCSN":
         models = {"DualCSN": {"model": DualCNNSqueezeNet(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)}}
-    elif classifier == "TinyCNN":
-        models = {"TinyCNN": {"model": TinyCNN(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)}} 
+    elif classifier == "CNN":
+        models = {"CNN": {"model": TinyCNN(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)}} 
     elif classifier == "ScatterNet":
-        #models = {"ScatterNet": {"model": MLPClassifier(input_dim=int(np.prod(scatdim)), num_classes=num_classes).to(DEVICE)}}
-        # scatdim should be a tuple like (173056, 32, 32) or similar
-        print(f"DEBUG: scatdim = {scatdim}")  # ADD: Debug print
-        input_dim = int(np.prod(scatdim))
-        print(f"DEBUG: Calculated input_dim = {input_dim}")  # ADD: Debug print
-        models = {"ScatterNet": {"model": MLPClassifier(
-            input_dim=input_dim, 
-            num_classes=num_classes
-        ).to(DEVICE)}}
+        models = {"ScatterNet": {"model": ScatterNet(input_dim=int(np.prod(scatdim)), num_classes=num_classes).to(DEVICE)}}
     elif classifier == "ScatterResNet":
         models = {"ScatterResNet": {"model": ScatterResNet(scat_shape=scatdim, num_classes=num_classes).to(DEVICE)}}
     elif classifier == "DualSSN":
         models = {"DualSSN": {"model": ScatterSqueezeNet(img_shape=tuple(valid_images.shape[1:]), scat_shape=scatdim, num_classes=num_classes).to(DEVICE)}}
     elif classifier == "SmallDualSSN":
         models = {"SmallDualSSN": {"model": TinyScatterSqueezeNet(img_shape=tuple(valid_images.shape[1:]), scat_shape=scatdim, num_classes=num_classes).to(DEVICE)}}
-    elif classifier == "DualSSN2":
-        models = {"DualSSN2": {"model": ScatterSqueezeNet2(img_shape=tuple(valid_images.shape[1:]), scat_shape=scatdim, num_classes=num_classes).to(DEVICE)}}
-    elif classifier == 'Binary':
-        models = {"BinaryClassifier": {"model": BinaryClassifier(input_shape=tuple(valid_images.shape[1:])).to(DEVICE)}}
     else:
         raise ValueError(f"Unknown classifier: {classifier}")
 
@@ -871,7 +853,7 @@ for fold, lr, reg in param_combinations:
         if FIRSTTIME:
             print(f"Summary for {classifier_name}:")
             if classifier == "ScatterNet":
-                summary(model_details["model"], input_size=(int(np.prod(scatdim)),), device=DEVICE)
+                summary(model_details["model"], input_size=scatdim, device=DEVICE)
             elif classifier == "ScatterResNet":
                 summary(model_details["model"], input_size=scatdim, device=DEVICE)
             elif classifier in ["DualSSN", "SmallDualSSN", "DualSSN2"]:
@@ -960,7 +942,7 @@ for fold, lr, reg in param_combinations:
                             
                             if classifier in ["ScatterNet", "ScatterResNet"]:
                                 logits = model(scat)
-                            elif classifier in ['DualSSN', 'SmallDualSSN', 'DualSSN2']:
+                            elif classifier in ['DualSSN', 'SmallDualSSN']:
                                 logits = model(images, scat)
                             else:
                                 logits = model(images)
@@ -975,7 +957,7 @@ for fold, lr, reg in param_combinations:
                             # Normal forward pass without MixUp
                             if classifier in ["ScatterNet", "ScatterResNet"]:
                                 logits = model(scat)
-                            elif classifier in ['DualSSN', 'SmallDualSSN', 'DualSSN2']:
+                            elif classifier in ['DualSSN', 'SmallDualSSN']:
                                 logits = model(images, scat)
                             else:
                                 logits = model(images)
@@ -1024,7 +1006,7 @@ for fold, lr, reg in param_combinations:
                             images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
                             if classifier in ["ScatterNet", "ScatterResNet"]:
                                 logits = model(scat)
-                            elif classifier in ['DualSSN', 'SmallDualSSN', 'DualSSN2']:
+                            elif classifier in ['DualSSN', 'SmallDualSSN']:
                                 logits = model(images, scat)
                             else:
                                 logits = model(images)
@@ -1069,7 +1051,7 @@ for fold, lr, reg in param_combinations:
                             
                             if classifier in ["ScatterNet", "ScatterResNet"]:
                                 logits = model(scat)
-                            elif classifier in ['DualSSN', 'SmallDualSSN', 'DualSSN2']:
+                            elif classifier in ['DualSSN', 'SmallDualSSN']:
                                 logits = model(images, scat)
                             else:
                                 logits = model(images)
@@ -1144,7 +1126,7 @@ for fold, lr, reg in param_combinations:
                         
                         if classifier in ["ScatterNet", "ScatterResNet"]:
                             logits = model(scat)
-                        elif classifier in ['DualSSN', 'SmallDualSSN', 'DualSSN2']:
+                        elif classifier in ['DualSSN', 'SmallDualSSN']:
                             logits = model(images, scat)
                         else:
                             logits = model(images)
@@ -1172,7 +1154,7 @@ for fold, lr, reg in param_combinations:
                         images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
                         if classifier in ["ScatterNet", "ScatterResNet"]:
                             logits = model(scat)
-                        elif classifier in ['DualSSN', 'SmallDualSSN', 'DualSSN2']:
+                        elif classifier in ['DualSSN', 'SmallDualSSN']:
                             logits = model(images, scat)
                         else:
                             logits = model(images)
@@ -1206,7 +1188,7 @@ for fold, lr, reg in param_combinations:
                         images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
                         if classifier in ["ScatterNet", "ScatterResNet"]:
                             logits = model(scat)
-                        elif classifier in ['DualSSN', 'SmallDualSSN', 'DualSSN2']:
+                        elif classifier in ['DualSSN', 'SmallDualSSN']:
                             logits = model(images, scat)
                         else:
                             logits = model(images)

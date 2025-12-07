@@ -32,58 +32,95 @@ class MLPClassifier_legacy(nn.Module):
         #return torch.softmax(x)
         return x # logits for BCE loss
 
-class MLPClassifier(nn.Module):
-    def __init__(self, input_dim, num_classes=2, hidden_dim=128):
+class ScatterNet(nn.Module):
+    """
+    CNN-based classifier for scattering coefficients.
+    Processes spatial structure in scattering features like TinyScatterSqueezeNet's scattering branch.
+    """
+    def __init__(self, input_dim, num_classes=2, hidden_dim=16, dropout_rate=0.5, J=2):
         """
-        Lightweight MLP for scattering coefficients.
-        Uses adaptive pooling to reduce spatial dimensions first.
-        
         Args:
-            input_dim: Expected flattened dimension (for validation) - NOT USED with adaptive pooling
+            input_dim: Not used (kept for compatibility)
             num_classes: Number of output classes
-            hidden_dim: Hidden layer size (default 128)
+            hidden_dim: Number of channels in conv layers
+            dropout_rate: Dropout probability
+            J: Scattering scale parameter (determines downsampling)
         """
-        super(MLPClassifier, self).__init__()
+        super(ScatterNet, self).__init__()
         
-        # Adaptive pooling to reduce spatial dimensions
-        # From [B, 169, 32, 32] -> [B, 169, 4, 4]
-        self.adaptive_pool = nn.AdaptiveAvgPool2d((4, 4))
+        # Scattering input is [B, 169, 32, 32]
+        C_scat = 169
         
-        # New input dimension after pooling: 169 * 4 * 4 = 2704
-        pooled_dim = 169 * 4 * 4
+        # Helper for conv blocks with dropout
+        def conv_block(in_ch, out_ch, k, s, p, dropout_p=0.2):
+            return nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, k, stride=s, padding=p, bias=True),
+                nn.BatchNorm2d(out_ch),
+                nn.LeakyReLU(0.2),
+                nn.Dropout2d(dropout_p)
+            )
         
-        # Smaller network appropriate for the task
-        self.fc1 = nn.Linear(pooled_dim, hidden_dim)
-        self.bn1 = nn.BatchNorm1d(hidden_dim)
-        self.dropout1 = nn.Dropout(0.4)
+        # Determine downsampling stages based on J (same as TinyScatterSqueezeNet)
+        if J == 4:
+            downsample_blocks = 1
+        elif J == 3:
+            downsample_blocks = 2
+        elif J == 2:
+            downsample_blocks = 3
+        elif J == 1:
+            downsample_blocks = 4
+        else:
+            downsample_blocks = 3  # Default for J=2
         
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim // 2)
-        self.bn2 = nn.BatchNorm1d(hidden_dim // 2)
-        self.dropout2 = nn.Dropout(0.3)
+        # Build scattering processing layers
+        scat_blocks = []
         
-        self.fc3 = nn.Linear(hidden_dim // 2, num_classes)
-        self.relu = nn.ReLU(inplace=True)
-
+        # Initial conv to reduce channels: 169 → hidden_dim
+        scat_blocks.append(conv_block(C_scat, hidden_dim, 3, 1, 1, dropout_p=0.2))
+        scat_blocks.append(SEBlock(hidden_dim))
+        
+        # Repeated downsampling with increasing dropout
+        for i in range(downsample_blocks):
+            dropout_p = 0.2 + i * 0.1
+            scat_blocks.append(conv_block(hidden_dim, hidden_dim, 3, 1, 1, dropout_p=dropout_p))
+            scat_blocks.append(SEBlock(hidden_dim))
+            scat_blocks.append(conv_block(hidden_dim, hidden_dim, 3, 2, 1, dropout_p=dropout_p))
+            scat_blocks.append(SEBlock(hidden_dim))
+        
+        self.scat_encoder = nn.Sequential(*scat_blocks)
+        
+        # Compute output size after conv layers
+        with torch.no_grad():
+            dummy_scat = torch.zeros(1, C_scat, 32, 32)
+            scat_f = self.scat_encoder(dummy_scat)
+            feature_dim = scat_f.view(1, -1).size(1)
+        
+        # Classifier head (matching TinyScatterSqueezeNet style)
+        self.fc1 = nn.Linear(feature_dim, hidden_dim * 2)
+        self.bn1 = nn.BatchNorm1d(hidden_dim * 2)
+        self.dropout1 = nn.Dropout(dropout_rate)
+        
+        self.fc2 = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.bn2 = nn.BatchNorm1d(hidden_dim)
+        self.dropout2 = nn.Dropout(dropout_rate)
+        
+        self.fc3 = nn.Linear(hidden_dim, num_classes)
+        self.act = nn.LeakyReLU(0.2)
+    
     def forward(self, x):
-        # Expected input: [B, C, H, W] e.g., [16, 169, 32, 32]
+        # Expected input: [B, 169, 32, 32]
         
-        # Apply adaptive pooling to reduce spatial dimensions
-        # [B, 169, 32, 32] -> [B, 169, 4, 4]
-        if x.dim() == 4:
-            x = self.adaptive_pool(x)
+        # Process scattering coefficients with spatial structure preserved
+        x = self.scat_encoder(x)
         
-        # Flatten: [B, 169, 4, 4] -> [B, 2704]
+        # Flatten
         x = x.view(x.size(0), -1)
         
-        # Forward through network
-        x = self.fc1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
+        # Classifier head
+        x = self.act(self.bn1(self.fc1(x)))
         x = self.dropout1(x)
         
-        x = self.fc2(x)
-        x = self.bn2(x)
-        x = self.relu(x)
+        x = self.act(self.bn2(self.fc2(x)))
         x = self.dropout2(x)
         
         x = self.fc3(x)
@@ -260,119 +297,82 @@ class BinaryClassifier_legacy(nn.Module):
         x = self.act6(self.fc1(x))
         logits = self.fc2(x)
         # logits = sigmoid(logits)
-        return logits
+        return logits    
+
+
+class TinyCNN(nn.Module): # 67%
+    """
+    Based on your Document 2 architecture that achieved 66% test accuracy.
     
+    Key changes from that version:
+    1. Keep the 16→32→32→48→48 channel progression (PROVEN to work)
+    2. Remove ALL SE blocks (they hurt performance on small datasets)
+    3. Add better regularization (progressive dropout, data augmentation)
+    4. Use LeakyReLU instead of ReLU
+    5. Add one more conv layer for better spatial reduction
     
-class TinyCNN(nn.Module):
-    """Fixed version - replaces 524k param FC layer with additional conv layers."""
+    Expected: 70-75% test accuracy
+    """
     def __init__(self, input_shape, num_classes=2):
         super(TinyCNN, self).__init__()
         
+        in_channels = input_shape[0]
+        
         self.features = nn.Sequential(
-            # Block 1: 128→64
-            nn.Conv2d(1, 16, kernel_size=5, stride=2, padding=2),
+            # Block 1: 128→64, 16 channels
+            nn.Conv2d(in_channels, 16, kernel_size=5, stride=2, padding=2, bias=True),
             nn.BatchNorm2d(16),
-            nn.ReLU(),
-            nn.Dropout2d(0.2),
+            nn.LeakyReLU(0.2),  # Changed from ReLU
+            nn.Dropout2d(0.15),  # Reduced from 0.2
             
-            # Block 2: 64→32
-            nn.Conv2d(16, 32, kernel_size=5, stride=2, padding=2),
+            # Block 2: 64→32, 32 channels
+            nn.Conv2d(16, 32, kernel_size=5, stride=2, padding=2, bias=True),
             nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.Dropout2d(0.3),
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.20),  # Progressive increase
             
-            # Block 3: 32→16
-            nn.Conv2d(32, 32, kernel_size=5, stride=2, padding=2),
+            # Block 3: 32→16, 32 channels (keep same size - refinement)
+            nn.Conv2d(32, 32, kernel_size=5, stride=2, padding=2, bias=True),
             nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.Dropout2d(0.4),
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.25),
             
-            # ADD: Block 4: 16→8 (critical addition!)
-            nn.Conv2d(32, 48, kernel_size=3, stride=2, padding=1),
+            # Block 4: 16→8, 48 channels
+            nn.Conv2d(32, 48, kernel_size=3, stride=2, padding=1, bias=True),
             nn.BatchNorm2d(48),
-            nn.ReLU(),
-            nn.Dropout2d(0.5),
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.30),
             
-            # ADD: Block 5: 8→4 (even more reduction!)
-            nn.Conv2d(48, 48, kernel_size=3, stride=2, padding=1),
+            # Block 5: 8→4, 48 channels
+            nn.Conv2d(48, 48, kernel_size=3, stride=2, padding=1, bias=True),
             nn.BatchNorm2d(48),
-            nn.ReLU(),
-            nn.Dropout2d(0.5),
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.35),
             
-            # Global Average Pooling instead of flatten
+            # NEW Block 6: 4→2, 64 channels (extra spatial reduction)
+            nn.Conv2d(48, 64, kernel_size=3, stride=2, padding=1, bias=True),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.40),
+            
+            # Global Average Pooling
             nn.AdaptiveAvgPool2d(1)
         )
         
-        # Tiny classifier
+        # Classifier with extra regularization
         self.classifier = nn.Sequential(
             nn.Flatten(),
             nn.Dropout(0.5),
-            nn.Linear(48, num_classes)  # 48→2 instead of 8192→64!
+            nn.Linear(64, 32),  # Add hidden layer
+            nn.BatchNorm1d(32),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.5),
+            nn.Linear(32, num_classes)
         )
     
     def forward(self, x):
         x = self.features(x)
         return self.classifier(x)
-    
-    
-
-class SCNN(nn.Module):
-    def __init__(self, input_shape, num_classes=4):
-        super(SCNN, self).__init__()
-        
-        # Parse (channels, height, width) from input_shape
-        in_channels = input_shape[0]
-        height = input_shape[1]
-        width = input_shape[2]
-
-        # Convolutional block 1
-        self.conv1 = nn.Conv2d(
-            in_channels=in_channels, 
-            out_channels=8, 
-            kernel_size=3, 
-            stride=2, 
-            padding=1
-        )
-        self.ln1  = nn.LayerNorm([8, height // 2, width // 2])
-        self.act1 = nn.LeakyReLU()
-        
-        # Convolutional block 2
-        self.conv2 = nn.Conv2d(8, 16, kernel_size=3, stride=2, padding=1)
-        self.ln2  = nn.LayerNorm([16, height // 4, width // 4])
-        self.act2 = nn.LeakyReLU()
-        
-        # Convolutional block 3
-        self.conv3 = nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1)
-        self.ln3  = nn.LayerNorm([32, height // 8, width // 8])
-        self.act3 = nn.LeakyReLU()
-        
-        # Convolutional block 4
-        self.conv4 = nn.Conv2d(32, 16, kernel_size=3, stride=2, padding=1)
-        self.ln4  = nn.LayerNorm([16, height // 16, width // 16])
-        self.act4 = nn.LeakyReLU()
-        
-        # Convolutional block 5
-        self.conv5 = nn.Conv2d(16, 16, kernel_size=2, stride=2)
-        self.ln5  = nn.LayerNorm([16, height // 32, width // 32])
-        self.act5 = nn.LeakyReLU()
-        
-        # Fully connected layers
-        # For (1, 128, 128) input, final size is (16, 4, 4) => 16 * 4 * 4 = 256
-        self.fc1   = nn.Linear(16 * (height // 32) * (width // 32), 100)
-        self.act6  = nn.LeakyReLU()
-        self.num_classes = num_classes
-        self.fc2 = nn.Linear(100, num_classes)
-
-    def forward(self, x):
-        x = self.act1(self.ln1(self.conv1(x)))
-        x = self.act2(self.ln2(self.conv2(x)))
-        x = self.act3(self.ln3(self.conv3(x)))
-        x = self.act4(self.ln4(self.conv4(x)))
-        x = self.act5(self.ln5(self.conv5(x)))
-        x = x.view(x.size(0), -1)
-        x = self.act6(self.fc1(x))
-        logits = self.fc2(x)
-        return torch.softmax(logits, dim=1)
 
 
 ##########################################################
@@ -456,6 +456,26 @@ class ScatterResNet(nn.Module):
 ## Dual Input Squeeze-and-Excitation Network Classifiers ###
 ############################################################
 
+
+class SEBlock_try(nn.Module):
+    """Squeeze-and-Excitation block - channel attention mechanism."""
+    def __init__(self, channels, reduction=8):
+        super(SEBlock_try, self).__init__()
+        # Make sure we don't reduce below 1 channel
+        reduced_channels = max(1, channels // reduction)
+        
+        self.squeeze = nn.AdaptiveAvgPool2d(1)
+        self.excitation = nn.Sequential(
+            nn.Conv2d(channels, reduced_channels, kernel_size=1, bias=True),
+            nn.ReLU(),
+            nn.Conv2d(reduced_channels, channels, kernel_size=1, bias=True),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x):
+        scale = self.squeeze(x)
+        scale = self.excitation(scale)
+        return x * scale
 
 class SEBlock(nn.Module):
     """
@@ -601,7 +621,7 @@ class ScatterSqueezeNet(nn.Module): #DualSSN
         return self.FC_classifier(x)  # Return logits directly for multi-class classification
     
 
-class TinyScatterSqueezeNet(nn.Module): # DualSSN
+class TinyScatterSqueezeNet(nn.Module): # DualSSN 79%
     def __init__(self, img_shape, scat_shape, num_classes,
                  hidden_dim1=32, hidden_dim2=16, classifier_hidden_dim=32,
                  dropout_rate=0.5, J=2):  # Increase default dropout to 0.5
@@ -858,6 +878,21 @@ class ScatterSqueezeNet2(nn.Module):
         return self.FC_classifier(x)  # Return logits directly for multi-class classification
     
 
+class InceptionBlock(nn.Module):
+    def __init__(self, in_ch):
+        super().__init__()
+        self.b1 = nn.Conv2d(in_ch, 16, kernel_size=1, padding=0, bias=False)
+        self.b2 = nn.Conv2d(in_ch, 16, kernel_size=3, padding=1, bias=False)
+        self.b3 = nn.Conv2d(in_ch, 16, kernel_size=5, padding=2, bias=False)
+        self.bn = nn.BatchNorm2d(48)
+        self.act = nn.LeakyReLU(0.2)
+    def forward(self, x):
+        x1 = self.b1(x)
+        x2 = self.b2(x)
+        x3 = self.b3(x)
+        return self.act(self.bn(torch.cat([x1, x2, x3], dim=1)))
+
+
 class DualCNNSqueezeNet_legacy(nn.Module):
     """
     Two-branch CNN classifier with SE attention in each branch,
@@ -940,7 +975,8 @@ class DualCNNSqueezeNet_legacy(nn.Module):
         return self.classifier(x)
 
 
-class DualCNNSqueezeNet(nn.Module):
+
+class DualCNNSqueezeNet_66(nn.Module): #66% accuracy
     """
     Dual-branch CNN directly analogous to TinyScatterSqueezeNet.
     
@@ -954,7 +990,7 @@ class DualCNNSqueezeNet(nn.Module):
     - MLP classifier head with BatchNorm (not just Linear layers)
     """
     def __init__(self, input_shape, num_classes=2, hidden_dim1=32, classifier_hidden_dim=32):
-        super(DualCNNSqueezeNet, self).__init__()
+        super(DualCNNSqueezeNet_66, self).__init__()
         
         in_channels, H, W = input_shape
         
@@ -1089,6 +1125,151 @@ class DualCNNSqueezeNet(nn.Module):
         x = torch.cat([x_img, x_detail], dim=1)
         
         # MLP classifier head (exactly like DualSSN)
+        x = self.act(self.bn1(self.FC_input(x)))
+        x = self.dropout1(x)
+        x = self.act(self.bn2(self.FC_hidden(x)))
+        x = self.dropout2(x)
+        
+        return self.FC_classifier(x)
+
+#DualCSN
+class DualCNNSqueezeNet(nn.Module):
+    """
+    Dual-branch CNN with complementary feature extraction.
+    
+    Changes from original:
+    - Increased dropout throughout (0.5 in classifier)
+    - Balanced channel capacity (32 in both branches)
+    - Stronger regularization via dropout
+    - Added batch normalization momentum adjustment
+    """
+    def __init__(self, input_shape, num_classes=2, hidden_dim1=32, classifier_hidden_dim=32):
+        super(DualCNNSqueezeNet, self).__init__()
+        
+        in_channels, H, W = input_shape
+        
+        # CHANGE 1: Match DualSSN's aggressive dropout strategy
+        # ==========================================
+        # Branch 1: Image Encoder (large receptive field)
+        # ==========================================
+        self.img_encoder = nn.Sequential(
+            nn.Conv2d(in_channels, 8, kernel_size=5, stride=1, padding=2, bias=True),
+            nn.BatchNorm2d(8, momentum=0.1),  # CHANGE: Added explicit momentum
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.3),  # CHANGE: Increased from 0.2
+            
+            nn.Conv2d(8, 16, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(16, momentum=0.1),
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.3),  # CHANGE: Increased from 0.2
+            
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            
+            nn.Conv2d(16, 32, kernel_size=5, stride=1, padding=2, bias=True),
+            nn.BatchNorm2d(32, momentum=0.1),
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.4)   # CHANGE: Increased from 0.3
+        )
+        
+        # Compression with stronger regularization
+        self.img_to_latent = nn.Sequential(
+            nn.Conv2d(32, 32, kernel_size=3, stride=2, padding=1, bias=True),
+            nn.BatchNorm2d(32, momentum=0.1),
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.4),  # CHANGE: Increased from 0.3
+            
+            nn.Conv2d(32, 32, kernel_size=3, stride=2, padding=1, bias=True),
+            nn.BatchNorm2d(32, momentum=0.1),
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.4),  # CHANGE: Increased from 0.3
+            
+            nn.Conv2d(32, 32, kernel_size=3, stride=2, padding=1, bias=True),
+            nn.BatchNorm2d(32, momentum=0.1),
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.4),  # CHANGE: Increased from 0.3
+            
+            nn.Conv2d(32, 32, kernel_size=3, stride=2, padding=1, bias=True),
+            nn.BatchNorm2d(32, momentum=0.1),
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.5)   # CHANGE: Increased from 0.4
+        )
+        
+        # ==========================================
+        # CHANGE 2: Increase detail branch capacity to 32 channels
+        # Branch 2: Detail Encoder (small receptive field with SE attention)
+        # ==========================================
+        def conv_block(in_ch, out_ch, k, s, p, dropout_p=0.3):  # CHANGE: Default dropout 0.3
+            return nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, k, stride=s, padding=p, bias=True),
+                nn.BatchNorm2d(out_ch, momentum=0.1),  # CHANGE: Added momentum
+                nn.LeakyReLU(0.2),
+                nn.Dropout2d(dropout_p)
+            )
+        
+        # CHANGE 3: Increase hidden_dim2 from 16 to 32 for balanced capacity
+        hidden_dim2 = 32  # CHANGE: Was 16, now matches img branch
+        detail_blocks = []
+        
+        # Initial conv + SE
+        detail_blocks.append(conv_block(in_channels, hidden_dim2, 3, 1, 1, dropout_p=0.3))
+        detail_blocks.append(SEBlock(hidden_dim2))
+        
+        # Three downsampling stages with increased dropout
+        for i in range(3):
+            dropout_p = 0.3 + i * 0.1  # CHANGE: Start at 0.3 instead of 0.2
+            # Non-strided conv + SE
+            detail_blocks.append(conv_block(hidden_dim2, hidden_dim2, 3, 1, 1, dropout_p=dropout_p))
+            detail_blocks.append(SEBlock(hidden_dim2))
+            # Strided conv + SE (downsampling)
+            detail_blocks.append(conv_block(hidden_dim2, hidden_dim2, 3, 2, 1, dropout_p=dropout_p))
+            detail_blocks.append(SEBlock(hidden_dim2))
+        
+        self.detail_to_latent = nn.Sequential(*detail_blocks)
+        
+        # Compute combined feature dimensions
+        with torch.no_grad():
+            dummy_input = torch.zeros(1, in_channels, H, W)
+            
+            img_f = self.img_encoder(dummy_input)
+            img_f = self.img_to_latent(img_f)
+            img_dim = img_f.view(1, -1).size(1)
+            
+            detail_f = self.detail_to_latent(dummy_input)
+            detail_dim = detail_f.view(1, -1).size(1)
+            
+            combined_dim = img_dim + detail_dim
+        
+        # ==========================================
+        # CHANGE 4: Match DualSSN's classifier dropout exactly
+        # Classifier Head
+        # ==========================================
+        self.FC_input = nn.Linear(combined_dim, hidden_dim1)
+        self.bn1 = nn.BatchNorm1d(hidden_dim1, momentum=0.1)  # CHANGE: Added momentum
+        self.dropout1 = nn.Dropout(0.5)  # CHANGE: Already 0.5, keep it
+        
+        self.FC_hidden = nn.Linear(hidden_dim1, classifier_hidden_dim)
+        self.bn2 = nn.BatchNorm1d(classifier_hidden_dim, momentum=0.1)  # CHANGE: Added momentum
+        self.dropout2 = nn.Dropout(0.5)  # CHANGE: Already 0.5, keep it
+        
+        self.FC_classifier = nn.Linear(classifier_hidden_dim, num_classes)
+        self.act = nn.LeakyReLU(0.2)
+    
+    def forward(self, x):
+        # Branch 1: Image encoding path (large receptive field)
+        x_img = self.img_encoder(x)
+        x_img = self.img_to_latent(x_img)
+        
+        # Branch 2: Detail encoding path (small receptive field + attention)
+        x_detail = self.detail_to_latent(x)
+        
+        # Flatten both branches
+        x_img = x_img.view(x_img.size(0), -1)
+        x_detail = x_detail.view(x_detail.size(0), -1)
+        
+        # Concatenate features
+        x = torch.cat([x_img, x_detail], dim=1)
+        
+        # MLP classifier head
         x = self.act(self.bn1(self.FC_input(x)))
         x = self.dropout1(x)
         x = self.act(self.bn2(self.FC_hidden(x)))

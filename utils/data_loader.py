@@ -767,19 +767,6 @@ def redistribute_excess(train_images, eval_images, train_labels, eval_labels,
         final_train_fnames, new_eval_fnames
     )
 
-# Using systematic transformations instead of random choices in augmentation
-def apply_transforms_with_config(image, config):
-    preprocess = transforms.Compose([
-        transforms.Lambda(lambda x: transforms.functional.hflip(x) if config['flip_h'] else x),  # Horizontal flip
-        transforms.Lambda(lambda x: transforms.functional.vflip(x) if config['flip_v'] else x),  # Vertical flip
-        transforms.Lambda(lambda x: transforms.functional.rotate(x, config['rotation']))  # Rotation by specific angle
-    ])
-    
-    if image.dim() == 2:  # Ensure image is 3D
-        image = image.unsqueeze(0)
-    transformed_image = preprocess(image) 
-    return transformed_image
-
 def apply_formatting(image: torch.Tensor,
                      crop_size: tuple = (1, 128, 128),
                      downsample_size: tuple = (1, 128, 128)
@@ -845,9 +832,22 @@ def img_hash(img: torch.Tensor) -> str:
     arr = img.cpu().contiguous().numpy()
     returnval = hashlib.sha1(arr.tobytes()).hexdigest()
     return returnval
+
+# Using systematic transformations instead of random choices in augmentation
+def apply_transforms_with_config(image, config):
+    preprocess = transforms.Compose([
+        transforms.Lambda(lambda x: transforms.functional.hflip(x) if config['flip_h'] else x),  # Horizontal flip
+        transforms.Lambda(lambda x: transforms.functional.vflip(x) if config['flip_v'] else x),  # Vertical flip
+        transforms.Lambda(lambda x: transforms.functional.rotate(x, config['rotation']))  # Rotation by specific angle
+    ])
+    
+    if image.dim() == 2:  # Ensure image is 3D
+        image = image.unsqueeze(0)
+    transformed_image = preprocess(image) 
+    return transformed_image
         
 def augment_images(
-    images, labels, rotations = [0, 90, 180, 270],    #rotations = np.arange(0, 360, 20).tolist(),
+    images, labels,  rotations = list(range(0, 360, 30)),   # 12 rotations instead of 4
     flips = [(False, False), (True, False)], mem_threshold=1000,
     #translations = [(10, 0), (-10, 0), (0, 10), (0, -10)], #[(5, 0), (-5, 0), (0, 5), (0, -5)],
     translations = [(0, 0)], 
@@ -1866,7 +1866,7 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
                 if not (galaxy_classes[0] == 52 and galaxy_classes[1] == 53):
                     eval_data  = [row for row in eval_data  for _ in range(n_aug)]
         if PRINTFILENAMES:
-            n_aug = 8  # default is 4*2 = 8
+            n_aug = 24  # default is 4*2 = 8
             train_filenames = [fname for fname in train_filenames for _ in range(n_aug)]
             if not (galaxy_classes[0] == 52 and galaxy_classes[1] == 53): 
                 eval_filenames  = [fname for fname in eval_filenames  for _ in range(n_aug)]
