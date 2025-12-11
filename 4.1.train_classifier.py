@@ -1,8 +1,6 @@
-import os, re, time, random, pickle, hashlib, itertools, torch
+import os, time, random, pickle, hashlib, itertools, torch
 from utils.data_loader import load_galaxies, get_classes
-from utils.classifiers import (
-    RustigeClassifier, TinyCNN, ScatterNet, ScatterResNet, 
-    ScatterSqueezeNet, TinyScatterSqueezeNet, DualCNNSqueezeNet)
+from utils.classifiers import CNN, ScatterNet, DualCNNSqueezeNet, DualScatterSqueezeNet
 from utils.training_tools import EarlyStopping, reset_weights
 from utils.calc_tools import cluster_metrics, normalise_images, check_tensor, fold_T_axis, compute_scattering_coeffs, custom_collate
 from utils.plotting import plot_histograms, plot_images_by_class, plot_image_grid, plot_background_histogram
@@ -13,8 +11,8 @@ from torch.utils.data import TensorDataset, DataLoader, Subset
 from torchsummary import summary
 from kymatio.torch import Scattering2D
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-import pandas as pd
 from tqdm import tqdm
+from math import log10, floor
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -38,26 +36,23 @@ print("Running script 4.1 with dl1 Latest version with seed", SEED)
 ###############################################
 galaxy_classes    = [50, 51]
 max_num_galaxies  = 1000000  # Upper limit for the all-classes combined training data before classical augmentation
-dataset_portions  = [1]
+dataset_portions  = [1] 
 J, L, order       = 2, 12, 2
 num_epochs_cuda = 200
 num_epochs_cpu = 100
-learning_rates = [6e-5]
-regularization_params = [1e-1]  
+lr = 6e-5 # Learning rate
+reg = 1e-1 # Weight decay (L2 regularization)
 label_smoothing = 0.1
-num_experiments = 5
+num_experiments = 3
 folds = [0] # 0-9 for 10-fold cross validation, 10 for only one training
 percentile_lo = 30 # Percentile stretch lower bound
 percentile_hi = 99  # Percentile stretch upper bound
 versions = 'RAW' # any mix of loadable and runtime-tapered planes. 'rt50' or 'rt100' for tapering. Square brackets for stacking
-
 classifier = ["CNN",         # 0.Very Simple CNN
-              "Rustige",     # 1.Simple CNN from Rustige et al. 2023, https://github.com/floriangriese/wGAN-supported-augmentation/blob/main/src/Classifiers/SimpleClassifiers/Classifiers.py
+              "ScatterNet",  # 1.Scattering coefficients as input to MLP
               "DualCSN",     # 2.Dual input CNN with scattering coefficients as one input branch and Squeeze-and-Excitation blocks
-              "ScatterNet",  # 3.Scattering coefficients as input to MLP
-              "DualSSN",     # 4.Dual input CNN with scattering coefficients as one input branch and Squeeze-and-Excitation blocks
-              "SmallDualSSN",# 5.Smaller Dual input CNN with scattering coefficients as one input branch and Squeeze-and-Excitation blocks
-              "ScatterResNet"][0]
+              "DualSSN"      # 3.Dual input CNN with scattering coefficients as one input branch and Squeeze-and-Excitation blocks
+              ][3]
 
 PREFER_PROCESSED = True
 STRETCH = True  # Arcsinh stretch
@@ -76,7 +71,8 @@ USE_CLASS_WEIGHTS = True  # Set to False to disable class weights
 ES, patience = True, 50  # Use early stopping
 SCHEDULER = True  # Use a learning rate scheduler
 SHOWIMGS = False  # Show some generated images for each class (Tool for control)
-
+DEBUG = True  # Perform data overlap checks
+USE_CACHE = True  # Use cached images, scattering coefficients, and metrics where available
 
 ########################################################################
 ##################### AUTOMATIC CONFIGURATION ##########################
@@ -86,6 +82,8 @@ os.makedirs('./classifier/trained_models', exist_ok=True)
 os.makedirs('./classifier/trained_models_filtered', exist_ok=True)
 os.makedirs('./classifier/figures', exist_ok=True)
 os.makedirs('./classifier/logfiles', exist_ok=True)
+os.makedirs('./classifier/4.1.runs', exist_ok=True)
+os.makedirs('./.cache/scattering_coefficients', exist_ok=True)
  
 if torch.cuda.is_available():
     DEVICE = "cuda"
@@ -143,27 +141,37 @@ scattering = Scattering2D(J=J, L=L, shape=img_shape[-2:], max_order=order)
 # Evaluation
 #-------------------------------------------------------------
 
-def check_overfitting_indicators(metrics, history, base, num_experiments):
-    """Print comprehensive overfitting diagnostics."""
-        
+def check_overfitting(metrics, history, classifier_name, dataset_sizes, folds, lr, reg, label_smoothing, crop_size, downsample_size, percentile_lo, percentile_hi, ver_key):
+    """ Same as check_overfitting_indicators but includes all folds and parameter combinations """
     print("\n" + "="*60)
-    print("OVERFITTING DIAGNOSTICS")
+    print("COMPREHENSIVE OVERFITTING DIAGNOSTICS ACROSS ALL EXPERIMENTS")
     print("="*60)
     
-    # 1. Accuracy levels
-    print(f"📊 Train Accuracy: {np.mean(metrics[f'{base}_train_acc']):.4f} ± {np.std(metrics[f'{base}_train_acc']):.4f}")
-    print(f"📊 Validation Accuracy: {np.mean(metrics[f'{base}_val_acc']):.4f} ± {np.std(metrics[f'{base}_val_acc']):.4f}")
-    print(f"📊 Test Accuracy: {np.mean(metrics[f'{base}_accuracy']):.4f} ± {np.std(metrics[f'{base}_accuracy']):.4f}")
+    # Calculate the average and std for everything combined
+    all_train_acc = []
+    all_val_acc = []
+    all_test_acc = []    
+    for fold in folds:
+        base = f"cl{classifier_name}_ss{dataset_sizes.get(fold, 'all')}_f{fold}_lr{lr}_reg{reg}_ls{label_smoothing}_cs{crop_size[-2]}x{crop_size[-1]}_ds{downsample_size[-2]}x{downsample_size[-1]}_pl{percentile_lo}_ph{percentile_hi}_ver{ver_key}"
+        all_train_acc.extend(metrics.get(f"{base}_train_acc", []))
+        all_val_acc.extend(metrics.get(f"{base}_val_acc", []))
+        all_test_acc.extend(metrics.get(f"{base}_accuracy", []))
+    print(f"📊 Overall Train Accuracy: {np.mean(all_train_acc):.4f} ± {np.std(all_train_acc):.4f}")
+    print(f"📊 Overall Validation Accuracy: {np.mean(all_val_acc):.4f} ± {np.std(all_val_acc):.4f}")
+    print(f"📊 Overall Test Accuracy: {np.mean(all_test_acc):.4f} ± {np.std(all_test_acc):.4f}")
     
-    # 2. Check if early stopping triggered
-    for experiment in range(num_experiments):
-        loss_key = f"{base}_{experiment}_train_loss"
-        if loss_key in history:
-            epochs_trained = len(history[loss_key])
-            print(f"📈 Epochs trained for experiment {experiment}: {epochs_trained-patience}/{num_epochs}")
-    
+    # Check if early stopping triggered for each experiment
+    for fold in folds:
+        base = f"cl{classifier_name}_ss{dataset_sizes.get(fold, 'all')}_f{fold}_lr{lr}_reg{reg}_ls{label_smoothing}_cs{crop_size[-2]}x{crop_size[-1]}_ds{downsample_size[-2]}x{downsample_size[-1]}_pl{percentile_lo}_ph{percentile_hi}_ver{ver_key}"
+        for experiment in range(num_experiments):
+            loss_key = f"{base}_{experiment}_train_loss"
+            if loss_key in history:
+                epochs_trained = len(history[loss_key])
+                print(f"📈 Epochs trained for {base} experiment {experiment}: {epochs_trained-patience}/{num_epochs}")
+                    
     print("="*60 + "\n")
     
+
 def compute_classification_metrics(y_true, y_pred, multilabel, num_classes):
     acc = accuracy_score(y_true, y_pred)
     if multilabel:
@@ -293,6 +301,25 @@ def _desc(name, x):
 # Data processing helpers
 # -------------------------------------------------------------
 
+def config_already_exists(classifier, galaxy_classes, lr, reg, percentile_lo, percentile_hi, 
+                          cs, ds, ver_key, fold, subset_size, experiment):
+    """
+    Check if a configuration has already been trained and saved.
+    
+    Returns:
+        bool: True if the PKL file exists, False otherwise
+    """
+    metrics_path = f'./classifier/4.1.runs/{classifier}_{galaxy_classes}_lr{lr}_reg{reg}_lo{percentile_lo}_hi{percentile_hi}_cs{cs}_ds{ds}_ver{ver_key}_f{fold}_ss{round_to_1(subset_size)}_e{experiment}_metrics_data.pkl'
+
+    
+    exists = os.path.exists(metrics_path)
+    if exists:
+        print(f"✓ Configuration already exists: fold={fold}, subset_size={subset_size}, experiment={experiment}")
+    return exists
+
+def round_to_1(x):
+   return round(x, -int(floor(log10(abs(x)))))
+
 def mixup_data(x1, x2, y, alpha=0.4):
     """
     Apply MixUp augmentation: create convex combinations of pairs of examples.
@@ -307,7 +334,7 @@ def mixup_data(x1, x2, y, alpha=0.4):
         Mixed inputs and targets
     """
     if alpha > 0:
-        lam = np.random.beta(alpha, alpha)
+        lam = np.random.beta(alpha, alpha) # Sample lambda from Beta distribution because 
     else:
         lam = 1
 
@@ -475,6 +502,8 @@ _out  = _loader(galaxy_classes=galaxy_classes,
             GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
             PRINTFILENAMES=PRINTFILENAMES,
             PREFER_PROCESSED=PREFER_PROCESSED,
+            USE_CACHE=USE_CACHE,
+            DEBUG=DEBUG,
             train=False)  # Obtain the test set
 
 if len(_out) == 4:
@@ -498,34 +527,43 @@ print("Labels of the test set after relabelling:", torch.unique(test_labels, ret
 ################# NORMALISE AND PACKAGE TEST DATA ############################
 ##############################################################################
 
-if classifier in ['Rustige', 'CSN', 'SmallDualSSN', 'Binary']:
+if classifier in ['CNN', 'DualCSN', 'DualSSN']: # When images are used
     test_images = _as_5d(test_images).to(DEVICE)
 
-# Prepare input data
-if classifier in ['ScatterNet', 'ScatterResNet', 'SmallDualSSN']:
-    # Define cache paths (you can adjust these names as needed)
-    test_cache_path = f"./.cache/test_scat_{galaxy_classes}_{dataset_portions[0]}_{FILTERED}.npy"
+if classifier in ['ScatterNet', 'DualSSN']: # When scattering is used
 
     # fold T into C on both real & scattering inputs
     test_images = fold_T_axis(test_images) # Merges the image version into the channel dimension
     mock_test = torch.zeros_like(test_images)
-    test_cache = f"./.cache/test_scat_{galaxy_classes}_{dataset_portions[0]}_{FILTERED}.pt"
-    test_scat_coeffs = compute_scattering_coeffs(test_images, scattering, batch_size=128, device="cpu")
+    
+    # Define cache paths
+    test_cache = f"./.cache/scattering_coefficients/test_scat_{galaxy_classes}_{FILTERED}.pt"
 
+    # Load or compute test scattering coefficients
+    if os.path.exists(test_cache) and USE_CACHE:
+        print(f"✓ Loading test scattering coefficients from cache: {test_cache}")
+        test_scat_coeffs = torch.load(test_cache)
+    else:
+        test_scat_coeffs = compute_scattering_coeffs(test_images, scattering, batch_size=128, device="cpu")
+        os.makedirs(os.path.dirname(test_cache), exist_ok=True)
+        torch.save(test_scat_coeffs, test_cache)
+        
     if test_scat_coeffs.dim() == 5:
         # [B, C_in, C_scat, H, W] → [B, C_in*C_scat, H, W]
-        print("Shape of test_scat_coeffs before flattening: ", test_scat_coeffs.shape)
         test_scat_coeffs = test_scat_coeffs.flatten(start_dim=1, end_dim=2)
-        print("Shape of test_scat_coeffs after flattening: ", test_scat_coeffs.shape)
 
     if NORMALISESCS or NORMALISESCSTOPM:
         # Now we need to normalise the scattering coefficients globally, and thus compute the scattering coeffs for all data
-        trainval_cache_path = f"./.cache/trainval_scat_{galaxy_classes}_{dataset_portions[0]}_{FILTERED}.npy"
         trainval_images = fold_T_axis(train_val_images)
-        trainval_cache = f"./.cache/trainval_scat_{galaxy_classes}_{dataset_portions[0]}_{FILTERED}.pt"
-        trainval_scat_coeffs = compute_scattering_coeffs(trainval_images, scattering, batch_size=128, device="cpu")
+        trainval_cache = f"./.cache/scattering_coefficients/trainval_scat_{galaxy_classes}_{FILTERED}.pt"
+        if os.path.exists(trainval_cache) and USE_CACHE:
+            print(f"✓ Loading trainval scattering coefficients from cache: {trainval_cache}")
+            trainval_scat_coeffs = torch.load(trainval_cache)
+        else:
+            trainval_scat_coeffs = compute_scattering_coeffs(trainval_images, scattering, batch_size=128, device="cpu")
+            os.makedirs(os.path.dirname(trainval_cache), exist_ok=True)
+            torch.save(trainval_scat_coeffs, trainval_cache)
         if trainval_scat_coeffs.dim() == 5:
-            # [B, C_in, C_scat, H, W] → [B, C_in*C_scat, H, W]
             trainval_scat_coeffs = trainval_scat_coeffs.flatten(start_dim=1, end_dim=2)
         all_scat = torch.cat([trainval_scat_coeffs, test_scat_coeffs], dim=0)
         if NORMALISESCSTOPM:
@@ -533,9 +571,9 @@ if classifier in ['ScatterNet', 'ScatterResNet', 'SmallDualSSN']:
         else:
             all_scat = normalise_images(all_scat, 0, 1)
         trainval_scat_coeffs, test_scat_coeffs = all_scat[:len(trainval_scat_coeffs)], all_scat[len(trainval_scat_coeffs):]
-    if classifier in ['ScatterNet', 'ScatterResNet']:
+    if classifier in ['ScatterNet']:
         test_dataset = TensorDataset(mock_test, test_scat_coeffs, test_labels)
-    else: # if classifier in ['DualSSN', 'DualSSN2']:
+    else: # if classifier == 'DualSSN':
         test_dataset = TensorDataset(test_images, test_scat_coeffs, test_labels)
 else:
     if test_images.dim() == 5:
@@ -552,8 +590,7 @@ test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num
 ###############################################            
 
 FIRSTTIME = True  # Set to True to print model summaries only once
-param_combinations = list(itertools.product(folds, learning_rates, regularization_params))
-for fold, lr, reg in param_combinations:
+for fold in folds:
     torch.cuda.empty_cache()
     runname = f"{galaxy_classes}_lr{lr}_reg{reg}_lo{percentile_lo}_hi{percentile_hi}_cs{cs}_ds{ds}_ver{ver_key}_f{fold}"
 
@@ -561,10 +598,25 @@ for fold, lr, reg in param_combinations:
     f"J={J}, L={L}, crop={crop_size}, down={downsample_size}, ver={versions}, "
     f"lo={percentile_lo}, hi={percentile_hi}, classifier={classifier}, "
     f"global_norm={USE_GLOBAL_NORMALISATION}, norm_mode={GLOBAL_NORM_MODE}, "
-    f"PREFER_PROCESSED={PREFER_PROCESSED} ◀\n")
+    f"PREFER_PROCESSED={PREFER_PROCESSED} ◀")
 
-    log_path = f"./classifier/logfiles/log_{runname}.txt"
+    log_path = f"./classifier/logfiles/log_{classifier}_{runname}.txt"
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    
+    if USE_CACHE:
+        fold_subset_sizes = [round_to_1(max(2, int(len(train_val_images) * p))) for p in dataset_portions]
+        all_configs_exist = all(
+            config_already_exists(classifier, galaxy_classes, lr, reg, percentile_lo, percentile_hi, 
+                                cs, ds, ver_key, fold, ss, exp)
+            for ss in fold_subset_sizes
+            for exp in range(num_experiments)
+        )
+        
+        if all_configs_exist:
+            print(f"⏭️  Skipping fold {fold} - all configurations already trained")
+            dataset_sizes[fold] = fold_subset_sizes
+            continue
+    
     _out = _loader(
             galaxy_classes=galaxy_classes,
             versions=versions, 
@@ -584,6 +636,8 @@ for fold, lr, reg in param_combinations:
             GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
             PRINTFILENAMES=PRINTFILENAMES,
             PREFER_PROCESSED=PREFER_PROCESSED,
+            USE_CACHE=USE_CACHE,
+            DEBUG=DEBUG,
             train=True) # Obtain the train and validation set. Not test set
     
     if len(_out) == 4:
@@ -607,65 +661,52 @@ for fold, lr, reg in param_combinations:
     train_labels, valid_labels = relabel(train_labels), relabel(valid_labels)       
 
     # ——— Data sanity checks ———
-    
-    # after loading train_images, test_images:
-    train_hashes = {img_hash(img) for img in train_images}
-    valid_hashes = {img_hash(img) for img in valid_images}
-    test_hashes  = {img_hash(img) for img in test_images}
+    if DEBUG:
+        # after loading train_images, test_images:
+        train_hashes = {img_hash(img) for img in train_images}
+        valid_hashes = {img_hash(img) for img in valid_images}
+        test_hashes  = {img_hash(img) for img in test_images}
 
-    train_val_common, train_test_common, val_test_common = train_hashes & valid_hashes, train_hashes & test_hashes, valid_hashes & test_hashes
-    assert not train_val_common, f"Overlap detected: {len(train_val_common)} images appear in both train and validation!"
-    assert not train_test_common, f"Overlap detected: {len(train_test_common)} images appear in both train and test validation!"
-    assert not val_test_common, f"Overlap detected: {len(val_test_common)} images appear in both validation and test validation!"
-    
-    for i, cls in enumerate(galaxy_classes):
-        if MULTILABEL:
-            train_mask = train_labels[:, i] > 0.5
-            valid_mask = valid_labels[:, i] > 0.5
-            test_mask  = test_labels[:,  i] > 0.5
-        else:
-            train_mask = as_index_labels(train_labels) == i
-            valid_mask = as_index_labels(valid_labels) == i
-            test_mask  = as_index_labels(test_labels)  == i
+        train_val_common, train_test_common, val_test_common = train_hashes & valid_hashes, train_hashes & test_hashes, valid_hashes & test_hashes
+        assert not train_val_common, f"Overlap detected: {len(train_val_common)} images appear in both train and validation!"
+        assert not train_test_common, f"Overlap detected: {len(train_test_common)} images appear in both train and test validation!"
+        assert not val_test_common, f"Overlap detected: {len(val_test_common)} images appear in both validation and test validation!"
+        
+        for i, cls in enumerate(galaxy_classes):
+            if MULTILABEL:
+                train_mask = train_labels[:, i] > 0.5
+                valid_mask = valid_labels[:, i] > 0.5
+                test_mask  = test_labels[:,  i] > 0.5
+            else:
+                train_mask = as_index_labels(train_labels) == i
+                valid_mask = as_index_labels(valid_labels) == i
+                test_mask  = as_index_labels(test_labels)  == i
 
-        check_tensor(f"Train images for class {cls} (idx={i})", train_images[train_mask])
-        check_tensor(f"Valid images for class {cls} (idx={i})", valid_images[valid_mask])
-        check_tensor(f"Test images for class {cls} (idx={i})",  test_images[test_mask])
+            check_tensor(f"Train images for class {cls} (idx={i})", train_images[train_mask])
+            check_tensor(f"Valid images for class {cls} (idx={i})", valid_images[valid_mask])
+            check_tensor(f"Test images for class {cls} (idx={i})",  test_images[test_mask])
 
-    _desc("TRAIN", train_images)
-    _desc("VALID", valid_images)
-    _desc("TEST", test_images)
+        _desc("TRAIN", train_images)
+        _desc("VALID", valid_images)
+        _desc("TEST", test_images)
 
-    print("First 10 training labels after relabelling:", train_labels[:10], "Label distribution:", torch.unique(train_labels, return_counts=True))         
-    print("First 10 validation labels after relabelling:", valid_labels[:10], "Label distribution:", torch.unique(valid_labels, return_counts=True))
-    print("First 10 test labels after relabelling:", test_labels[:10], "Label distribution:", torch.unique(test_labels, return_counts=True))
+        print("First 10 training labels after relabelling:", train_labels[:10], "Label distribution:", torch.unique(train_labels, return_counts=True))         
+        print("First 10 validation labels after relabelling:", valid_labels[:10], "Label distribution:", torch.unique(valid_labels, return_counts=True))
+        print("First 10 test labels after relabelling:", test_labels[:10], "Label distribution:", torch.unique(test_labels, return_counts=True))
     # ————————————————————————
 
-    if dataset_sizes == {}:
-        dataset_sizes[fold] = [max(2, int(len(train_images) * p)) for p in dataset_portions]
-        print(f"Dataset sizes for fold {fold}: {dataset_sizes[fold]}")
-
+    dataset_sizes[fold] = [max(2, int(len(train_images) * p)) for p in dataset_portions]
+    
+    
     ##########################################################
     ############ NORMALISE AND PACKAGE THE INPUT #############
     ##########################################################
 
-    if classifier in ['Rustige', 'CSN', 'SmallDualSSN', 'DualSSN']:
+    if classifier in ['CNN', 'DualCSN', 'DualSSN']:
         train_images = _as_5d(train_images).to(DEVICE)
         valid_images = _as_5d(valid_images).to(DEVICE)
-    
-    if MULTILABEL:
-        # labels are 2-hot; compute per-label pos_weight for BCE
-        pos_counts = train_labels.sum(dim=0)                       # [2]
-        neg_counts = train_labels.shape[0] - pos_counts            # [2]
-        pos_counts = torch.clamp(pos_counts, min=1.0)
-        pos_weight = (neg_counts / pos_counts).to(DEVICE)          # [2]
-        print(f"[pos_weight] RH={pos_weight[0].item():.2f}, RR={pos_weight[1].item():.2f}")
 
-    # Prepare input data
-    if classifier in ['ScatterNet', 'ScatterResNet', 'SmallDualSSN', 'DualSSN']:
-        # Define cache paths (you can adjust these names as needed)
-        train_cache_path = f"./.cache/train_scat_{galaxy_classes}_{fold}_{dataset_portions[0]}_{FILTERED}.npy"
-        valid_cache_path = f"./.cache/valid_scat_{galaxy_classes}_{fold}_{dataset_portions[0]}_{FILTERED}.npy"
+    if classifier in ['ScatterNet', 'DualSSN']:
     
         # fold T into C on both real & scattering inputs
         train_images = fold_T_axis(train_images) # Merges the image version into the channel dimension
@@ -673,17 +714,36 @@ for fold, lr, reg in param_combinations:
         mock_train = torch.zeros_like(train_images)
         mock_valid = torch.zeros_like(valid_images)
 
-        train_cache = f"./.cache/train_scat_{galaxy_classes}_{fold}_{dataset_portions[0]}_{FILTERED}.pt"
-        valid_cache = f"./.cache/valid_scat_{galaxy_classes}_{fold}_{dataset_portions[0]}_{FILTERED}.pt"
-        train_scat_coeffs = compute_scattering_coeffs(train_images, scattering, batch_size=128, device="cpu")
-        valid_scat_coeffs = compute_scattering_coeffs(valid_images, scattering, batch_size=128, device="cpu")
+        # Define cache paths
+        train_cache = f"./.cache/scattering_coefficients/train_scat_{galaxy_classes}_{fold}_{FILTERED}.pt"
+        valid_cache = f"./.cache/scattering_coefficients/valid_scat_{galaxy_classes}_{fold}_{FILTERED}.pt"
+
+        # Load or compute train scattering coefficients
+        if os.path.exists(train_cache) and USE_CACHE:
+            print(f"✓ Loading train scattering coefficients from cache: {train_cache}")
+            train_scat_coeffs = torch.load(train_cache)
+        else:
+            # Take time to compute scattering coefficients
+            start_time = time.time()
+            train_scat_coeffs = compute_scattering_coeffs(train_images, scattering, batch_size=128, device="cpu")
+            end_time = time.time()
+            print(f"Time taken to compute train scattering coefficients: {end_time - start_time:.2f} seconds")
+            os.makedirs(os.path.dirname(train_cache), exist_ok=True)
+            torch.save(train_scat_coeffs, train_cache)
+
+        # Load or compute validation scattering coefficients
+        if os.path.exists(valid_cache) and USE_CACHE:
+            print(f"✓ Loading valid scattering coefficients from cache: {valid_cache}")
+            valid_scat_coeffs = torch.load(valid_cache)
+        else:
+            valid_scat_coeffs = compute_scattering_coeffs(valid_images, scattering, batch_size=128, device="cpu")
+            os.makedirs(os.path.dirname(valid_cache), exist_ok=True)
+            torch.save(valid_scat_coeffs, valid_cache)
 
         if train_scat_coeffs.dim() == 5:
             # [B, C_in, C_scat, H, W] → [B, C_in*C_scat, H, W]
-            print("Shape of train_scat_coeffs before flattening: ", train_scat_coeffs.shape)
             train_scat_coeffs = train_scat_coeffs.flatten(start_dim=1, end_dim=2)
             valid_scat_coeffs = valid_scat_coeffs.flatten(start_dim=1, end_dim=2)
-            print("Shape of train_scat_coeffs after flattening: ", train_scat_coeffs.shape)
 
         all_scat = torch.cat([train_scat_coeffs, valid_scat_coeffs], dim=0)
         if NORMALISESCS or NORMALISESCSTOPM:
@@ -695,10 +755,12 @@ for fold, lr, reg in param_combinations:
 
         scatdim = train_scat_coeffs.shape[1:]   # tuple(C, H, W)
 
-        if classifier in ['ScatterNet', 'ScatterResNet']:
+        if classifier in ['ScatterNet']:
             train_dataset = TensorDataset(mock_train, train_scat_coeffs, train_labels)
             valid_dataset = TensorDataset(mock_valid, valid_scat_coeffs, valid_labels)
-        else: # if classifier in ['DualSSN', 'DualSSN2']:
+        else: # if classifier == 'DualSSN':
+            print("Shape of train images:", train_images.shape)
+            print("Shape of train scattering coefficients:", train_scat_coeffs.shape)
             train_dataset = TensorDataset(train_images, train_scat_coeffs, train_labels)
             valid_dataset = TensorDataset(valid_images, valid_scat_coeffs, valid_labels)
     else:
@@ -815,50 +877,26 @@ for fold, lr, reg in param_combinations:
     ###############################################
     ############# DEFINE MODEL ####################
     ###############################################
-    
-    # Right before defining models, add:
-    if classifier in ['ScatterNet', 'ScatterResNet', 'SmallDualSSN', 'DualSSN']:
-        print(f"\n{'='*60}")
-        print(f"SCATTERING DIMENSION DEBUG")
-        print(f"{'='*60}")
-        print(f"train_scat_coeffs.shape = {train_scat_coeffs.shape}")
-        print(f"scatdim (from shape[1:]) = {scatdim}")
-        print(f"np.prod(scatdim) = {int(np.prod(scatdim))}")
-        
-        # Verify with actual batch
-        sample_batch = next(iter(train_loader))
-        _, scat_sample, _ = sample_batch
-        print(f"Actual batch scat shape = {scat_sample.shape}")
-        print(f"Flattened size = {scat_sample.view(scat_sample.size(0), -1).shape[1]}")
-        print(f"{'='*60}\n")
-    
-    if classifier == "Rustige":
-        models = {"RustigeClassifier": {"model": RustigeClassifier(n_output_nodes=num_classes).to(DEVICE)}} 
-    elif classifier == "DualCSN":
-        models = {"DualCSN": {"model": DualCNNSqueezeNet(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)}}
-    elif classifier == "CNN":
-        models = {"CNN": {"model": TinyCNN(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)}} 
+     
+    if classifier == "CNN":
+        models = {"CNN": {"model": CNN(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)}} 
     elif classifier == "ScatterNet":
         models = {"ScatterNet": {"model": ScatterNet(input_dim=int(np.prod(scatdim)), num_classes=num_classes).to(DEVICE)}}
-    elif classifier == "ScatterResNet":
-        models = {"ScatterResNet": {"model": ScatterResNet(scat_shape=scatdim, num_classes=num_classes).to(DEVICE)}}
+    elif classifier == "DualCSN":
+        models = {"DualCSN": {"model": DualCNNSqueezeNet(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)}}
     elif classifier == "DualSSN":
-        models = {"DualSSN": {"model": ScatterSqueezeNet(img_shape=tuple(valid_images.shape[1:]), scat_shape=scatdim, num_classes=num_classes).to(DEVICE)}}
-    elif classifier == "SmallDualSSN":
-        models = {"SmallDualSSN": {"model": TinyScatterSqueezeNet(img_shape=tuple(valid_images.shape[1:]), scat_shape=scatdim, num_classes=num_classes).to(DEVICE)}}
+        models = {"DualSSN": {"model": DualScatterSqueezeNet(img_shape=tuple(valid_images.shape[1:]), scat_shape=scatdim, num_classes=num_classes).to(DEVICE)}}
     else:
         raise ValueError(f"Unknown classifier: {classifier}")
 
     for classifier_name, model_details in models.items():
         if FIRSTTIME:
             print(f"Summary for {classifier_name}:")
-            if classifier == "ScatterNet":
+            if classifier == 'ScatterNet': # Only scattering input
                 summary(model_details["model"], input_size=scatdim, device=DEVICE)
-            elif classifier == "ScatterResNet":
-                summary(model_details["model"], input_size=scatdim, device=DEVICE)
-            elif classifier in ["DualSSN", "SmallDualSSN", "DualSSN2"]:
+            elif classifier == "DualSSN": # Both image and scattering input
                 summary(model_details["model"], input_size=[valid_images.shape[1:], scatdim])
-            else:
+            else: # Only image input
                 summary(model_details["model"], input_size=tuple(valid_images.shape[1:]), device=DEVICE)
         FIRSTTIME = False
         
@@ -867,19 +905,20 @@ for fold, lr, reg in param_combinations:
     ############### TRAINING LOOP #################
     ###############################################
     
-    if USE_CLASS_WEIGHTS:
-        unique, counts = np.unique(train_labels.cpu().numpy(), return_counts=True)
-        total_count = sum(counts)
-        class_weights = {i: total_count / count for i, count in zip(unique, counts)}
-        weights = torch.tensor([class_weights.get(i, 1.0) for i in range(num_classes)],
-                            dtype=torch.float, device=DEVICE)
-    else:
-        weights = None
-    
     if MULTILABEL:
+        # labels are 2-hot; compute per-label pos_weight for BCE
+        pos_counts = train_labels.sum(dim=0)                       # [2]
+        neg_counts = train_labels.shape[0] - pos_counts            # [2]
+        pos_counts = torch.clamp(pos_counts, min=1.0)
+        pos_weight = (neg_counts / pos_counts).to(DEVICE)          # [2]
         criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     else:
-        if weights is not None:
+        if USE_CLASS_WEIGHTS:
+            unique, counts = np.unique(train_labels.cpu().numpy(), return_counts=True)
+            total_count = sum(counts)
+            class_weights = {i: total_count / count for i, count in zip(unique, counts)}
+            weights = torch.tensor([class_weights.get(i, 1.0) for i in range(num_classes)],
+                                dtype=torch.float, device=DEVICE)
             print("Using class weighting:", weights)
             criterion = nn.CrossEntropyLoss(weight=weights, label_smoothing=label_smoothing)
         else:
@@ -895,13 +934,29 @@ for fold, lr, reg in param_combinations:
             if subset_size <= 0:
                 print(f"Skipping invalid subset size: {subset_size}")
                 continue
+            
+            all_experiments_cached = all(
+                config_already_exists(classifier_name,galaxy_classes, lr, reg, percentile_lo, percentile_hi,
+                                    cs, ds, ver_key, fold, subset_size, exp)
+                for exp in range(num_experiments)
+            )
+            if USE_CACHE and all_experiments_cached:
+                print(f"⏭️  Skipping subset_size {subset_size} - all experiments already cached")
+                continue
+            
+            all_logits = []
             if fold not in training_times:
                 training_times[fold] = {}
             if subset_size not in training_times[fold]:
                 training_times[fold][subset_size] = []
 
             for experiment in range(num_experiments):
-                base = f"cl{classifier_name}_ss{subset_size}_f{fold}_lr{lr}_reg{reg}_ls{label_smoothing}_cs{cs}_ds{ds}_pl{percentile_lo}_ph{percentile_hi}_ver{ver_key}"
+                
+                if USE_CACHE and config_already_exists(classifier_name, galaxy_classes, lr, reg, percentile_lo, percentile_hi, cs, ds, ver_key, fold, subset_size, experiment):
+                    print(f"⏭️  Skipping: fold={fold}, subset_size={subset_size}, experiment={experiment} - configuration already trained")
+                    continue
+                
+                base = f"cl{classifier_name}_ss{round_to_1(subset_size)}_f{fold}_lr{lr}_reg{reg}_ls{label_smoothing}_cs{cs}_ds{ds}_pl{percentile_lo}_ph{percentile_hi}_ver{ver_key}"
                 initialise_history(history, base, experiment)
                 initialise_metrics(metrics, base)
                 initialise_labels(base, all_true_labels, all_pred_labels)
@@ -929,20 +984,21 @@ for fold, lr, reg in param_combinations:
                     model.train()
                     train_total_loss = 0
                     train_total_images = 0
-                    train_correct = 0  # Add this to track training accuracy per epoch
+                    if DEBUG:
+                        train_correct = 0  # Add this to track training accuracy per epoch
 
                     for images, scat, _rest in subset_train_loader:
                         labels = _rest
                         images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
                         optimizer.zero_grad()
-                        
+                                                
                         # ADD MixUp here:
                         if np.random.rand() > 0.5 and MIXUP:  # Apply MixUp 50% of the time
                             images, scat, labels_a, labels_b, lam = mixup_data(images, scat, labels, alpha=0.4)
                             
-                            if classifier in ["ScatterNet", "ScatterResNet"]:
+                            if classifier == 'ScatterNet':
                                 logits = model(scat)
-                            elif classifier in ['DualSSN', 'SmallDualSSN']:
+                            elif classifier == 'DualSSN':
                                 logits = model(images, scat)
                             else:
                                 logits = model(images)
@@ -955,9 +1011,9 @@ for fold, lr, reg in param_combinations:
                             loss = mixup_criterion(criterion, logits, labels_a, labels_b, lam)
                         else:
                             # Normal forward pass without MixUp
-                            if classifier in ["ScatterNet", "ScatterResNet"]:
+                            if classifier == 'ScatterNet':
                                 logits = model(scat)
-                            elif classifier in ['DualSSN', 'SmallDualSSN']:
+                            elif classifier == 'DualSSN':
                                 logits = model(images, scat)
                             else:
                                 logits = model(images)
@@ -975,22 +1031,25 @@ for fold, lr, reg in param_combinations:
                         train_total_images += float(images.size(0))
                         
                         # Track training accuracy during training
-                        with torch.no_grad():
-                            if MULTILABEL:
-                                preds = (torch.sigmoid(logits) >= THRESHOLD).cpu().numpy()
-                                trues = labels.cpu().numpy()
-                                train_correct += (preds == trues).all(axis=1).sum()
-                            else:
-                                preds = logits.argmax(dim=1)
-                                train_correct += (preds == labels).sum().item()
+                        if DEBUG:
+                            with torch.no_grad():
+                                if MULTILABEL:
+                                    preds = (torch.sigmoid(logits) >= THRESHOLD).cpu().numpy()
+                                    trues = labels.cpu().numpy()
+                                    train_correct += (preds == trues).all(axis=1).sum()
+                                else:
+                                    preds = logits.argmax(dim=1)
+                                    train_correct += (preds == labels).sum().item()
+                                    
+                    if DEBUG:
+                        train_epoch_acc = train_correct / train_total_images if train_total_images > 0 else 0.0
+                        train_acc_key = f"{base}_{experiment}_train_acc"
+                        history[train_acc_key].append(train_epoch_acc)  # Store per-epoch train accuracy
 
                     # Calculate epoch training metrics
                     train_average_loss = train_total_loss / train_total_images
-                    train_epoch_acc = train_correct / train_total_images if train_total_images > 0 else 0.0
                     train_loss_key = f"{base}_{experiment}_train_loss"
-                    train_acc_key = f"{base}_{experiment}_train_acc"
                     history[train_loss_key].append(train_average_loss)
-                    history[train_acc_key].append(train_epoch_acc)  # Store per-epoch train accuracy
 
 
                     model.eval()
@@ -1004,9 +1063,9 @@ for fold, lr, reg in param_combinations:
                                 continue
                             labels = _rest
                             images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
-                            if classifier in ["ScatterNet", "ScatterResNet"]:
+                            if classifier == 'ScatterNet':
                                 logits = model(scat)
-                            elif classifier in ['DualSSN', 'SmallDualSSN']:
+                            elif classifier == 'DualSSN':
                                 logits = model(images, scat)
                             else:
                                 logits = model(images)
@@ -1023,80 +1082,83 @@ for fold, lr, reg in param_combinations:
                             val_total_images += float(images.size(0))
 
                             # Track validation accuracy per epoch
-                            if MULTILABEL:
-                                preds = (torch.sigmoid(logits) >= THRESHOLD).cpu().numpy()
-                                trues = labels.cpu().numpy()
-                                val_correct += (preds == trues).all(axis=1).sum()
-                            else:
-                                preds = logits.argmax(dim=1)
-                                val_correct += (preds == labels).sum().item()
+                            if DEBUG:
+                                if MULTILABEL:
+                                    preds = (torch.sigmoid(logits) >= THRESHOLD).cpu().numpy()
+                                    trues = labels.cpu().numpy()
+                                    val_correct += (preds == trues).all(axis=1).sum()
+                                else:
+                                    preds = logits.argmax(dim=1)
+                                    val_correct += (preds == labels).sum().item()
+                        
+                    if DEBUG:
+                        val_epoch_acc = val_correct / val_total_images if val_total_images > 0 else 0.0
+                        val_acc_key = f"{base}_{experiment}_val_acc"
+                        history[val_acc_key].append(val_epoch_acc)  # Store per-epoch val accuracy
 
                     val_average_loss = val_total_loss / val_total_images if val_total_images > 0 else float('inf')
-                    val_epoch_acc = val_correct / val_total_images if val_total_images > 0 else 0.0
                     val_loss_key = f"{base}_{experiment}_val_loss"
-                    val_acc_key = f"{base}_{experiment}_val_acc"
                     history[val_loss_key].append(val_average_loss)
-                    history[val_acc_key].append(val_epoch_acc)  # Store per-epoch val accuracy
                     
                     # ADD TEST EVALUATION DURING TRAINING
-                    test_total_loss = 0
-                    test_total_images = 0
-                    test_correct = 0
-                    with torch.inference_mode():
-                        for i, (images, scat, _rest) in enumerate(test_loader): 
-                            if images is None or len(images) == 0:
-                                continue
-                            labels = _rest
-                            images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
-                            
-                            if classifier in ["ScatterNet", "ScatterResNet"]:
-                                logits = model(scat)
-                            elif classifier in ['DualSSN', 'SmallDualSSN']:
-                                logits = model(images, scat)
-                            else:
-                                logits = model(images)
+                    if DEBUG:
+                        test_total_loss = 0
+                        test_total_images = 0
+                        with torch.inference_mode():
+                            for i, (images, scat, _rest) in enumerate(test_loader): 
+                                if images is None or len(images) == 0:
+                                    continue
+                                labels = _rest
+                                images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
+                                
+                                if classifier == 'ScatterNet':
+                                    logits = model(scat)
+                                elif classifier == 'DualSSN':
+                                    logits = model(images, scat)
+                                else:
+                                    logits = model(images)
 
-                            logits = collapse_logits(logits, num_classes, MULTILABEL)
-                            labels = labels.float() if MULTILABEL else labels.long()
-                            
-                            loss = criterion(logits, labels)
-                            batch_size = images.size(0)
-                            
-                            test_total_loss += float(loss.item() * batch_size)
-                            
-                            if MULTILABEL:
-                                preds = (torch.sigmoid(logits) >= THRESHOLD).cpu().numpy()
-                                trues = labels.cpu().numpy()
-                                test_correct += (preds == trues).all(axis=1).sum()
-                            else:
-                                preds = logits.argmax(dim=1)
-                                test_correct += (preds == labels).sum().item()
-                            
-                            test_total_images += batch_size
+                                logits = collapse_logits(logits, num_classes, MULTILABEL)
+                                labels = labels.float() if MULTILABEL else labels.long()
+                                
+                                loss = criterion(logits, labels)
+                                batch_size = images.size(0)
+                                
+                                test_total_loss += float(loss.item() * batch_size)
+                                
+                                if MULTILABEL:
+                                    preds = (torch.sigmoid(logits) >= THRESHOLD).cpu().numpy()
+                                    trues = labels.cpu().numpy()
+                                    test_correct += (preds == trues).all(axis=1).sum()
+                                else:
+                                    preds = logits.argmax(dim=1)
+                                    test_correct += (preds == labels).sum().item()
+                                
+                                test_total_images += batch_size
 
-                    test_average_loss = test_total_loss / test_total_images if test_total_images > 0 else float('inf')
-                    test_epoch_acc = test_correct / test_total_images if test_total_images > 0 else 0.0
-                    test_loss_key = f"{base}_{experiment}_test_loss"
-                    test_acc_key = f"{base}_{experiment}_test_acc"
-                    history[test_loss_key].append(test_average_loss)
-                    history[test_acc_key].append(test_epoch_acc)
+                        test_average_loss = test_total_loss / test_total_images if test_total_images > 0 else float('inf')
+                        test_epoch_acc = test_correct / test_total_images if test_total_images > 0 else 0.0
+                        test_loss_key = f"{base}_{experiment}_test_loss"
+                        test_acc_key = f"{base}_{experiment}_test_acc"
+                        history[test_loss_key].append(test_average_loss)
+                        history[test_acc_key].append(test_epoch_acc)
                     
-                    # Update print statement to include test metrics
-                    print(f"Epoch [{epoch+1}/{num_epochs}] - "
-                        f"Train Loss: {train_average_loss:.4f}, Train Acc: {train_epoch_acc:.4f} - "
-                        f"Val Loss: {val_average_loss:.4f}, Val Acc: {val_epoch_acc:.4f} - "
-                        f"Test Loss: {test_average_loss:.4f}, Test Acc: {test_epoch_acc:.4f}")
+                        # Update print statement to include test metrics
+                        print(f"Epoch [{epoch+1}/{num_epochs}] - "
+                                f"Train Loss: {train_average_loss:.4f}, Train Acc: {train_epoch_acc:.4f} - "
+                                f"Val Loss: {val_average_loss:.4f}, Val Acc: {val_epoch_acc:.4f} - "
+                                f"Test Loss: {test_average_loss:.4f}, Test Acc: {test_epoch_acc:.4f}")                        
                     
-                    # Stop if overfitting is detected
-                    train_val_gap = train_epoch_acc - val_epoch_acc
-                    train_test_gap = train_epoch_acc - test_epoch_acc
+                        # Stop if overfitting is detected
+                        train_val_gap = train_epoch_acc - val_epoch_acc
+                        train_test_gap = train_epoch_acc - test_epoch_acc
 
-                    # Stop if overfitting becomes severe
-                    if train_epoch_acc > 0.95 and (train_val_gap > 0.25 or train_test_gap > 0.25):  # 25% gap threshold
-                        print(f"⚠️  Severe overfitting detected at epoch {epoch+1}")
-                        print(f"   Train-Val gap: {train_val_gap:.4f}, Train-Test gap: {train_test_gap:.4f}")
-                        print(f"   Stopping early to prevent further overfitting")
-                        break
+                        # Stop if overfitting becomes severe
+                        if train_epoch_acc > 0.95 and (train_val_gap > 0.25 or train_test_gap > 0.25):  # 25% gap threshold
+                            print(f"⚠️  Severe overfitting detected at epoch {epoch+1}")
+                            print(f"   Train-Val gap: {train_val_gap:.4f}, Train-Test gap: {train_test_gap:.4f}")
+                            print(f"   Stopping early to prevent further overfitting")
+                            break
                     
                     if ES:
                         early_stopping(val_average_loss, model, f'./classifier/trained_models/{base}_best_model.pth')
@@ -1114,7 +1176,8 @@ for fold, lr, reg in param_combinations:
                     else:
                         print(f"No checkpoint found at {checkpoint_path}, using current model state")
                     
-                plot_training_history(history, base, experiment, save_dir='./classifier/test')
+                if DEBUG:
+                    plot_training_history(history, base, experiment, save_dir='./classifier/test')
 
                 model.eval()                  
                 with torch.inference_mode():
@@ -1124,9 +1187,9 @@ for fold, lr, reg in param_combinations:
                         labels = _rest
                         images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
                         
-                        if classifier in ["ScatterNet", "ScatterResNet"]:
+                        if classifier == 'ScatterNet':
                             logits = model(scat)
-                        elif classifier in ['DualSSN', 'SmallDualSSN']:
+                        elif classifier == 'DualSSN':
                             logits = model(images, scat)
                         else:
                             logits = model(images)
@@ -1152,9 +1215,9 @@ for fold, lr, reg in param_combinations:
                     for images, scat, _rest in valid_loader: # Evaluate on validation data 
                         labels = _rest
                         images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
-                        if classifier in ["ScatterNet", "ScatterResNet"]:
+                        if classifier == 'ScatterNet':
                             logits = model(scat)
-                        elif classifier in ['DualSSN', 'SmallDualSSN']:
+                        elif classifier == 'DualSSN':
                             logits = model(images, scat)
                         else:
                             logits = model(images)
@@ -1171,7 +1234,8 @@ for fold, lr, reg in param_combinations:
                         val_total += images.size(0)
                 
                 final_val_acc = val_correct / val_total if val_total > 0 else 0.0
-                print(f"Final validation accuracy for experiment {experiment}: {final_val_acc:.4f}")
+                if DEBUG:
+                    print(f"Final validation accuracy for experiment {experiment}: {final_val_acc:.4f}")
                 metrics.setdefault(f'{base}_val_acc', []).append(final_val_acc)
                     
                 with torch.inference_mode(): 
@@ -1181,14 +1245,13 @@ for fold, lr, reg in param_combinations:
                     mis_images = []
                     mis_trues  = []
                     mis_preds  = []
-                    all_logits = []
                     
                     for images, scat, _rest in test_loader: # Evaluate on test data
                         labels = _rest
                         images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
-                        if classifier in ["ScatterNet", "ScatterResNet"]:
+                        if classifier == 'ScatterNet':
                             logits = model(scat)
-                        elif classifier in ['DualSSN', 'SmallDualSSN']:
+                        elif classifier == 'DualSSN':
                             logits = model(images, scat)
                         else:
                             logits = model(images)
@@ -1248,7 +1311,6 @@ for fold, lr, reg in param_combinations:
                             # pick the first channel if there are two, else drop the singleton channel
                             img = img_tensor[0] if img_tensor.shape[0] > 1 else img_tensor.squeeze(0)
                             ax.imshow(img.numpy(), cmap='viridis')
-                            #ax.set_title(f"T={mis_trues[i]}, P={mis_preds[i]}")
                             # Instead of seeing T=0, P=1. I want to see the actual class names (T=DE, P+NDE)
                             if MULTILABEL:
                                 true_labels = [str(min(galaxy_classes) + idx) for idx, val in enumerate(mis_trues[i]) if val == 1]
@@ -1266,11 +1328,6 @@ for fold, lr, reg in param_combinations:
                         fig.savefig(out_path, dpi=150, bbox_inches='tight')
                         plt.close(fig)
 
-            mean_acc = float(np.mean(metrics[f"{base}_accuracy"])) if metrics[f"{base}_accuracy"] else float('nan')
-            mean_prec = float(np.mean(metrics[f"{base}_precision"])) if metrics[f"{base}_precision"] else float('nan')
-            mean_rec = float(np.mean(metrics[f"{base}_recall"])) if metrics[f"{base}_recall"] else float('nan')
-            mean_f1 = float(np.mean(metrics[f"{base}_f1_score"])) if metrics[f"{base}_f1_score"] else float('nan')
-            print(f"AVERAGE over {num_experiments} experiments — Accuracy: {mean_acc:.4f}, Precision: {mean_prec:.4f}, Recall: {mean_rec:.4f}, F1 Score: {mean_f1:.4f}")
             end_time = time.time()
             elapsed_time = end_time - start_time
             training_times.setdefault(fold, {}).setdefault(subset_size, []).append(elapsed_time)
@@ -1279,113 +1336,78 @@ for fold, lr, reg in param_combinations:
                 with open(log_path, 'a') as file:
                     file.write(f"Time taken to train the model on fold {fold}: {elapsed_time:.2f} seconds \n")
 
-        model_save_path = f'./classifier/trained_models/{base}_model.pth'
-        torch.save(model.state_dict(), model_save_path)
-        
-        check_overfitting_indicators(metrics, history, base, num_experiments)
-
-        all_logits = np.concatenate(all_logits, axis=0)
-        cluster_error, cluster_distance, cluster_std_dev = cluster_metrics(all_logits, n_clusters=num_classes)
-        with open(log_path, 'a') as file:
-            file.write(f"Results for fold {fold}, Classifier {classifier_name}, lr={lr}, reg={reg}, percentile_lo={percentile_lo}, percentile_hi={percentile_hi}, crop_size={crop_size}, downsample_size={downsample_size}, STRETCH={STRETCH}, FILTERED={FILTERED} \n")
-            file.write(f"Cluster Error: {cluster_error} \n")
-            file.write(f"Cluster Distance: {cluster_distance} \n")
-            file.write(f"Cluster Standard Deviation: {cluster_std_dev} \n")
-
-        model_save_path = f'./classifier/trained_models/{base}_model.pth'
-        torch.save(model.state_dict(), model_save_path)
-        
-# Create aggregate plot showing all experiments
-if num_experiments > 1:
-    plot_dir = './classifier/test'
-    if not os.path.exists(plot_dir):
-        os.makedirs(plot_dir, exist_ok=True)
-        print(f"Created directory: {plot_dir}")
-    
-    print("Creating aggregate plots for all experiments...")
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))  # Changed to 2x3 grid
-    
-    for experiment in range(num_experiments):
-        train_loss_key = f"{base}_{experiment}_train_loss"
-        val_loss_key = f"{base}_{experiment}_val_loss"
-        test_loss_key = f"{base}_{experiment}_test_loss"
-        train_acc_key = f"{base}_{experiment}_train_acc"
-        val_acc_key = f"{base}_{experiment}_val_acc"
-        test_acc_key = f"{base}_{experiment}_test_acc"
-        
-        if train_loss_key in history and val_loss_key in history:
-            epochs = range(1, len(history[train_loss_key]) + 1)
+            # Save model and compute cluster metrics if we trained something
+            if all_logits:
+                model_save_path = f'./classifier/trained_models/{base}_model.pth'
+                torch.save(model.state_dict(), model_save_path)
+                
+                all_logits_concat = np.concatenate(all_logits, axis=0)
+                cluster_error, cluster_distance, cluster_std_dev = cluster_metrics(all_logits_concat, n_clusters=num_classes)
+                
+                # Write to log file (keep this)
+                with open(log_path, 'a') as file:
+                    file.write(f"Results for fold {fold}, Classifier {classifier_name}, lr={lr}, reg={reg}, percentile_lo={percentile_lo}, percentile_hi={percentile_hi}, crop_size={crop_size}, downsample_size={downsample_size}, STRETCH={STRETCH}, FILTERED={FILTERED} \n")
+                    file.write(f"Cluster Error: {cluster_error} \n")
+                    file.write(f"Cluster Distance: {cluster_distance} \n")
+                    file.write(f"Cluster Standard Deviation: {cluster_std_dev} \n")
+            else:
+                print(f"⏭️  No new experiments trained for fold {fold}, subset_size {subset_size} - skipping model save and cluster metrics")
             
-            # Plot losses
-            axes[0, 0].plot(epochs, history[train_loss_key], alpha=0.6, label=f'Exp {experiment}')
-            axes[0, 1].plot(epochs, history[val_loss_key], alpha=0.6, label=f'Exp {experiment}')
-            if test_loss_key in history:
-                axes[0, 2].plot(epochs[:len(history[test_loss_key])], history[test_loss_key], 
-                               alpha=0.6, label=f'Exp {experiment}')
             
-            # Plot accuracies
-            if train_acc_key in history and val_acc_key in history:
-                axes[1, 0].plot(epochs[:len(history[train_acc_key])], history[train_acc_key], 
-                               alpha=0.6, label=f'Exp {experiment}')
-                axes[1, 1].plot(epochs[:len(history[val_acc_key])], history[val_acc_key], 
-                               alpha=0.6, label=f'Exp {experiment}')
-                if test_acc_key in history:
-                    axes[1, 2].plot(epochs[:len(history[test_acc_key])], history[test_acc_key], 
-                                   alpha=0.6, label=f'Exp {experiment}')
-    
-    # Configure subplots
-    axes[0, 0].set_title('Training Loss (All Experiments)')
-    axes[0, 0].set_xlabel('Epoch')
-    axes[0, 0].set_ylabel('Loss')
-    axes[0, 0].legend(fontsize=8)
-    axes[0, 0].grid(True, alpha=0.3)
-    
-    axes[0, 1].set_title('Validation Loss (All Experiments)')
-    axes[0, 1].set_xlabel('Epoch')
-    axes[0, 1].set_ylabel('Loss')
-    axes[0, 1].legend(fontsize=8)
-    axes[0, 1].grid(True, alpha=0.3)
-    
-    axes[0, 2].set_title('Test Loss (All Experiments)')
-    axes[0, 2].set_xlabel('Epoch')
-    axes[0, 2].set_ylabel('Loss')
-    axes[0, 2].legend(fontsize=8)
-    axes[0, 2].grid(True, alpha=0.3)
-    
-    axes[1, 0].set_title('Training Accuracy (All Experiments)')
-    axes[1, 0].set_xlabel('Epoch')
-    axes[1, 0].set_ylabel('Accuracy')
-    axes[1, 0].legend(fontsize=8)
-    axes[1, 0].grid(True, alpha=0.3)
-    axes[1, 0].set_ylim([0, 1])
-    
-    axes[1, 1].set_title('Validation Accuracy (All Experiments)')
-    axes[1, 1].set_xlabel('Epoch')
-    axes[1, 1].set_ylabel('Accuracy')
-    axes[1, 1].legend(fontsize=8)
-    axes[1, 1].grid(True, alpha=0.3)
-    axes[1, 1].set_ylim([0, 1])
-    
-    axes[1, 2].set_title('Test Accuracy (All Experiments)')
-    axes[1, 2].set_xlabel('Epoch')
-    axes[1, 2].set_ylabel('Accuracy')
-    axes[1, 2].legend(fontsize=8)
-    axes[1, 2].grid(True, alpha=0.3)
-    axes[1, 2].set_ylim([0, 1])
-    
-    plt.tight_layout()
-    save_path = f"{plot_dir}/{base}_all_experiments.pdf"
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"Saved aggregate plot to {save_path}")
-
 directory = './classifier/trained_models_filtered/' if FILTERED else './classifier/trained_models/'
-for fold, lr, reg in param_combinations:
+
+
+for fold in folds:
     for subset_size in dataset_sizes[fold]:
         for experiment in range(num_experiments):
-                            
-            metrics_save_path = f'./classifier/4.1.runs/{runname}_sz{subset_size}_e{experiment}_metrics_data.pkl'
-            # Build robust, per-setting summaries using empirical percentiles
+            # Build the configuration key
+            base = f"cl{classifier_name}_ss{round_to_1(subset_size)}_f{fold}_lr{lr}_reg{reg}_ls{label_smoothing}_cs{cs}_ds{ds}_pl{percentile_lo}_ph{percentile_hi}_ver{ver_key}"
+            
+            # Extract ONLY the metrics for this specific configuration
+            config_metrics = {
+                "accuracy": metrics.get(f"{base}_accuracy", []),
+                "precision": metrics.get(f"{base}_precision", []),
+                "recall": metrics.get(f"{base}_recall", []),
+                "f1_score": metrics.get(f"{base}_f1_score", []),
+                "train_acc": metrics.get(f"{base}_train_acc", []),
+                "val_acc": metrics.get(f"{base}_val_acc", []),
+            }
+            
+            # Extract history for this configuration
+            config_history = {}
+            for key in history.keys():
+                if key.startswith(f"{base}_{experiment}"):
+                    config_history[key] = history[key]
+            
+            # Extract labels and predictions for this configuration
+            config_true_labels = {base: all_true_labels.get(base, [])}
+            config_pred_labels = {base: all_pred_labels.get(base, [])}
+            config_pred_probs = {base: all_pred_probs.get(base, [])}
+            
+            # Extract training time for this configuration
+            config_training_times = {
+                fold: {subset_size: training_times.get(fold, {}).get(subset_size, [])}
+            }
+            
+            # Save to file
+            metrics_save_path = f'./classifier/4.1.runs/{classifier}_{galaxy_classes}_lr{lr}_reg{reg}_lo{percentile_lo}_hi{percentile_hi}_cs{cs}_ds{ds}_ver{ver_key}_f{fold}_ss{round_to_1(subset_size)}_e{experiment}_metrics_data.pkl'
+            
+            with open(metrics_save_path, 'wb') as f:
+                pickle.dump({
+                    "metrics": config_metrics,
+                    "history": config_history,
+                    "all_true_labels": config_true_labels,
+                    "all_pred_labels": config_pred_labels,
+                    "all_pred_probs": config_pred_probs,
+                    "training_times": config_training_times,
+                    "classifier_name": classifier_name,
+                    "model_architecture": str(models[classifier_name]["model"]),
+                    "cluster_error": cluster_error,
+                    "cluster_distance": cluster_distance,
+                    "cluster_std_dev": cluster_std_dev,
+                }, f)
+            print(f"Saved metrics PKL to {os.path.abspath(metrics_save_path)}")
+            
             robust_summary = {}   # { base_key: {metric: {'n', 'p16','p50','p84','sigma68'} } }
             skip_keys = {"accuracy", "precision", "recall", "f1_score"}
             rows = []
@@ -1463,22 +1485,125 @@ for fold, lr, reg in param_combinations:
                     "p84": float(p84),
                     "sigma68": float(sigma68)
                 })
-
-            # Also write a tidy CSV so you can scan summaries quickly
-            summary_csv = f'{directory}{classifier}_{galaxy_classes}_percentile_summary.csv'
-            pd.DataFrame(rows).to_csv(summary_csv, index=False)
             
-            with open(metrics_save_path, 'wb') as f:
-                pickle.dump({
-                    "models": models,
-                    "history": history,
-                    "metrics": metrics,
-                    "metric_colors": metric_colors,
-                    "all_true_labels": all_true_labels,
-                    "all_pred_labels": all_pred_labels,
-                    "training_times": training_times,
-                    "all_pred_probs": all_pred_probs,
-                    "percentile_summary": robust_summary
-                }, f)
-            print(f"Saved metrics PKL to {os.path.abspath(metrics_save_path)}")
+# Calculate and print grand average over ALL folds and experiments
+all_accuracies = []
+all_precisions = []
+all_recalls = []
+all_f1_scores = []
+
+for fold in folds:
+    for subset_size in dataset_sizes[fold]:
+        base = f"cl{classifier_name}_ss{round_to_1(subset_size)}_f{fold}_lr{lr}_reg{reg}_ls{label_smoothing}_cs{cs}_ds{ds}_pl{percentile_lo}_ph{percentile_hi}_ver{ver_key}"
+        
+        # Collect metrics from this fold/subset combination
+        if f"{base}_accuracy" in metrics:
+            all_accuracies.extend(metrics[f"{base}_accuracy"])
+            all_precisions.extend(metrics[f"{base}_precision"])
+            all_recalls.extend(metrics[f"{base}_recall"])
+            all_f1_scores.extend(metrics[f"{base}_f1_score"])
+
+# Calculate grand averages
+grand_mean_acc = float(np.mean(all_accuracies)) if all_accuracies else float('nan')
+grand_mean_prec = float(np.mean(all_precisions)) if all_precisions else float('nan')
+grand_mean_rec = float(np.mean(all_recalls)) if all_recalls else float('nan')
+grand_mean_f1 = float(np.mean(all_f1_scores)) if all_f1_scores else float('nan')
+
+print("\n" + "="*80)
+print(f"GRAND AVERAGE over ALL {len(folds)} folds and {num_experiments} experiments:")
+print(f"  Accuracy:  {grand_mean_acc:.4f} ± {float(np.std(all_accuracies)):.4f}")
+print(f"  Precision: {grand_mean_prec:.4f} ± {float(np.std(all_precisions)):.4f}")
+print(f"  Recall:    {grand_mean_rec:.4f} ± {float(np.std(all_recalls)):.4f}")
+print(f"  F1 Score:  {grand_mean_f1:.4f} ± {float(np.std(all_f1_scores)):.4f}")
+print(f"  Total experiments: {len(all_accuracies)}")
+print("="*80 + "\n")
+  
+if DEBUG:          
+    check_overfitting(metrics, history, classifier_name, dataset_sizes, folds, lr, reg, label_smoothing, crop_size, downsample_size, percentile_lo, percentile_hi, ver_key)
+            
+    # Create aggregate plot showing all experiments
+    if num_experiments > 1:
+        plot_dir = './classifier/test'
+        if not os.path.exists(plot_dir):
+            os.makedirs(plot_dir, exist_ok=True)
+            print(f"Created directory: {plot_dir}")
+        
+        print("Creating aggregate plots for all experiments...")
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))  # Changed to 2x3 grid
+        
+        for fold, experiment in list(itertools.product(folds, range(num_experiments))):
+            base = f"cl{classifier_name}_f{fold}_lr{lr}_reg{reg}_ls{label_smoothing}_cs{crop_size}_ds{downsample_size}_pl{percentile_lo}_ph{percentile_hi}_ver{ver_key}"
+            train_loss_key = f"{base}_{experiment}_train_loss"
+            val_loss_key = f"{base}_{experiment}_val_loss"
+            test_loss_key = f"{base}_{experiment}_test_loss"
+            train_acc_key = f"{base}_{experiment}_train_acc"
+            val_acc_key = f"{base}_{experiment}_val_acc"
+            test_acc_key = f"{base}_{experiment}_test_acc"
+            
+            if train_loss_key in history and val_loss_key in history:
+                epochs = range(1, len(history[train_loss_key]) + 1)
+                
+                # Plot losses
+                axes[0, 0].plot(epochs, history[train_loss_key], alpha=0.6, label=f'Exp {experiment}')
+                axes[0, 1].plot(epochs, history[val_loss_key], alpha=0.6, label=f'Exp {experiment}')
+                if test_loss_key in history:
+                    axes[0, 2].plot(epochs[:len(history[test_loss_key])], history[test_loss_key], 
+                                alpha=0.6, label=f'Exp {experiment}')
+                
+                # Plot accuracies
+                if train_acc_key in history and val_acc_key in history:
+                    axes[1, 0].plot(epochs[:len(history[train_acc_key])], history[train_acc_key], 
+                                alpha=0.6, label=f'Exp {experiment}')
+                    axes[1, 1].plot(epochs[:len(history[val_acc_key])], history[val_acc_key], 
+                                alpha=0.6, label=f'Exp {experiment}')
+                    if test_acc_key in history:
+                        axes[1, 2].plot(epochs[:len(history[test_acc_key])], history[test_acc_key], 
+                                    alpha=0.6, label=f'Exp {experiment}')
+        
+        # Configure subplots
+        axes[0, 0].set_title('Training Loss (All Experiments)')
+        axes[0, 0].set_xlabel('Epoch')
+        axes[0, 0].set_ylabel('Loss')
+        axes[0, 0].legend(fontsize=8)
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        axes[0, 1].set_title('Validation Loss (All Experiments)')
+        axes[0, 1].set_xlabel('Epoch')
+        axes[0, 1].set_ylabel('Loss')
+        axes[0, 1].legend(fontsize=8)
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        axes[0, 2].set_title('Test Loss (All Experiments)')
+        axes[0, 2].set_xlabel('Epoch')
+        axes[0, 2].set_ylabel('Loss')
+        axes[0, 2].legend(fontsize=8)
+        axes[0, 2].grid(True, alpha=0.3)
+        
+        axes[1, 0].set_title('Training Accuracy (All Experiments)')
+        axes[1, 0].set_xlabel('Epoch')
+        axes[1, 0].set_ylabel('Accuracy')
+        axes[1, 0].legend(fontsize=8)
+        axes[1, 0].grid(True, alpha=0.3)
+        axes[1, 0].set_ylim([0, 1])
+        
+        axes[1, 1].set_title('Validation Accuracy (All Experiments)')
+        axes[1, 1].set_xlabel('Epoch')
+        axes[1, 1].set_ylabel('Accuracy')
+        axes[1, 1].legend(fontsize=8)
+        axes[1, 1].grid(True, alpha=0.3)
+        axes[1, 1].set_ylim([0, 1])
+        
+        axes[1, 2].set_title('Test Accuracy (All Experiments)')
+        axes[1, 2].set_xlabel('Epoch')
+        axes[1, 2].set_ylabel('Accuracy')
+        axes[1, 2].legend(fontsize=8)
+        axes[1, 2].grid(True, alpha=0.3)
+        axes[1, 2].set_ylim([0, 1])
+        
+        plt.tight_layout()
+        save_path = f"{plot_dir}/{base}_all_experiments.pdf"
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"Saved aggregate plot to {save_path}")
+
                 

@@ -1,28 +1,20 @@
-import skimage, cv2, collections, random, math, hashlib, glob, os, re, torch, json
+import random, math, hashlib, glob, os, re, torch, json
 import numpy as np, pandas as pd
 import torch.nn.functional as F
 from torchvision import transforms
-from utils.GAN_models import load_gan_generator
-from utils.calc_tools import normalise_images, generate_from_noise, load_model, check_tensor
+from utils.calc_tools import normalise_images, check_tensor
+from utils.plotting import plot_class_images, plot_pixel_overlaps_side_by_side
 from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
-from scipy.ndimage import label
 import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-from matplotlib.gridspec import GridSpecFromSubplotSpec
 from astropy.io import fits
 from astropy.convolution import Gaussian2DKernel, convolve_fft
 from collections import Counter, defaultdict
-from PIL import Image
 
 # For reproducibility
 SEED = 42 
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
-
-######################################################################################################
-################################### CONFIGURATION ####################################################
-######################################################################################################
 
 root_path =  '/users/mbredber/scratch/data/' # '/home/markusbredberg/Scripts/data/'  #
 
@@ -95,222 +87,6 @@ def get_classes():
         {"tag": 57, "length": 47, "description": "U"}, # Uncertain
         {"tag": 58, "length": 40, "description": "unclassified"} # Unclassified
     ]
-
-
-########################################################################################################
-####################################### DEBUGGING PLOTTING #############################################
-########################################################################################################
-
-def plot_pixel_overlaps_side_by_side(
-    train_images, eval_images,
-    train_filenames=None, eval_filenames=None,
-    max_hashes=20, outdir="./overlap_debug"
-):
-    """
-    For each pixel-identical hash shared by train/test, save a side-by-side figure.
-    Title of each panel: 'train — <name>' or 'test — <name>'.
-    Works with 2D, 3D (C,H,W), or 4D (T,C,H,W) tensors per image.
-    """
-    os.makedirs(outdir, exist_ok=True)
-
-    # fallbacks if filenames aren't available
-    if not train_filenames: train_filenames = [f"idx {i}" for i in range(len(train_images))]
-    if not eval_filenames:  eval_filenames  = [f"idx {i}" for i in range(len(eval_images))]
-
-    # build hash -> indices maps
-    train_map, eval_map = {}, {}
-    for i, img in enumerate(train_images):
-        h = img_hash(img)
-        train_map.setdefault(h, []).append(i)
-    for j, img in enumerate(eval_images):
-        h = img_hash(img)
-        eval_map.setdefault(h, []).append(j)
-
-    commons = list(set(train_map) & set(eval_map))
-    if not commons:
-        print("[overlap-debug] No pixel-identical images between train and test.")
-        return 0
-
-    for k, h in enumerate(commons[:max_hashes]):
-        t_idxs = train_map[h]
-        e_idxs = eval_map[h]
-        nrows  = max(len(t_idxs), len(e_idxs))
-
-        fig, axs = plt.subplots(nrows, 2, figsize=(6, 3*nrows))
-        if nrows == 1:
-            axs = np.array([axs])  # normalize shape
-
-        for r in range(nrows):
-            # left column: train
-            if r < len(t_idxs):
-                ti = t_idxs[r]
-                arr = _to_2d_for_imshow(train_images[ti], how="first")
-                axs[r, 0].imshow(arr, cmap='viridis', origin='lower')
-                axs[r, 0].set_title(f"train — {train_filenames[ti]}", fontsize=10)
-            axs[r, 0].axis('off')
-
-            # right column: test
-            if r < len(e_idxs):
-                ej = e_idxs[r]
-                arr = _to_2d_for_imshow(eval_images[ej], how="first")
-                axs[r, 1].imshow(arr, cmap='viridis', origin='lower')
-                axs[r, 1].set_title(f"test — {eval_filenames[ej]}", fontsize=10)
-            axs[r, 1].axis('off')
-
-        fig.suptitle(f"Pixel-identical hash: {h[:12]}…  (train {t_idxs}  |  test {e_idxs})", fontsize=11)
-        fig.tight_layout(rect=[0, 0, 1, 0.95])
-        fig.savefig(os.path.join(outdir, f"overlap_{k:03d}_{h}.png"), dpi=200)
-        plt.close(fig)
-        print("Plotted overlap at ", os.path.join(outdir, f"overlap_{k:03d}_{h}.png"))
-
-    print(f"[overlap-debug] Wrote {min(len(commons), max_hashes)} figure(s) to {outdir}")
-    return len(commons)
-
-def plot_class_images_old(images, labels, filenames=None, set_name='train'):
-    # ensure labels are a plain list of ints
-    if isinstance(labels, torch.Tensor):
-        labels = labels.tolist()
-
-    # if images have more than one channel (C, H, W), only use the first channel
-    if isinstance(images, torch.Tensor) and images.ndim == 4:
-        images = [img[0] for img in images]
-    
-    desc_map = {c['tag']: c['description'] for c in get_classes()}
-    
-    for cls in sorted(set(labels)):
-        # collect up to 10 examples of this class
-        idxs = [i for i,l in enumerate(labels) if l == cls][:10]
-        if not idxs:
-            continue
-        
-        fig, axes = plt.subplots(2, 5, figsize=(10, 4))
-        fig.suptitle(f"{set_name} images for class {cls} – {desc_map.get(cls, '')}", fontsize=12)
-        
-        for ax, idx in zip(axes.flat, idxs):
-            img = images[idx]
-            arr = img.squeeze().cpu().numpy() if isinstance(img, torch.Tensor) else np.squeeze(img)
-            
-            # If multiple channels take the first channel
-            if arr.ndim == 3 and arr.shape[0] > 1:
-                arr = arr[0]
-            
-            ax.imshow(arr, cmap='viridis', origin='lower')
-            ax.axis('off')
-            if filenames and idx < len(filenames):
-                ax.set_title(filenames[idx], fontsize=8)
-        
-        # blank out any unused subplots
-        for ax in axes.flat[len(idxs):]:
-            ax.axis('off')
-        
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-        plt.savefig(f"./classifier/processing_step/{cls}_{set_name}_images.png", dpi=300)
-        plt.close(fig)
-        
-# Create the same function as above, but it plots both train and eval sets and both classes side by side for comparison
-# I want the top left quadrant to be the first class of train images, top right to be the first class of eval images, bottom left to be the second class of train images, bottom right to be the second class of eval images
-def plot_class_images(train_images, eval_images, train_labels, eval_labels, train_filenames=None, eval_filenames=None, set_name='comparison'):
-    # ensure labels are a plain list of ints
-    if isinstance(train_labels, torch.Tensor):
-        print("Converting train_labels tensor to list")
-        train_labels = train_labels.tolist()
-    if isinstance(eval_labels, torch.Tensor):
-        eval_labels = eval_labels.tolist()
-
-    desc_map = {c['tag']: c['description'] for c in get_classes()}
-    
-    unique_classes = sorted(set(train_labels) | set(eval_labels))
-    if len(unique_classes) < 2:
-        print("Not enough unique classes to compare.")
-        return
-    
-    class1, class2 = unique_classes[:2]    
-    
-    fig, axes = plt.subplots(2, 2, figsize=(8, 8))
-    
-    # Top-left: train class1 
-    axes[0, 0].set_title("Train", fontsize=12)
-    axes[0, 0].set_ylabel(f"Class {class1}", fontsize=12)
-    axes[0, 0].set_xticks([])
-    axes[0, 0].set_yticks([])
-    axes[0, 0].set_frame_on(False)
-
-    idxs1_train = [i for i, l in enumerate(train_labels) if l == class1][:9]
-    gs = GridSpecFromSubplotSpec(3, 3, subplot_spec=axes[0, 0].get_subplotspec(), wspace=0.02, hspace=0.02)
-    subaxes = [fig.add_subplot(gs[i, j]) for i in range(3) for j in range(3)]
-
-    for ax, idx in zip(subaxes, idxs1_train):
-        img = train_images[idx]
-        arr = img.squeeze().cpu().numpy() if isinstance(img, torch.Tensor) else np.squeeze(img)
-        if arr.ndim == 3 and arr.shape[0] > 1:
-            arr = arr[0]
-        ax.imshow(arr, cmap='viridis', origin='lower')
-        ax.set_xticks([])
-        ax.set_yticks([])
-        ax.set_frame_on(False)
-    
-    # Top-right: eval class1
-    axes[0, 1].set_title("Eval", fontsize=12)
-    axes[0, 1].set_xticks([])
-    axes[0, 1].set_yticks([])
-    axes[0, 1].set_frame_on(False)
-
-    idxs1_eval = [i for i, l in enumerate(eval_labels) if l == class1][:9]
-    gs = GridSpecFromSubplotSpec(3, 3, subplot_spec=axes[0, 1].get_subplotspec(), wspace=0.02, hspace=0.02)
-    subaxes = [fig.add_subplot(gs[i, j]) for i in range(3) for j in range(3)]
-
-    for ax, idx in zip(subaxes, idxs1_eval):
-        img = eval_images[idx]
-        arr = img.squeeze().cpu().numpy() if isinstance(img, torch.Tensor) else np.squeeze(img)
-        if arr.ndim == 3 and arr.shape[0] > 1:
-            arr = arr[0]
-        ax.imshow(arr, cmap='viridis', origin='lower')
-        ax.set_xticks([])
-        ax.set_yticks([])
-        ax.set_frame_on(False)
-    
-    # Bottom-left: train class2
-    axes[1, 0].set_ylabel(f"Class {class2}", fontsize=12)
-    axes[1, 0].set_xticks([])
-    axes[1, 0].set_yticks([])
-    axes[1, 0].set_frame_on(False)
-
-    idxs2_train = [i for i, l in enumerate(train_labels) if l == class2][:9]
-    gs = GridSpecFromSubplotSpec(3, 3, subplot_spec=axes[1, 0].get_subplotspec(), wspace=0.02, hspace=0.02)
-    subaxes = [fig.add_subplot(gs[i, j]) for i in range(3) for j in range(3)]
-
-    for ax, idx in zip(subaxes, idxs2_train):
-        img = train_images[idx]
-        arr = img.squeeze().cpu().numpy() if isinstance(img, torch.Tensor) else np.squeeze(img)
-        if arr.ndim == 3 and arr.shape[0] > 1:
-            arr = arr[0]
-        ax.imshow(arr, cmap='viridis', origin='lower')
-        ax.set_xticks([])
-        ax.set_yticks([])
-        ax.set_frame_on(False)
-    
-    # Bottom-right: eval class2
-    axes[1, 1].set_xticks([])
-    axes[1, 1].set_yticks([])
-    axes[1, 1].set_frame_on(False)
-
-    idxs2_eval = [i for i, l in enumerate(eval_labels) if l == class2][:9]
-    gs = GridSpecFromSubplotSpec(3, 3, subplot_spec=axes[1, 1].get_subplotspec(), wspace=0.02, hspace=0.02)
-    subaxes = [fig.add_subplot(gs[i, j]) for i in range(3) for j in range(3)]
-
-    for ax, idx in zip(subaxes, idxs2_eval):
-        img = eval_images[idx]
-        arr = img.squeeze().cpu().numpy() if isinstance(img, torch.Tensor) else np.squeeze(img)
-        if arr.ndim == 3 and arr.shape[0] > 1:
-            arr = arr[0]
-        ax.imshow(arr, cmap='viridis', origin='lower')
-        ax.set_xticks([])
-        ax.set_yticks([])
-        ax.set_frame_on(False)
-            
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])  
-    plt.savefig(f"./classifier/processing_step/{class1}_{class2}_{set_name}_comparison.png", dpi=300)
-    plt.close()
 
 
 #######################################################################################################
@@ -614,45 +390,6 @@ def _to_2d_for_imshow(x, how="first"):
     # Ensure float32 ndarray
     return np.asarray(img, dtype=np.float32)
 
-# Introduce a function that takes the excess images from the evaluation set and adds them to the training set to balance the classes
-def move_excess_eval_to_train(train_images, train_labels, eval_images, eval_labels, function_names=None):
-    """
-    Move excess samples from eval set to train set to balance classes.
-    """
-    # Count samples per class in both sets
-    train_counter = Counter(train_labels)
-    eval_counter = Counter(eval_labels)
-    
-    class_idxs_eval = defaultdict(list)
-    for i, lbl in enumerate(eval_labels): # Collect indices per class in eval set
-        class_idxs_eval[lbl].append(i)
-    
-    selected_eval = []
-    for cls in train_counter.keys():
-        n_train = train_counter[cls]
-        n_eval = eval_counter.get(cls, 0)
-        if n_eval > n_train:
-            n_to_move = n_eval - n_train
-            idxs = class_idxs_eval[cls]
-            selected_eval.extend(random.sample(idxs, n_to_move))
-    
-    # Move selected samples from eval to train
-    for idx in sorted(selected_eval, reverse=True):
-        train_images.append(eval_images[idx])
-        train_labels.append(eval_labels[idx])
-        if function_names is not None:
-            function_names.append(function_names[idx])
-        del eval_images[idx]
-        del eval_labels[idx]
-        if function_names is not None:
-            del function_names[idx]
-    
-    print(f"Moved {len(selected_eval)} samples from eval to train to balance classes.")
-    
-    if function_names is not None:
-        return train_images, train_labels, eval_images, eval_labels, function_names
-    
-    return train_images, train_labels, eval_images, eval_labels
 
 def balance_classes(images, labels, function_names=None):
     """
@@ -681,91 +418,50 @@ def balance_classes(images, labels, function_names=None):
     return [images[i] for i in selected], [labels[i] for i in selected]
 
 
-def redistribute_excess(train_images, eval_images, train_labels, eval_labels,
-                        train_filenames=None, eval_filenames=None):
+# Introduce a function that takes the excess images from the evaluation set and adds them to the training set to balance the classes
+def move_excess_eval_to_train(train_images, eval_images, train_labels, eval_labels, train_function_names=None, eval_function_names=None):
     """
-    Balance the evaluation set by moving excess images from the larger class(es) 
-    to the training set, ensuring equal representation of each class in eval.
+    Move excess samples from eval set to train set to balance classes.
     """
+    # Count samples per class in both sets
+    train_counter = Counter(train_labels)
+    eval_counter = Counter(eval_labels)
     
-    # Work with tensors directly
-    if isinstance(train_labels, list):
-        train_labels = torch.tensor(train_labels, dtype=torch.long)
-    if isinstance(eval_labels, list):
-        eval_labels = torch.tensor(eval_labels, dtype=torch.long)
+    class_idxs_eval = defaultdict(list)
+    for i, lbl in enumerate(eval_labels): # Collect indices per class in eval set
+        class_idxs_eval[lbl].append(i)
     
-    train_fnames = train_filenames if train_filenames else []
-    eval_fnames = eval_filenames if eval_filenames else []
+    selected_eval = []
+    for cls in train_counter.keys():
+        n_train = train_counter[cls]
+        n_eval = eval_counter.get(cls, 0)
+        if n_eval > n_train:
+            n_to_move = n_eval - n_train
+            idxs = class_idxs_eval[cls]
+            selected_eval.extend(random.sample(idxs, n_to_move, random.seed(SEED)))
+    
+    # Move selected samples from eval to train
+    for idx in sorted(selected_eval, reverse=True):
+        train_images.append(eval_images[idx])
+        train_labels.append(eval_labels[idx])
+        if train_function_names is not None:
+            train_function_names.append(eval_function_names[idx])
+        del eval_images[idx]
+        del eval_labels[idx]
+        if eval_function_names is not None:
+            del eval_function_names[idx]
+    
+    print(f"Moved {len(selected_eval)} samples from eval to train to balance classes.")
+    
+    
+    if train_function_names is not None and eval_function_names is not None:
+        print("All images in eval are listed below:")
+        for name in eval_function_names:
+            print(name)
+        return train_images, train_labels, eval_images, eval_labels, train_function_names, eval_function_names
+    
+    return train_images, train_labels, eval_images, eval_labels
 
-    # Group eval samples by class using tensor operations
-    eval_bins = defaultdict(list)
-    for i in range(len(eval_images)):
-        lbl = int(eval_labels[i].item())
-        eval_bins[lbl].append(i)
-    
-    target_classes = sorted(set(eval_labels.tolist()))
-    
-    # Print before
-    #print(f"Samples per each unique class in the evaluation set before redistribution: "
-    #      f"{Counter(eval_labels.tolist())}")
-    
-    # Find minimum class size
-    min_count = min(len(eval_bins[cls]) for cls in target_classes if cls in eval_bins)
-    keep_idxs, move_idxs = [], []
-    for cls in target_classes:
-        if cls not in eval_bins:
-            continue
-        
-        idxs = eval_bins[cls]
-        
-        # Sort by content hash for deterministic selection
-        items_sorted = sorted(idxs, key=lambda i: img_hash(eval_images[i]))
-        
-        # Debug: Print which samples are being kept/moved
-        if eval_fnames:
-            kept_names = [eval_fnames[items_sorted[j]] for j in range(min(min_count, len(items_sorted)))]
-            moved_names = [eval_fnames[items_sorted[j]] for j in range(min_count, len(items_sorted))]
-            
-            # Sort images according to filenames for easier readability
-            kept_names.sort()
-            moved_names.sort()
-            
-            print(f"Class {cls}: Keeping {len(kept_names)} samples: {kept_names[:15]}{'...' if len(kept_names) > 15 else ''}")
-            #if moved_names:
-            #    print(f"Class {cls}: Moving {len(moved_names)} samples to train: {moved_names[:15]}{'...' if len(moved_names) > 15 else ''}")
-            
-        
-        keep_idxs.extend(items_sorted[:min_count])
-        move_idxs.extend(items_sorted[min_count:])
-    
-    # Use tensor indexing - much faster than list operations
-    new_eval_imgs = eval_images[keep_idxs]
-    new_eval_lbls = eval_labels[keep_idxs]
-    new_eval_fnames = [eval_fnames[i] for i in keep_idxs] if eval_fnames else []
-    
-    # Move excess to train using cat
-    if move_idxs:
-        to_move_imgs = eval_images[move_idxs]
-        to_move_lbls = eval_labels[move_idxs]
-        to_move_fnames = [eval_fnames[i] for i in move_idxs] if eval_fnames else []
-        
-        final_train_imgs = torch.cat([train_images, to_move_imgs], dim=0)
-        final_train_lbls = torch.cat([train_labels, to_move_lbls], dim=0)
-        final_train_fnames = (list(train_fnames) if train_fnames else []) + to_move_fnames
-    else:
-        final_train_imgs = train_images
-        final_train_lbls = train_labels
-        final_train_fnames = train_fnames if train_fnames else []
-    
-    # Print after
-    print(f"Samples per each unique class in evaluation set after redistribution: "
-          f"{Counter(new_eval_lbls.tolist())}")
-    
-    return (
-        final_train_imgs, new_eval_imgs, 
-        final_train_lbls, new_eval_lbls,
-        final_train_fnames, new_eval_fnames
-    )
 
 def apply_formatting(image: torch.Tensor,
                      crop_size: tuple = (1, 128, 128),
@@ -847,9 +543,8 @@ def apply_transforms_with_config(image, config):
     return transformed_image
         
 def augment_images(
-    images, labels,  rotations = list(range(0, 360, 30)),   # 12 rotations instead of 4
+    images, labels, rotations = list(range(0, 360, 30)),   # 12 rotations instead of 4
     flips = [(False, False), (True, False)], mem_threshold=1000,
-    #translations = [(10, 0), (-10, 0), (0, 10), (0, -10)], #[(5, 0), (-5, 0), (0, 5), (0, -5)],
     translations = [(0, 0)], 
     ST_augmentation=False, n_gen = 1):
     """
@@ -951,7 +646,6 @@ def augment_images(
 ##########################################################################################
 ################################# CACHE FUNCTIONS ########################################
 ##########################################################################################
-
 
 
 def _build_cache_key(galaxy_classes, versions, fold, crop_size, downsample_size, 
@@ -1619,16 +1313,9 @@ def load_PSZ2(
     train_images, train_labels, train_fns = _take(tr_idx)
     eval_images,  eval_labels,  eval_fns  = _take(va_idx)
     
-    # Compare the data in train and eval sets with check_tensor to ensure similarity
-    print("Initial dataset sizes — train:", len(train_images), "eval:", len(eval_images))
-    for cls in set(train_labels):
-        cls_imgs = [img for img, lbl in zip(train_images, train_labels) if lbl == cls]
-        check_tensor(f"train_images class {cls} just after splitting", cls_imgs)
-    for cls in set(eval_labels):
-        cls_imgs = [img for img, lbl in zip(eval_images, eval_labels) if lbl == cls]
-        check_tensor(f"eval_images class {cls} just after splitting", cls_imgs)
-    
-    print("Final dataset sizes — train:", len(train_images), "eval:", len(eval_images))
+    if not train:
+        # Make test set balanced without removing any images (needed for some forms of normalisations)
+        move_excess_eval_to_train(train_images, eval_images, train_labels, eval_labels, train_function_names=None, eval_function_names=None)
 
     return train_images, train_labels, eval_images, eval_labels, train_fns, eval_fns
 
@@ -1637,7 +1324,7 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
                   sample_size=None, REMOVEOUTLIERS=True, BALANCE=False, AUGMENT=False, 
                   USE_GLOBAL_NORMALISATION=False, GLOBAL_NORM_MODE="percentile", STRETCH=False, alpha=10.0,
                   percentile_lo=30, percentile_hi=99, NORMALISE=True, NORMALISETOPM=False, PREFER_PROCESSED=True, 
-                  EXTRADATA=False, PRINTFILENAMES=False, SAVE_IMAGES=False, train=None, USE_CACHE=False, DEBUG=True):
+                  EXTRADATA=False, PRINTFILENAMES=False, SAVE_IMAGES=False, train=None, USE_CACHE=True, DEBUG=True):
     """
     Master loader that delegates to specific dataset loaders and returns zero-based labels.
     """
@@ -1665,17 +1352,12 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
                 # Cache has filenames but we don't need them - just return first 4
                 return cached_data[:4]
     
-    def get_max_class(galaxy_classes):
-        if isinstance(galaxy_classes, list):
-            return max(galaxy_classes)
-        return galaxy_classes
-    
     # Clean up kwargs to remove None values
     kwargs = {'path': path, 'versions': versions, 'sample_size': sample_size, 'fold':fold, 'train': train,
               'island': island, 'crop_size': crop_size, 'downsample_size': downsample_size, 'prefer_processed': PREFER_PROCESSED}
     clean_kwargs = {k: v for k, v in kwargs.items() if v is not None}
-
-    max_class = get_max_class(galaxy_classes)
+        
+    max_class = max(galaxy_classes) if isinstance(galaxy_classes, list) else galaxy_classes
 
     # Delegate to specific loaders based on class range
     if max_class <= 59 and max_class >= 50:
@@ -1694,10 +1376,9 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
     else:
         raise ValueError("Data loader did not return the expected number of outputs.")
     
-
-    if NORMALISE:
+    if NORMALISE: 
         if DEBUG:
-            plot_class_images(train_images, eval_images, train_labels, eval_labels, train_filenames, eval_filenames, set_name='1.before_normalisation')
+            plot_class_images(get_classes(), train_images, eval_images, train_labels, eval_labels, train_filenames, eval_filenames, set_name='1.before_normalisation')
             for cls in set(train_labels):
                 cls_imgs = [img for img, lbl in zip(train_images, train_labels) if lbl == cls]
                 check_tensor(f"train_images class {cls} before normalisation", cls_imgs)
@@ -1732,7 +1413,7 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
             eval_images  = all_images[len(train_images):]
             
         if DEBUG:
-            plot_class_images(train_images, eval_images, train_labels, eval_labels, train_filenames, eval_filenames, set_name='2.after_normalisation')
+            plot_class_images(get_classes(), train_images, eval_images, train_labels, eval_labels, train_filenames, eval_filenames, set_name='2.after_normalisation')
             for cls in set(train_labels):
                 cls_imgs = [img for img, lbl in zip(train_images, train_labels) if lbl == cls]
                 check_tensor(f"train_images class {cls} after normalisation", cls_imgs)
@@ -1753,20 +1434,13 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
         
         if DEBUG:
             print("Applied asinh stretch with alpha =", alpha)
-            plot_class_images(train_images, eval_images, train_labels, eval_labels, train_filenames, eval_filenames, set_name='3.after_stretching')
+            plot_class_images(get_classes(),train_images, eval_images, train_labels, eval_labels, train_filenames, eval_filenames, set_name='3.after_stretching')
             for cls in set(train_labels):
                 cls_imgs = [img for img, lbl in zip(train_images, train_labels) if lbl == cls]
                 check_tensor(f"train_images class {cls} after stretching", cls_imgs)
             for cls in set(eval_labels):
                 cls_imgs = [img for img, lbl in zip(eval_images, eval_labels) if lbl == cls]
                 check_tensor(f"eval_images class {cls} after stretching", cls_imgs)
-                
-    train_images, eval_images, train_labels, eval_labels, train_filenames, eval_filenames = \
-        redistribute_excess(
-            train_images, eval_images,
-            train_labels, eval_labels,
-            train_filenames, eval_filenames,
-        )
         
     # Check for overlap between train and test sets
     train_hashes = {img_hash(img) for img in train_images}
@@ -1907,168 +1581,3 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
         return train_images, train_labels, eval_images, eval_labels, train_data, eval_data
     
     return train_images, train_labels, eval_images, eval_labels
-
-
-def load_halos_and_relics(
-    galaxy_classes,
-    versions=('RAW',),
-    fold=5,
-    crop_size=(1, 128, 128),
-    downsample_size=(1, 128, 128),
-    sample_size=1_000_000,
-    REMOVEOUTLIERS=True,
-    BALANCE=False,
-    STRETCH=False,
-    percentile_lo=1,
-    percentile_hi=99,
-    AUGMENT=False,
-    NORMALISE=True,
-    NORMALISETOPM=False,
-    USE_GLOBAL_NORMALISATION=False,
-    GLOBAL_NORM_MODE='percentile',
-    PRINTFILENAMES=False,
-    train=True,
-):
-    """
-    Unifies dataset loading so the training driver can call a single entry point.
-    Returns:
-      train=True:
-        4-tuple: (train_images, train_labels, valid_images, valid_labels)
-        6-tuple if PRINTFILENAMES: (..., train_fns, valid_fns)
-      train=False:
-        4-tuple: (empty_images, empty_labels, test_images, test_labels)
-        6-tuple if PRINTFILENAMES: (..., test_fns)
-    Notes:
-      * Labels are left as original class tags (e.g. 52, 53). The driver relabels later.
-      * If multiple `versions` are provided (e.g. ['RAW','T50kpc']), PSZ2 returns a tesseract [T,1,H,W] per sample.
-    """
-
-    # -------- 1) Load raw images/labels (+ optional filenames) ----------
-    # Decide dataset family from class tags
-    is_psz2  = any(50 <= int(c) <= 58 for c in galaxy_classes)
-    is_first = any(10 <= int(c) <= 13 for c in galaxy_classes)
-
-    images = labels = filenames = None
-
-    if is_psz2:
-        raw = load_PSZ2(
-            path = root_path + "PSZ2/classified/",
-            sample_size = sample_size,              # per class in training set; eval uses sample_size*0.2
-            target_classes = galaxy_classes,  # list of int class tags to load
-            versions = versions,          # string or list/tuple; list => Multiple versions
-            crop_size = crop_size,        # (C,Hc,Wc) — angular FoV is taken from the ref version
-            downsample_size = downsample_size,  # (C,Ho,Wo) — output per frame
-        )
-        
-        if len(raw) == 6:
-            tr_imgs, tr_lbls, ev_imgs, ev_lbls, tr_fns, ev_fns = raw
-        elif len(raw) == 4:
-            tr_imgs, tr_lbls, ev_imgs, ev_lbls = raw
-            tr_fns, ev_fns = [], []
-        else:
-            raise RuntimeError(f"load_PSZ2 returned unexpected shape (len={len(raw)})")
-        # combine so we can stratify/split here
-        def _as_list(x):
-            return [x[i] for i in range(len(x))] if torch.is_tensor(x) else list(x)
-        images    = _as_list(tr_imgs) + _as_list(ev_imgs)
-        labels    = (tr_lbls.cpu().tolist() if torch.is_tensor(tr_lbls) else list(tr_lbls)) + \
-                    (ev_lbls.cpu().tolist() if torch.is_tensor(ev_lbls) else list(ev_lbls))
-        filenames = list(tr_fns) + list(ev_fns)
-    else:
-        raise ValueError("load_galaxies: unsupported class set; add a branch for your dataset.")
-
-    # Ensure list types
-    if isinstance(images, torch.Tensor):
-        images = [img for img in images]
-    if isinstance(labels, torch.Tensor):
-        labels = labels.cpu().tolist()
-
-    # -------- 2) Optional image-level transforms (percentile stretch, asinh, normalise) ----------
-    def _maybe_proc(img):
-        x = img
-        if STRETCH:
-            # per-image percentile stretch then asinh, like the driver expects
-            x = per_image_percentile_stretch(x, lo=percentile_lo, hi=percentile_hi)
-            x = torch.asinh(10 * x) / math.asinh(10)
-        if NORMALISE:
-            if NORMALISETOPM:
-                x = normalise_images(x, -1, 1)
-            else:
-                x = normalise_images(x, 0, 1)
-        return x
-
-    images = [_maybe_proc(x) for x in images]
-
-    # -------- 3) Optional class balancing (undersample to min class size) ----------
-    if BALANCE:
-        from collections import defaultdict
-        byc = defaultdict(list)
-        for i, lbl in enumerate(labels):
-            byc[int(lbl)].append(i)
-        min_n = min(len(v) for v in byc.values())
-        keep = []
-        for v in byc.values():
-            keep.extend(v[:min_n])
-        keep = sorted(keep)
-        images   = [images[i] for i in keep]
-        labels   = [labels[i] for i in keep]
-        filenames = [filenames[i] for i in keep] if filenames else []
-
-    # -------- 4) Optional augmentation (pre-split, like your current driver when LATE_AUG=False) ----------
-    if AUGMENT:
-        imgs_t = torch.stack(images)
-        lbls_t = torch.tensor(labels, dtype=torch.long)
-        imgs_t, lbls_t = augment_images(imgs_t, lbls_t)
-        images = [imgs_t[i] for i in range(len(imgs_t))]
-        labels = lbls_t.cpu().tolist()
-        if filenames:
-            # replicate filenames n_aug times
-            n_aug = len(images) // max(1, len(filenames))
-            filenames = [fn for fn in filenames for _ in range(n_aug)]
-
-    # -------- 5) Stratified split into train/valid (or build test only) ----------
-    y = np.array(labels)
-    idx_all = np.arange(len(y))
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
-    splits = list(skf.split(idx_all, y))
-    # Map fold==5 to "last split" for your driver’s convention
-    split_idx = fold if fold in [0,1,2,3,4] else 4
-    tr_idx, va_idx = splits[split_idx]
-
-    def _take(idxs):
-        ims = [images[i] for i in idxs]
-        lbs = torch.tensor([labels[i] for i in idxs], dtype=torch.long)
-        fns = [filenames[i] for i in idxs] if filenames else []
-        # stack if 3D or 4D tensors, else leave as-is
-        try:
-            ims = torch.stack(ims)
-        except Exception:
-            pass
-        return ims, lbs, fns
-
-    train_images, train_labels, train_fns = _take(tr_idx)
-    valid_images, valid_labels, valid_fns = _take(va_idx)
-
-    # Optionally bound per-class sample sizes
-    if isinstance(sample_size, int) and sample_size > 0:
-        # limit train set per class
-        cls_counts = {c:0 for c in sorted(set(labels))}
-        keep = []
-        for i, lbl in enumerate(train_labels.tolist()):
-            if cls_counts[lbl] < sample_size:
-                keep.append(i); cls_counts[lbl] += 1
-        train_images = train_images[keep]
-        train_labels = train_labels[keep]
-        if train_fns:
-            train_fns = [train_fns[i] for i in keep]
-
-    if not train:
-        empty_imgs = torch.empty((0,)+tuple(train_images.shape[1:])) if isinstance(train_images, torch.Tensor) else []
-        empty_lbls = torch.empty((0,), dtype=torch.long)
-        if PRINTFILENAMES:
-            return empty_imgs, empty_lbls, valid_images, valid_labels, [], valid_fns
-        return empty_imgs, empty_lbls, valid_images, valid_labels
-
-    if PRINTFILENAMES:
-        return train_images, train_labels, valid_images, valid_labels, train_fns, valid_fns
-    return train_images, train_labels, valid_images, valid_labels
