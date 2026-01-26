@@ -1,18 +1,83 @@
-from utils.data_loader import get_classes
+import math, torch, os, hashlib
 import numpy as np
 import matplotlib.pyplot as plt
-import math
-import torch
-from torchvision.utils import make_grid, save_image
 from matplotlib.gridspec import GridSpecFromSubplotSpec
-import os
 
-#plot_histograms, plot_images_by_class, plot_image_grid, plot_background_histogram
+def img_hash(img: torch.Tensor) -> str:
+    arr = img.cpu().contiguous().numpy()
+    returnval = hashlib.sha1(arr.tobytes()).hexdigest()
+    return returnval
 
+def _to_2d_for_imshow(x, how="first"):
+    """
+    Return a (H, W) numpy array suitable for plt.imshow from a tensor/ndarray.
 
-###############################################
-########## SIMPLE PLOTS OF IMAGES #############
-###############################################
+    Accepts shapes like:
+      (H, W)
+      (C, H, W)            or (H, W, C)
+      (B, C, H, W)         or (T, C, H, W)
+      (B, T, C, H, W)
+
+    Parameters
+    ----------
+    x : torch.Tensor or np.ndarray
+        Image-like object.
+    how : {"first","mean","max"}
+        How to reduce non-spatial/extra axes (channels, time, batch).
+    """
+
+    def _reduce(a, axis=0):
+        if how == "mean":
+            return a.mean(axis=axis)
+        if how == "max":
+            return a.max(axis=axis)
+        # "first"
+        return np.take(a, 0, axis=axis)
+
+    # ---- convert to numpy float32 without altering values ----
+    if isinstance(x, torch.Tensor):
+        a = x.detach().cpu().float().numpy()
+    else:
+        a = np.asarray(x, dtype=np.float32)
+
+    # ---- peel dimensions until we have (H, W) ----
+    if a.ndim == 2:
+        img = a
+
+    elif a.ndim == 3:
+        # Heuristic: channels-first if first dim is small (<=4) and last isn't;
+        # channels-last if last dim is small (<=4) and first isn't.
+        c_first = (a.shape[0] in (1, 2, 3, 4)) and (a.shape[-1] not in (1, 2, 3, 4))
+        c_last  = (a.shape[-1] in (1, 2, 3, 4)) and (a.shape[0]  not in (1, 2, 3, 4))
+
+        if c_first:
+            # (C, H, W)
+            img = a[0] if a.shape[0] == 1 else _reduce(a, axis=0)
+        elif c_last:
+            # (H, W, C)
+            img = a[..., 0] if a.shape[-1] == 1 else _reduce(a, axis=-1)
+        else:
+            # Ambiguous; take first plane along the leading axis.
+            img = _reduce(a, axis=0)
+
+    elif a.ndim == 4:
+        # Assume leading axis is batch/time → reduce then recurse.
+        img = _to_2d_for_imshow(_reduce(a, axis=0), how=how)
+
+    elif a.ndim == 5:
+        # (B, T, C, H, W) → reduce B and T, then recurse.
+        a = _reduce(a, axis=0)
+        a = _reduce(a, axis=0)
+        img = _to_2d_for_imshow(a, how=how)
+
+    else:
+        # Fallback: keep reducing the first axis until 2D.
+        while a.ndim > 2:
+            a = _reduce(a, axis=0)
+        img = a
+
+    # Ensure float32 ndarray
+    return np.asarray(img, dtype=np.float32)
 
 
 def plot_image_grid(
@@ -82,12 +147,6 @@ def plot_image_grid(
     else:
         return fig
 
-
-
-
-########################################################################################################
-####################################### DEBUGGING PLOTTING #############################################
-########################################################################################################
 
 def plot_pixel_overlaps_side_by_side(
     train_images, eval_images,
@@ -260,7 +319,7 @@ def plot_class_images(classes, train_images, eval_images, train_labels, eval_lab
     plt.savefig(f"./classifier/processing_step/{class1}_{class2}_{set_name}_comparison.png", dpi=300)
     plt.close()
     
-def plot_images_by_class(images, labels, num_images=5, classes, save_path="./classifier/unknown_omdel_example_inputs.png"):
+def plot_images_by_class(images, labels, classes, num_images=5, save_path="./classifier/unknown_omdel_example_inputs.png"):
     """
     Plots a specified number of input images in a row for each class with the class label as a title.
     """

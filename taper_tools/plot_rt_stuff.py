@@ -119,19 +119,6 @@ def _radial_profiles(U, V, A_T, A_IG, A_IW, F_T, F_IG, nbins=28):
     return out
 
 
-def _parse_ra_deg(val):
-    s = str(val)
-    if ":" in s or " " in s:  # h:m:s style
-        return Angle(s, unit=u.hourangle).degree
-    v = float(s)
-    return Angle(v, unit=u.hourangle).degree if abs(v) <= 24.1 else float(v)
-
-def _parse_dec_deg(val):
-    s = str(val)
-    if ":" in s or " " in s:  # d:m:s style
-        return Angle(s, unit=u.deg).degree
-    return float(s)
-
 
 def center_crop_at(arr, ny_target, nx_target, cy, cx):
     ny, nx = arr.shape

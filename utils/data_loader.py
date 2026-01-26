@@ -4,8 +4,7 @@ import torch.nn.functional as F
 from torchvision import transforms
 from utils.calc_tools import normalise_images, check_tensor
 from utils.plotting import plot_class_images, plot_pixel_overlaps_side_by_side
-from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
-import matplotlib.pyplot as plt
+from sklearn.model_selection import StratifiedGroupKFold
 from astropy.io import fits
 from astropy.convolution import Gaussian2DKernel, convolve_fft
 from collections import Counter, defaultdict
@@ -319,77 +318,6 @@ def _kernel_from_beams(raw_hdr, tgt_hdr):
     return Gaussian2DKernel(x_stddev=s_major, y_stddev=s_minor, theta=theta,
                             x_size=nker, y_size=nker)
 
-def _to_2d_for_imshow(x, how="first"):
-    """
-    Return a (H, W) numpy array suitable for plt.imshow from a tensor/ndarray.
-
-    Accepts shapes like:
-      (H, W)
-      (C, H, W)            or (H, W, C)
-      (B, C, H, W)         or (T, C, H, W)
-      (B, T, C, H, W)
-
-    Parameters
-    ----------
-    x : torch.Tensor or np.ndarray
-        Image-like object.
-    how : {"first","mean","max"}
-        How to reduce non-spatial/extra axes (channels, time, batch).
-    """
-
-    def _reduce(a, axis=0):
-        if how == "mean":
-            return a.mean(axis=axis)
-        if how == "max":
-            return a.max(axis=axis)
-        # "first"
-        return np.take(a, 0, axis=axis)
-
-    # ---- convert to numpy float32 without altering values ----
-    if isinstance(x, torch.Tensor):
-        a = x.detach().cpu().float().numpy()
-    else:
-        a = np.asarray(x, dtype=np.float32)
-
-    # ---- peel dimensions until we have (H, W) ----
-    if a.ndim == 2:
-        img = a
-
-    elif a.ndim == 3:
-        # Heuristic: channels-first if first dim is small (<=4) and last isn't;
-        # channels-last if last dim is small (<=4) and first isn't.
-        c_first = (a.shape[0] in (1, 2, 3, 4)) and (a.shape[-1] not in (1, 2, 3, 4))
-        c_last  = (a.shape[-1] in (1, 2, 3, 4)) and (a.shape[0]  not in (1, 2, 3, 4))
-
-        if c_first:
-            # (C, H, W)
-            img = a[0] if a.shape[0] == 1 else _reduce(a, axis=0)
-        elif c_last:
-            # (H, W, C)
-            img = a[..., 0] if a.shape[-1] == 1 else _reduce(a, axis=-1)
-        else:
-            # Ambiguous; take first plane along the leading axis.
-            img = _reduce(a, axis=0)
-
-    elif a.ndim == 4:
-        # Assume leading axis is batch/time → reduce then recurse.
-        img = _to_2d_for_imshow(_reduce(a, axis=0), how=how)
-
-    elif a.ndim == 5:
-        # (B, T, C, H, W) → reduce B and T, then recurse.
-        a = _reduce(a, axis=0)
-        a = _reduce(a, axis=0)
-        img = _to_2d_for_imshow(a, how=how)
-
-    else:
-        # Fallback: keep reducing the first axis until 2D.
-        while a.ndim > 2:
-            a = _reduce(a, axis=0)
-        img = a
-
-    # Ensure float32 ndarray
-    return np.asarray(img, dtype=np.float32)
-
 
 def balance_classes(images, labels, function_names=None):
     """
@@ -418,53 +346,8 @@ def balance_classes(images, labels, function_names=None):
     return [images[i] for i in selected], [labels[i] for i in selected]
 
 
-# Introduce a function that takes the excess images from the evaluation set and adds them to the training set to balance the classes
-def move_excess_eval_to_train(train_images, eval_images, train_labels, eval_labels, train_function_names=None, eval_function_names=None):
-    """
-    Move excess samples from eval set to train set to balance classes.
-    """
-    # Count samples per class in both sets
-    train_counter = Counter(train_labels)
-    eval_counter = Counter(eval_labels)
-    
-    class_idxs_eval = defaultdict(list)
-    for i, lbl in enumerate(eval_labels): # Collect indices per class in eval set
-        class_idxs_eval[lbl].append(i)
-    
-    selected_eval = []
-    for cls in train_counter.keys():
-        n_train = train_counter[cls]
-        n_eval = eval_counter.get(cls, 0)
-        if n_eval > n_train:
-            n_to_move = n_eval - n_train
-            idxs = class_idxs_eval[cls]
-            selected_eval.extend(random.sample(idxs, n_to_move, random.seed(SEED)))
-    
-    # Move selected samples from eval to train
-    for idx in sorted(selected_eval, reverse=True):
-        train_images.append(eval_images[idx])
-        train_labels.append(eval_labels[idx])
-        if train_function_names is not None:
-            train_function_names.append(eval_function_names[idx])
-        del eval_images[idx]
-        del eval_labels[idx]
-        if eval_function_names is not None:
-            del eval_function_names[idx]
-    
-    print(f"Moved {len(selected_eval)} samples from eval to train to balance classes.")
-    
-    
-    if train_function_names is not None and eval_function_names is not None:
-        print("All images in eval are listed below:")
-        for name in eval_function_names:
-            print(name)
-        return train_images, train_labels, eval_images, eval_labels, train_function_names, eval_function_names
-    
-    return train_images, train_labels, eval_images, eval_labels
-
-
 def apply_formatting(image: torch.Tensor,
-                     crop_size: tuple = (1, 128, 128),
+                     crop_size: tuple = (1, 512, 512),
                      downsample_size: tuple = (1, 128, 128)
                     ) -> torch.Tensor:
     """
@@ -648,7 +531,7 @@ def augment_images(
 ##########################################################################################
 
 
-def _build_cache_key(galaxy_classes, versions, fold, crop_size, downsample_size, 
+def _build_cache_key(galaxy_classes, versions, fold, crop_size, downsample_size,
                      sample_size, REMOVEOUTLIERS, BALANCE, AUGMENT, STRETCH,
                      percentile_lo, percentile_hi, NORMALISE, NORMALISETOPM,
                      USE_GLOBAL_NORMALISATION, GLOBAL_NORM_MODE, PREFER_PROCESSED, train):
@@ -683,7 +566,7 @@ def _build_cache_key(galaxy_classes, versions, fold, crop_size, downsample_size,
         'USE_GLOBAL_NORMALISATION': USE_GLOBAL_NORMALISATION,
         'GLOBAL_NORM_MODE': GLOBAL_NORM_MODE,
         'PREFER_PROCESSED': PREFER_PROCESSED,
-        'train': train
+        'train': train,
     }
     
     # Create a deterministic string from parameters and hash it
@@ -692,12 +575,14 @@ def _build_cache_key(galaxy_classes, versions, fold, crop_size, downsample_size,
     
     # Build readable prefix
     classes_str = "_".join(map(str, params['galaxy_classes']))
-    prefix = f"cache_cls{classes_str}_ver{ver_str}_f{fold}"
-    
+    if USE_GLOBAL_NORMALISATION:
+        prefix = f"cache_cls{classes_str}_ver{ver_str}_globnorm{GLOBAL_NORM_MODE}_f{fold}"
+    else:
+        prefix = f"cache_cls{classes_str}_ver{ver_str}_f{fold}"
     return f"{prefix}_{cache_hash}"
 
 
-def _save_cache(cache_key, data_tuple, cache_dir="./.cache/data"):
+def _save_cache(cache_key, data_tuple, cache_dir="./.cache/images"):
     """
     Save processed data to cache.
     
@@ -729,7 +614,7 @@ def _save_cache(cache_key, data_tuple, cache_dir="./.cache/data"):
         print(f"⚠ Failed to save cache: {e}")
 
 
-def _load_cache(cache_key, cache_dir="./.cache/data"):
+def _load_cache(cache_key, cache_dir="./.cache/images"):
     """
     Load processed data from cache if it exists.
     
@@ -780,11 +665,12 @@ def load_PSZ2(
     sample_size = 300,              # per class in training set; eval uses sample_size*0.2
     target_classes = [50, 51],
     versions = "T100kpcSUB",          # string or list/tuple; list => Multiple versions
+    file_version = 'circular_new',
     crop_size = (1, 512, 512),        # (C,Hc,Wc) — angular FoV is taken from the ref version
     downsample_size = (1, 128, 128),  # (C,Ho,Wo) — output per frame
     fold = 0,                         # 0..4 = CV folds, 5 = last split
     train = False,                    # Not implemented
-    processed_dir = "/users/mbredber/scratch/create_image_sets_outputs/processed_psz2_fits", # directory for preformatted images
+    processed_dir = "/users/mbredber/scratch/data/PSZ2/create_image_sets_outputs/processed_psz2_fits", # directory for preformatted images
     prefer_processed = True,   # whether to prefer processed images when available
     gate_with = None  # None | "auto" | "T50kpc" | 50 (number). If set, gate RAW/T/RT against this T directory.
 ):
@@ -797,6 +683,7 @@ def load_PSZ2(
     print("Parameters:")
     print("  path:", path)
     print("  versions:", versions)
+    print("  file_version:", file_version)
     print("  crop_size:", crop_size)
     print("  downsample_size:", downsample_size)
     print("  target_classes:", target_classes)
@@ -864,159 +751,119 @@ def load_PSZ2(
         return re.sub(r'T\d+kpc.*$', '', base)
     _seen_sources = set()
     
+    
     # ============= multi-version stack =============
     if isinstance(versions, (list, tuple)) and len(versions) > 1:
-        # prefer a taper present in versions; else RAW
+        
+        # Normalize version names
         versions = list(versions) if isinstance(versions, (list, tuple)) else [versions]
-        tapers = [v for v in versions if str(v).upper().startswith("T")]
-        ref_version = tapers[0] if tapers else ("RAW" if any(str(v).upper() == "RAW" for v in versions) else str(versions[0]))
+        norm_versions = [_canon_ver(v) for v in versions]
+        
+        # Use a reference T version to determine class membership
+        # Find any T version in our list, or default to T50kpc
+        ref_T_version = None
+        for v in norm_versions:
+            if str(v).upper().startswith('T') and not str(v).upper().startswith('RT'):
+                ref_T_version = v
+                print(f"[DEBUG] Using reference T version from list: {ref_T_version}")
+                break
+        
+        # If no T version in list, try to find one that exists
+        if ref_T_version is None:
+            for test_v in ['T50kpc', 'T100kpc', 'T25kpc']:
+                test_dir = os.path.join(path, test_v)
+                if os.path.isdir(test_dir):
+                    ref_T_version = test_v
+                    print(f"[DEBUG] Using default reference T version: {ref_T_version}")
+                    break
+                
+        if ref_T_version is not None:
+            for cls in target_classes:
+                sub = classes_map.get(cls)
+                if not sub:
+                    continue
+                                
+                # Scan the reference T directory to get list of sources for this class
+                ref_dir = os.path.join(path, ref_T_version, sub)
+                if not os.path.isdir(ref_dir):
+                    print(f"[DEBUG] Reference directory does not exist: {ref_dir}")
+                    continue
+                
+                # Get all source IDs from this class folder
+                ref_files = os.listdir(ref_dir)
 
-        def _list_bases(ver, sub):
-            folder = os.path.join(path, ver, sub)
-            if not os.path.isdir(folder):
-                return folder, set()
-            files = os.listdir(folder)
-            bases = {os.path.splitext(f)[0] for f in files if f.upper().endswith(".fits")}
-            return folder, bases
+                source_ids = set()
+                fits_count = 0
+                for f in ref_files:
+                    # Debug each file check
+                    is_fits = f.lower().endswith('.fits')
+                    if is_fits:
+                        fits_count += 1
+                        base = os.path.splitext(f)[0]
+                        src_id = _source_id(base)
+                        source_ids.add(src_id)
 
-        for cls in target_classes:
-            sub = classes_map.get(cls)
-            if not sub:
-                continue
+                # Now check which of these sources have all required processed versions
+                valid_sources = []
+                missing_details = []  # Track why sources are invalid
+                for src_id in sorted(source_ids)[:5]:  # Debug first 5 sources only
+                    has_all = True
+                    for nv in norm_versions:
+                        tag = _kpc_tag(nv)
+                        proc_path = os.path.join(processed_dir, f"{src_id}_{tag}_fmt_{Ho}x{Wo}_{file_version}.fits")
+                        exists = os.path.isfile(proc_path)
+                        if not exists:
+                            has_all = False
+                            missing_details.append(f"{src_id} missing {tag}")
+                    if has_all:
+                        valid_sources.append(src_id)
+                        print(f"[DEBUG]   ✓ Source {src_id} has all versions")
 
-            folder_map, base_sets = {}, []
-            for vf in versions:
-                vfU = str(vf).upper()
-                if vfU.startswith("RT"):
-                    # derive gate version, e.g. RT50kpc -> T50kpc
-                    num = ''.join([c for c in str(vf) if c.isdigit()])
-                    gate = f"RT{num}kpc"
 
-                    # list bases from RAW and gate; RT cubes are built from RAW convolved to gate beam
-                    folder_raw,  bases_raw  = _list_bases("RAW",  sub)
-                    folder_gate, bases_gate = _list_bases(gate,   sub)
-                    folder_map["RAW"] = folder_raw
-                    folder_map[gate]  = folder_gate
-                    base_sets.append(bases_raw & bases_gate)     # require presence in both RAW and gate to be eligible
-
-                    # optional: point vf to RAW for ref-only lookups (we never read vf directly for RT)
-                    folder_map[vf] = folder_raw
-                else:
-                    folder, bases = _list_bases(vf, sub)
-                    folder_map[vf] = folder
-                    base_sets.append(bases)
-
-            # intersection over all version requirements (for RT entries this was RAW∩gate)
-            common = sorted(set.intersection(*base_sets)) if base_sets else []
-            
-            for base in common:
-                # ref header/pixscale defines the angular FoV for cropping other versions
-                ref_path = os.path.join(folder_map[ref_version], f"{base}.fits")
-                ref_hdr = fits.getheader(ref_path)
-                ref_pix = _pixdeg(ref_hdr)   # deg/px
-
-                frames, ok = [], True
-                for vf in versions:
-                    vfU = str(vf).upper()
-
-                    # === T/RT: prefer processed file; else generate ===
-                    if vfU.startswith("T") or vfU.startswith("RT"):
-                        src_name = _source_id(base)
-                        tag = _kpc_tag(vfU)  # e.g. RT50kpc or T50kpc
-                        Hwant, Wwant = Ho, Wo  # preformatted target size
-                        proc_path = os.path.join(
-                            processed_dir,
-                            f"{src_name}_{tag}_fmt_{Hwant}x{Wwant}.fits"
-                        )
-
-                        if os.path.isfile(proc_path):
+                # Now check all sources (not just first 5)
+                valid_sources_full = []
+                for src_id in source_ids:
+                    has_all = True
+                    for nv in norm_versions:
+                        tag = _kpc_tag(nv)
+                        proc_path = os.path.join(processed_dir, f"{src_id}_{tag}_fmt_{Ho}x{Wo}_{file_version}.fits")
+                        if not os.path.isfile(proc_path):
+                            has_all = False
+                            break
+                    if has_all:
+                        valid_sources_full.append(src_id)
+                
+                # Load the processed files for valid sources
+                for src_id in valid_sources_full:
+                    frames = []
+                    ok = True
+                    
+                    for nv in norm_versions:
+                        tag = _kpc_tag(nv)
+                        proc_path = os.path.join(processed_dir, f"{src_id}_{tag}_fmt_{Ho}x{Wo}_{file_version}.fits")
+                        
+                        try:
                             arr = np.squeeze(fits.getdata(proc_path)).astype(np.float32)
                             if arr.ndim == 3:
                                 arr = arr.mean(axis=0)
                             if arr.ndim != 2:
                                 ok = False
                                 break
-                            ten = torch.from_numpy(arr).unsqueeze(0).float()  # already formatted
-                            frames.append(ten)
-                            continue
-
-                        # --- processed file missing: generate like the montage script ---
-                        if vfU.startswith("T"):
-                            # read native T image and format to ref FoV
-                            fpath = os.path.join(folder_map[vf], f"{base}.fits")
-                            arr = np.squeeze(fits.getdata(fpath)).astype(np.float32)
-                            if arr.ndim == 3:
-                                arr = arr.mean(axis=0)
-                            if arr.ndim != 2:
-                                ok = False
-                                break
-                            hdr = fits.getheader(fpath)
-
-                            if n_beams_min is not None:
-                                fwhm_as = max(float(hdr["BMAJ"]), float(hdr["BMIN"])) * 3600.0
-                                side_as = n_beams_min * fwhm_as
-                                px, py = _pix_scales_arcsec(hdr)
-                                Hc_eff = max(1, int(round(side_as / py)))
-                                Wc_eff = max(1, int(round(side_as / px)))
-                            else:
-                                ref_hdr = fits.getheader(ref_path)
-                                ref_pix = _pixdeg(ref_hdr)
-                                pix = _pixdeg(hdr)
-                                Hc_eff = max(1, int(round(Hc_ref * (ref_pix / pix))))
-                                Wc_eff = max(1, int(round(Wc_ref * (ref_pix / pix))))
-
                             ten = torch.from_numpy(arr).unsqueeze(0).float()
-                            frm = apply_formatting(ten, crop_size=(1, Hc_eff, Wc_eff), downsample_size=(1, Ho, Wo))
-                            frames.append(frm)
-                            continue
-
-                        # RT fallback: convolve RAW to T-beam and format
-                        num = ''.join([c for c in vfU if c.isdigit()])
-                        gate_T = f"T{num}kpc"
-                        raw_path = os.path.join(folder_map["RAW"], f"{base}.fits")
-                        txx_path = os.path.join(folder_map[gate_T], f"{base}.fits")
-                        if not (os.path.isfile(raw_path) and os.path.isfile(txx_path)):
+                            frames.append(ten)
+                        except Exception as e:
+                            print(f"[DEBUG] Failed to load {proc_path}: {e}")
                             ok = False
                             break
+                    
+                    if not ok or len(frames) != len(norm_versions):
+                        continue
+                    
+                    cube = torch.stack(frames, dim=0)
+                    images.append(cube)
+                    labels.append(cls)
+                    basenames.append(src_id)
 
-                        raw_arr = np.squeeze(fits.getdata(raw_path)).astype(np.float32)
-                        if raw_arr.ndim == 3:
-                            raw_arr = raw_arr.mean(axis=0)
-                        txx_hdr = fits.getheader(txx_path)
-                        raw_hdr = fits.getheader(raw_path)
-
-                        ker = _kernel_from_beams(raw_hdr, txx_hdr)
-                        rt_arr = convolve_fft(
-                            raw_arr, ker, boundary="fill", fill_value=np.nan,
-                            nan_treatment="interpolate", normalize_kernel=True,
-                            psf_pad=True, fft_pad=True, allow_huge=True
-                        )
-                        rt_arr *= (_beam_solid_angle_sr(txx_hdr) / _beam_solid_angle_sr(raw_hdr))
-
-                        if n_beams_min is not None:
-                            fwhm_as = max(float(txx_hdr["BMAJ"]), float(txx_hdr["BMIN"])) * 3600.0
-                            side_as = n_beams_min * fwhm_as
-                            px, py = _pix_scales_arcsec(raw_hdr)
-                            Hc_eff = max(1, int(round(side_as / py)))
-                            Wc_eff = max(1, int(round(side_as / px)))
-                        else:
-                            ref_hdr = fits.getheader(ref_path)
-                            ref_pix = _pixdeg(ref_hdr)
-                            raw_pix = _pixdeg(raw_hdr)
-                            Hc_eff = max(1, int(round(Hc_ref * (ref_pix / raw_pix))))
-                            Wc_eff = max(1, int(round(Wc_ref * (ref_pix / raw_pix))))
-
-                        ten = torch.from_numpy(rt_arr).unsqueeze(0).float()
-                        frm = apply_formatting(ten, crop_size=(1, Hc_eff, Wc_eff), downsample_size=(1, Ho, Wo))
-                        frames.append(frm)
-
-                        if not ok or not frames:
-                            continue
-
-                        cube = torch.stack(frames, dim=0)  # [T,1,Ho,Wo]
-                        images.append(cube)
-                        labels.append(cls)
-                        basenames.append(_source_id(base))
 
     # ============= SINGLE-VERSION PATH (optionally rtXXkpc) =============
     else:
@@ -1091,10 +938,9 @@ def load_PSZ2(
                 use_processed = bool(prefer_processed) and (vU.startswith("T") or vU.startswith("RT") or vU == "RAW")
                 if use_processed:
                     src_name = _source_id(base)
-                    Hwant, Wwant = Ho, Wo
                     proc_path = os.path.join(
                         processed_dir,
-                        f"{src_name}_{tag}_fmt_{Hwant}x{Wwant}_old.fits" # This is the used file name
+                        f"{src_name}_{tag}_fmt_{Ho}x{Wo}_{file_version}.fits" # This is the used file name
                     )
                     if os.path.isfile(proc_path):
                         arr = np.squeeze(fits.getdata(proc_path)).astype(np.float32)
@@ -1274,7 +1120,7 @@ def load_PSZ2(
             f"with fmt_{Ho}x{Wo}. "
             f"Tip: ensure crop_size matches available *_fmt_HxW.fits, "
             f"or use the fallback glob below."
-            f"First location tried:\n {os.path.join(processed_dir, f'*_{v_tag}_fmt_{Ho}x{Wo}.fits')} "
+            f"First location tried:\n {os.path.join(processed_dir, f'*_{v_tag}_fmt_{Ho}x{Wo}_{file_version}.fits')} "
         )
 
     # Separate test from training and validation data. 
@@ -1312,10 +1158,6 @@ def load_PSZ2(
 
     train_images, train_labels, train_fns = _take(tr_idx)
     eval_images,  eval_labels,  eval_fns  = _take(va_idx)
-    
-    if not train:
-        # Make test set balanced without removing any images (needed for some forms of normalisations)
-        move_excess_eval_to_train(train_images, eval_images, train_labels, eval_labels, train_function_names=None, eval_function_names=None)
 
     return train_images, train_labels, eval_images, eval_labels, train_fns, eval_fns
 

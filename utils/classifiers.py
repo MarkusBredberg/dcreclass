@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-from torch.autograd import Function
 
 
 class CNN(nn.Module): # 67%

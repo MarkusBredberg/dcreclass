@@ -7,10 +7,11 @@ from astropy.io import fits
 from astropy.table import Table
 import pandas as pd
 
+
 # ─── CONFIG ────────────────────────────────────────────────────────────────
-FITS_ROOT       = "/users/mbredber/scratch/data/PSZ2/fits"
-CROP_ROOT       = "/users/mbredber/scratch/data/PSZ2/crops"
-META_FITS       = "/users/mbredber/scratch/data/PSZ2/planck_dr2_metadata.fits"
+FITS_ROOT       = "/users/mbredber/scratch/data/PSZ2/fits"  # Path to downloaded FITS files
+CROP_ROOT       = "/users/mbredber/scratch/data/PSZ2/crops" # Path to save cropped PNGs
+META_CSV        = "/users/mbredber/scratch/data/PSZ2/cluster_metadata.csv" # Metadata CSV file
 CROP_SIZE       = None  # Set to None to use full size
 
 FILENAME_SUFFIXES = ["T15arcsec"] # List of suffixes to use
@@ -47,9 +48,8 @@ BUCKETS = {
 os.makedirs(CROP_ROOT, exist_ok=True)
 
 # ─── LOAD METADATA ─────────────────────────────────────────────────────────
-meta = Table.read(META_FITS).to_pandas()
-meta['Name_str'] = [n.decode('utf-8') if isinstance(n, (bytes, bytearray)) else str(n) for n in meta['Name']]
-meta['slug'] = meta['Name_str'].str.replace(" ", "")
+meta = pd.read_csv(META_CSV)
+meta['slug'] = meta['slug'].str.replace(" ", "")
 meta = meta.set_index('slug')
 rows = []
 

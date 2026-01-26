@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import os
 import shutil
-from astropy.io import fits
 from astropy.table import Table
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────

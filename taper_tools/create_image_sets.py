@@ -37,7 +37,7 @@ OFFSETS_PX: Dict[str, Tuple[int,int]] = {
 }
 
 # ---------------------------- FITS / WCS utilities ----------------------------
-ARCSEC_PER_RAD = 206264.80624709636
+ARCSEC_PER_RAD = 206264.80624709636 # 180.0 * 3600.0 / pi
 
 def _cd_matrix_rad(h):
     if 'CD1_1' in h:
@@ -175,7 +175,6 @@ def wcs_after_center_crop_and_resize(header, H0, W0, Hc, Wc, Ho, Wo, y0, x0):
     return wcs_new, new
 
 def robust_vmin_vmax(arr: np.ndarray, lo=1, hi=99):
-    #This is only used for display purposes
     finite = np.isfinite(arr)
     if not finite.any(): return 0.0, 1.0
     vals = arr[finite]
@@ -236,10 +235,8 @@ def crop_to_side_arcsec_on_raw(I, Hraw, side_arcsec, *arrs, center=None):
     out = [a[y0:y0+ny, x0:x0+nx] for a in (I,) + arrs]
     return out, (ny, nx), (cy_eff, cx_eff)
 
-# ------------------------------ IO helpers -----------------------------------
-def t_product_path(src_dir: Path, name: str, scale_kpc: str) -> Path:
-    return src_dir / f"{name}T{scale_kpc}kpc.fits"
 
+# ------------------------------ IO helpers -----------------------------------
 def find_pairs_in_tree(root: Path, desired_kpc: float) -> Iterable[Tuple[str, Path, Path, float]]:
     """
     Yield (name, raw_path, t_path, chosen_kpc) where chosen_kpc is the available T scale
@@ -261,53 +258,42 @@ def find_pairs_in_tree(root: Path, desired_kpc: float) -> Iterable[Tuple[str, Pa
         if candidates:
             _, ybest, fbest = sorted(candidates, key=lambda t: (t[0], t[1]))[0]
             yield name, raw_path, fbest, ybest
+            
 
-          
 def compute_global_nbeams_min(root_dir):
     """
     Scan all subdirs under root_dir, find every *Tkpc.fits,
-    compute n_beams = min(FOV_x, FOV_y)/FWHM (arcsec),
-    and also the minimum field-of-view (min side, in arcmin) and its source.
-    Returns (nmin, min_fov_arcmin, min_fov_path) where nmin is the smallest n_beams,
-    min_fov_arcmin is the smallest min(FOV_x,FOV_y) in arcmin, and min_fov_path is the file.
+    compute n_beams = min(FOV_x, FOV_y)/FWHM, return the smallest.
     """
     n_beams = []
-    fovs = []  # tuples (fov_min_arcmin, path)
     for tfile in Path(root_dir).rglob("*T*kpc.fits"):
         try:
+            from astropy.io import fits
             with fits.open(tfile) as hdul:
                 h = hdul[0].header
-            fwhm = max(float(h.get("BMAJ", 0.0)), float(h.get("BMIN", 0.0))) * 3600.0
+            fwhm = max(float(h["BMAJ"]), float(h["BMIN"])) * 3600.0
             # pixel scale
             if "CD1_1" in h:
                 cd11 = h["CD1_1"]; cd22 = h.get("CD2_2", 0)
                 cd12 = h.get("CD1_2", 0); cd21 = h.get("CD2_1", 0)
                 dx = np.hypot(cd11, cd21)
                 dy = np.hypot(cd12, cd22)
-                asx = dx * ARCSEC_PER_RAD; asy = dy * ARCSEC_PER_RAD
+                asx = dx * 206264.806; asy = dy * 206264.806
             else:
-                asx = abs(h.get("CDELT1",1.0)) * 3600.0
-                asy = abs(h.get("CDELT2",1.0)) * 3600.0
-            fovx = int(h.get("NAXIS1", 0)) * asx
-            fovy = int(h.get("NAXIS2", 0)) * asy
-            if fovx <= 0 or fovy <= 0 or fwhm <= 0:
-                continue
-            nb = min(fovx, fovy) / max(fwhm, 1e-9)
-            n_beams.append((nb, str(tfile)))
-            fov_min_arcmin = float(min(fovx, fovy) / 60.0)
-            fovs.append((fov_min_arcmin, str(tfile)))
+                asx = abs(h.get("CDELT1",1))*3600.0
+                asy = abs(h.get("CDELT2",1))*3600.0
+            fovx = int(h["NAXIS1"])*asx
+            fovy = int(h["NAXIS2"])*asy
+            nb = min(fovx,fovy)/max(fwhm,1e-9)
+            n_beams.append(nb)
         except Exception as e:
             print(f"[scan] skip {tfile}: {e}")
     if not n_beams:
-        print("[scan] No T*kpc files found → default to (None, None, None)")
-        return None, None, None
-    # smallest n_beams overall
-    nmin, nmin_path = min(n_beams, key=lambda t: t[0])
-    # smallest FOV (arcmin) overall
-    fmin, fmin_path = min(fovs, key=lambda t: t[0])
+        print("[scan] No T*kpc files found → default to None")
+        return None
+    nmin = min(n_beams)
     print(f"[scan] Using n_beams = {nmin:.2f} (smallest across {len(n_beams)} T*kpc frames)")
-    print(f"[scan] Smallest min-FOV = {fmin:.3f} arcmin from {fmin_path}")
-    return float(nmin), float(fmin), fmin_path
+    return nmin
 
 def report_nans(path: Path):
     with fits.open(path, memmap=False) as hdul:
@@ -322,13 +308,13 @@ def make_montage(source_name: str,
                  t_path: Path,
                  rt_label: str,
                  t_label: str,
+                 crop_size=(1, 512, 512),
                  downsample_size=(1, 128, 128),
                  out_png: Path = None,
                  save_fits: bool = False,
                  out_fits_dir: Optional[Path] = None,
                  fov_arcmin: float = 50.0,
-                 cheat_rt: bool = False,
-                 scale_factor: float = 1.0):
+                 cheat_rt: bool = False):
     """
     Build RT on RAW grid, then 3×2 WCS montage:
       rows: RAW, RT, T_X
@@ -342,7 +328,6 @@ def make_montage(source_name: str,
     # --- determine equal-beams crop side based on smallest n_beams across T50 set ---
     # (We cache the global minimum once at module level)
     if not hasattr(make_montage, "_global_nbeams"):
-        print(f"[info] Computing global minimum n_beams across T*kpc files under {raw_path.parent.parent} ...")
         # compute n_beams for this T50
         fwhm_as = fwhm_major_as(H_tgt)
         asx, asy = arcsec_per_pix(H_tgt)
@@ -429,75 +414,42 @@ def make_montage(source_name: str,
         yc_t += dy_px; xc_t += dx_px
         center_note += f" | manual offset (dy,dx)=({dy_px:.1f},{dx_px:.1f}) px"
 
-    # --- fixed physical FOV crop  across RAW, RT, T (on RAW grid) ---
-    # --- choose a safe physical crop side, limited by global minima, and shrink if NaNs ---
-    # Compute FWHM (arcsec) for this target so physical size = GLOBAL_NBEAMS * FWHM
-    fwhm_as_tgt = fwhm_major_as(H_tgt)  # arcsec
-    fwhm_arcmin = fwhm_as_tgt / 60.0    # arcmin
-
-    # Prefer using GLOBAL_NBEAMS if available; otherwise fall back to provided fov_arcmin.
-    target_nbeams = getattr(make_montage, "GLOBAL_NBEAMS", None)
-    if target_nbeams is None:
-        # fallback to old behaviour
-        print(f"[info] GLOBAL_NBEAMS not set; using fixed FOV = {fov_arcmin} arcmin")
-        target_side_arcmin = float(fov_arcmin)
+    # --- extract kpc scale from label for zoom adjustment ---
+    import re
+    kpc_match = re.search(r'T(\d+(?:\.\d+)?)kpc', t_label)
+    if kpc_match:
+        kpc_value = float(kpc_match.group(1))
+        # Apply scale-dependent zoom factor:
+        zoom_25 = 1.42 # - 25kpc: zoom OUT
+        zoom_100 = 0.49 # - 100kpc: zoom IN 
+        if kpc_value <= 30:  # 25kpc and similar
+            zoom_factor = zoom_25
+        elif kpc_value >= 90:  # 100kpc and similar
+            zoom_factor = zoom_100
+        else:  # intermediate scales
+            # Linear interpolation between 30-90 kpc
+            #zoom_factor = zoom_25 - (kpc_value - 30) * (zoom_25 - zoom_100) / (90 - 30)
+            #print(f"[zoom] kpc={kpc_value:.1f} → zoom_factor={zoom_factor:.3f}")
+            zoom_factor = 1.0  # neutral zoom for intermediate scales
     else:
-        # physical side implied by n_beams × FWHM (arcmin)
-        side_by_nbeams = float(target_nbeams) * fwhm_arcmin
-        # global minimum available FOV (from dataset) — crop must not exceed this
-        global_min_fov = getattr(make_montage, "GLOBAL_MIN_FOV_ARCMIN", None)
-        if global_min_fov is None:
-            # conservative fallback
-            print(f"[info] GLOBAL_MIN_FOV_ARCMIN not set; limiting to provided FOV = {fov_arcmin} arcmin")
-            target_side_arcmin = min(side_by_nbeams, float(fov_arcmin))
-        else:
-            # choose the smaller: don't ask for more sky than the smallest FOV in the set
-            target_side_arcmin = min(side_by_nbeams, float(global_min_fov))
-
-    # Iteratively shrink the angular side only if NaNs persist in the crop
-    side_arcmin = float(max(0.1, target_side_arcmin))  # start (arcmin)
-    shrink_factor = 0.90
-    max_iters = 20
-    min_side_px = 16  # absolute lower limit in pixels
-
-    I_crop = RT_crop = T_crop = None
-    cy_raw = cx_raw = None
-    for it in range(max_iters):
-        (I_crop, RT_crop, T_crop), (nyc, nxc), (cy_raw, cx_raw) = crop_to_fov_on_raw(
-            I_raw, H_raw, side_arcmin, RT_rawgrid, T_on_raw, center=(yc_i, xc_i)
+        zoom_factor = 1.0  # default if no match
+    
+    # --- equal-beams crop: side = global_min_beams * FWHM_T50 * zoom_factor ---
+    fwhm_t50_as = fwhm_major_as(H_tgt)
+    side_as = make_montage._global_nbeams * fwhm_t50_as * zoom_factor
+    if getattr(make_montage, "GLOBAL_NBEAMS", None):
+        # equal-beams crop using global min beam count with zoom adjustment
+        fwhm_t50_as = fwhm_major_as(H_tgt)
+        side_as = make_montage.GLOBAL_NBEAMS * fwhm_t50_as * zoom_factor
+        (I_crop, RT_crop, T_crop), (nyc, nxc), (cy_raw, cx_raw) = crop_to_side_arcsec_on_raw(
+            I_raw, H_raw, side_as, RT_rawgrid, T_on_raw, center=(yc_i, xc_i)
         )
-        # If crop too small in pixels, stop and accept current crop (avoid infinite loop)
-        if min(nyc, nxc) < min_side_px:
-            break
-        # Success if no NaNs
-        if not (np.isnan(I_crop).any() or np.isnan(RT_crop).any() or np.isnan(T_crop).any()):
-            break
-        # else shrink and retry
-        side_arcmin *= shrink_factor
-
-    # If there are still NaNs (rare), report the limiting source and fall back to nearest-fill
-    if np.isnan(I_crop).any() or np.isnan(RT_crop).any() or np.isnan(T_crop).any():
-        limiting = getattr(make_montage, "GLOBAL_MIN_FOV_SOURCE", "unknown")
-        print(f"[warn] Crop for {source_name} still contains NaNs after shrinking; limiting source: {limiting}")
-        # last-resort nearest-fill (optional; keeps FITS NaN-free)
-        try:
-            from scipy import ndimage
-            def _fill_nan_nearest(arr):
-                if arr.ndim != 2: return arr
-                mask = np.isnan(arr)
-                if not mask.any(): return arr
-                idx = ndimage.distance_transform_edt(mask, return_indices=True)
-                filled = arr.copy()
-                filled[mask] = arr[tuple(idx[:, mask])]
-                return filled
-            print(f"[info] Applying nearest-neighbor fill for NaNs in crop for {source_name}")
-            I_crop  = _fill_nan_nearest(I_crop)
-            RT_crop = _fill_nan_nearest(RT_crop)
-            T_crop  = _fill_nan_nearest(T_crop)
-        except Exception:
-            # if scipy not available, leave NaNs but log a warning
-            print(f"[warn] scipy.ndimage not available — leaving NaNs in crop for {source_name}")
-
+    else:
+        # fallback: just use your default FOV crop with zoom adjustment
+        adjusted_fov = fov_arcmin * zoom_factor
+        (I_crop, RT_crop, T_crop), (nyc, nxc), (cy_raw, cx_raw) = crop_to_fov_on_raw(
+            I_raw, H_raw, adjusted_fov, RT_rawgrid, T_on_raw, center=(yc_i, xc_i)
+        )
     # Optional downsample to a fixed display size (keeps the FOV content)
     Ho, Wo = _canon_size(downsample_size)[-2:]
     def _maybe_downsample(arr, Ho, Wo):
@@ -537,11 +489,11 @@ def make_montage(source_name: str,
     ax21 = fig.add_subplot(3,2,6, projection=W_t_fmt)    # T formatted (native grid)
 
     im00 = ax00.imshow(I_orig_np,  origin="lower", vmin=vmin_I,  vmax=vmax_I);   ax00.set_title("RAW (original)")
-    im01 = ax01.imshow(I_fmt_np,   origin="lower", vmin=vmin_I,  vmax=vmax_I);   ax01.set_title(f"RAW formatted (FOV {fov_arcmin:.1f}′ → {Ho}×{Wo})")
+    im01 = ax01.imshow(I_fmt_np,   origin="lower", vmin=vmin_I,  vmax=vmax_I);   ax01.set_title(f"RAW formatted (FOV {fov_arcmin:.1f}′ → {Ho}×{Wo}, zoom={zoom_factor:.2f})")
     im10 = ax10.imshow(RT_orig_np, origin="lower", vmin=vmin_RT, vmax=vmax_RT);  ax10.set_title(f"{rt_label}=RAW⊗G (original, RAW grid)")
-    im11 = ax11.imshow(RT_fmt_np,  origin="lower", vmin=vmin_RT, vmax=vmax_RT);  ax11.set_title(f"{rt_label} formatted (FOV {fov_arcmin:.1f}′ → {Ho}×{Wo})")
+    im11 = ax11.imshow(RT_fmt_np,  origin="lower", vmin=vmin_RT, vmax=vmax_RT);  ax11.set_title(f"{rt_label} formatted (FOV {fov_arcmin:.1f}′ → {Ho}×{Wo}, zoom={zoom_factor:.2f})")
     im20 = ax20.imshow(T_on_raw,   origin="lower", vmin=vmin_T,  vmax=vmax_T);   ax20.set_title(f"{t_label} (original, RAW grid)")
-    im21 = ax21.imshow(T_fmt_np,   origin="lower", vmin=vmin_T,  vmax=vmax_T);   ax21.set_title(f"{t_label} formatted (FOV {fov_arcmin:.1f}′ → {Ho}×{Wo})")
+    im21 = ax21.imshow(T_fmt_np,   origin="lower", vmin=vmin_T,  vmax=vmax_T);   ax21.set_title(f"{t_label} formatted (FOV {fov_arcmin:.1f}′ → {Ho}×{Wo}, zoom={zoom_factor:.2f})")
 
     fig.colorbar(im00, ax=[ax00, ax01], shrink=0.85, label="RAW [Jy/beam_raw]")
     fig.colorbar(im10, ax=[ax10, ax11], shrink=0.85, label=f"{rt_label} [Jy/beam_tgt]")
@@ -558,14 +510,16 @@ def make_montage(source_name: str,
         out_fits_dir = (out_fits_dir or out_png.parent)
         out_fits_dir.mkdir(parents=True, exist_ok=True)
         Ho, Wo = _canon_size(downsample_size)[-2:]
-
-        for (type_label, np_map, H_vers) in zip(["RAW", rt_label, t_label],
-                                               [I_fmt_np, RT_fmt_np, T_fmt_np],
-                                               [H_i_fmt, H_rt_fmt, H_t_fmt]):
-            fout = out_fits_dir / f"{source_name}_{type_label}_fmt_{Ho}x{Wo}_{scale_factor}.fits"
-            fits.writeto(fout, np_map.astype(np.float32), H_vers, overwrite=True)
-            report_nans(fout)
-        #print(f"[info] Saved formatted FITS to {out_fits_dir} under names like {source_name}_RAW_fmt_{Ho}x{Wo}_{scale_factor}.fits")
+        fits.writeto(out_fits_dir / f"{source_name}_RAW_fmt_{Ho}x{Wo}_old_{zoom_factor}.fits",
+                     I_fmt_np.astype(np.float32), H_i_fmt, overwrite=True)
+        fits.writeto(out_fits_dir / f"{source_name}_{rt_label}_fmt_{Ho}x{Wo}_old_{zoom_factor}.fits",
+                    RT_fmt_np.astype(np.float32), H_rt_fmt, overwrite=True)
+        fits.writeto(out_fits_dir / f"{source_name}_{t_label}_fmt_{Ho}x{Wo}_old_{zoom_factor}.fits",
+                    T_fmt_np.astype(np.float32), H_t_fmt, overwrite=True)
+        
+        report_nans(out_fits_dir / f"{source_name}_RAW_fmt_{Ho}x{Wo}_old_{zoom_factor}.fits")
+        report_nans(out_fits_dir / f"{source_name}_{rt_label}_fmt_{Ho}x{Wo}_old_{zoom_factor}.fits")
+        report_nans(out_fits_dir / f"{source_name}_{t_label}_fmt_{Ho}x{Wo}_old_{zoom_factor}.fits")
 
 
 # --------------------------------- CLI ---------------------------------------
@@ -578,18 +532,18 @@ def parse_tuple3(txt: str) -> Tuple[int,int,int]:
 def main():
     ap = argparse.ArgumentParser(description="3×2 montages per source: RAW, RT=RAW⊗G, and T_X (X in kpc).")
     DEFAULT_ROOT = Path("/users/mbredber/scratch/data/PSZ2/fits")
-    DEFAULT_OUT  = Path("/users/mbredber/scratch/create_image_sets_outputs/montages")
+    DEFAULT_OUT  = Path("/users/mbredber/scratch/data/PSZ2/create_image_sets_outputs/montages")
 
     ap.add_argument("--root", type=Path, default=DEFAULT_ROOT,
                     help=f"Root directory with per-source subfolders (/<name>/<name>.fits and T_X).")
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT,
                     help=f"Output directory for PNG montages. Default: {DEFAULT_OUT}")
+    ap.add_argument("--crop", type=parse_tuple3, default="512,512",
+                    help="Crop size H,W or C,H,W in input pixels. Default: 512,512")
     ap.add_argument("--down", type=parse_tuple3, default="128,128",
                     help="Downsample size H,W or C,H,W. Default: 128,128")
-    ap.add_argument("--scales", type=str, default="25, 50, 100",
+    ap.add_argument("--scales", type=str, default="100",
                     help="Comma-separated requested RT scales in kpc (any values; nearest available T_Y is used).")
-    ap.add_argument("--scale-factor", type=float, default=1.0,
-                    help="Multiply the computed GLOBAL_NBEAMS by this factor (default 1.0). Use <1 to shrink, >1 to enlarge.")
     ap.add_argument("--fov-arcmin", type=float, default=50.0,
                     help="Square FOV (arcmin) for the formatted column; crop is on RAW grid.")
     ap.add_argument("--only-offsets", action="store_true",
@@ -598,17 +552,13 @@ def main():
                     help="Comma-separated source names to include exclusively.")
     ap.add_argument("--save-fits", action="store_true", default=True,
                     help="Also write formatted RAW/RT/T_X FITS for each montage.")
-    ap.add_argument("--fits-out", type=Path, default=Path("/users/mbredber/scratch/create_image_sets_outputs/processed_psz2_fits"),
+    ap.add_argument("--fits-out", type=Path, default=Path("/users/mbredber/scratch/data/PSZ2/create_image_sets_outputs/processed_psz2_fits"),
                     help="Directory for formatted FITS (defaults to the montage folder).")
+
     args = ap.parse_args()
     
     # store it in a global so make_montage can read it
-    nmin, min_fov_arcmin, min_fov_path = compute_global_nbeams_min(args.root)
-    # apply optional global scale factor to the n_beams target (keeps behaviour compatible)
-    make_montage.GLOBAL_NBEAMS = (nmin * args.scale_factor) if (nmin is not None) else None
-    # smallest available angular half-side across dataset (arcmin) — crop must not exceed this
-    make_montage.GLOBAL_MIN_FOV_ARCMIN = min_fov_arcmin
-    make_montage.GLOBAL_MIN_FOV_SOURCE = min_fov_path
+    make_montage.GLOBAL_NBEAMS = compute_global_nbeams_min(args.root) * 1.85 # Larger factor than 1.85 makes PSZ2G048.10+57.16 too small
 
     scales = [s.strip() for s in args.scales.split(",") if s.strip()]
     only_names = set(s.strip() for s in args.only.split(",") if s.strip())
@@ -629,14 +579,14 @@ def main():
                 continue
             try:
                 t_label = f"T{int(y_chosen) if float(y_chosen).is_integer() else y_chosen}kpc"
-                out_png = args.out / f"{name}_montage_{rt_label}_{t_label}_{args.scale_factor}.png"
-                make_montage(name, raw_path, t_path, rt_label, t_label, # Create images with same n_beams
+                out_png = args.out / f"{name}_montage_{rt_label}_{t_label}_old.png"
+                make_montage(name, raw_path, t_path, rt_label, t_label,
+                            crop_size=args.crop,
                             downsample_size=args.down,
                             out_png=out_png,
                             save_fits=args.save_fits,
                             out_fits_dir=args.fits_out,
-                            fov_arcmin=args.fov_arcmin,
-                            scale_factor=args.scale_factor) 
+                            fov_arcmin=args.fov_arcmin)
                 #print(f"[OK] {name} {rt_label} using {t_label} → {out_png}")
                 n_ok += 1
             except Exception as e:

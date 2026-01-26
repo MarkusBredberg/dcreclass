@@ -8,7 +8,7 @@ from astropy.cosmology import Planck18 as COSMO
 import astropy.units as u
 import matplotlib as mpl
 import matplotlib
-matplotlib.use('QtAgg')   # GUI backend needed for live updates
+matplotlib.use('Agg')   # Non-interactive backend for servers
 import matplotlib.pyplot as plt
 
 try:
@@ -541,8 +541,8 @@ def get_beam_info(raw_fits, T50_fits=None, out_pdf="one_source_quicklook_with_re
 if __name__ == "__main__":
     
     # Configuration
-    ROOT = "/home/markusbredberg/Scripts/data/PSZ2/fits"
-    Z_CSV = "/home/markusbredberg/Scripts/data/PSZ2/cluster_source_data.csv"
+    ROOT = "/users/mbredber/scratch/data/PSZ2/fits"
+    Z_CSV = "/users/mbredber/scratch/data/PSZ2/cluster_source_data.csv"
     slug_to_z = load_z_table(Z_CSV)
     pairs = pick_random_pairs(ROOT, n=10**6, seed=42)  # effectively "all"
     y_axis = "omega_tgt_circ"  # (ΔΩ): (Ω_rt_cheat) / (Ω_tgt_raw)
@@ -551,7 +551,7 @@ if __name__ == "__main__":
 
     
     # ---- interactive figure (shows after first point) ----
-    plt.ion()
+    #plt.ion()
     fig = plt.figure(figsize=(6.6, 5.2), dpi=130)
     gs = fig.add_gridspec(2, 3, width_ratios=[4, 1, 0.15], height_ratios=[1, 4], wspace=0.05, hspace=0.05)
     ax       = fig.add_subplot(gs[1, 0])                 # main scatter (bottom-left)
@@ -766,7 +766,7 @@ if __name__ == "__main__":
             
         #ax.set_title(f"Beam-area scaling vs. redshift  (N={len(X)})")
         fig.canvas.draw_idle()
-        plt.pause(0.01)  # GUI heartbeat
+        #plt.pause(0.01)  # GUI heartbeat
 
 
     # ---- process all sources, updating the plot each time ----
@@ -790,7 +790,7 @@ if __name__ == "__main__":
         if i % UPDATE_EVERY == 0:
             _update_plot()
 
-    plt.ioff()
+    #plt.ioff()
     _update_plot()
     plt.tight_layout()
     out = "omega_circ_over_omega_T50_vs_z_live.png"
