@@ -1,17 +1,24 @@
 import numpy as np, pickle, torch, os, itertools
 from sklearn.metrics import confusion_matrix, roc_curve, auc
 from sklearn.preprocessing import label_binarize
-from utils.data_loader import get_classes
+from utils.data_loader import get_classes, load_galaxies
 from collections import defaultdict
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 import seaborn as sns
+import torch.nn.functional as F
+from torch.utils.data import TensorDataset, DataLoader
+
+# Import your classifiers
+from utils.classifiers import CNN, ScatterNet, DualCNNSqueezeNet, DualScatterSqueezeNet
+from utils.calc_tools import fold_T_axis, custom_collate
 
 # Create output directories
 os.makedirs('./classifier/trained_models', exist_ok=True)
 os.makedirs('./classifier/trained_models_filtered', exist_ok=True)
+os.makedirs('./classifier/attention_maps', exist_ok=True)
 
-print("Running evaluation script 4.2")
+print("Running enhanced evaluation script 2.0 with attention visualization")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Set random seeds for reproducibility
@@ -23,27 +30,31 @@ np.random.seed(seed)
 ################ CONFIGURATION ################
 ###############################################
 
-# IMPORTANT: These must match your 4.1 training configuration
-FILTERED = True       # Evaluation with filtered data (REMOVEOUTLIERS = True)
-USE_GLOBAL_NORMALISATION = False          # single on/off switch . False - image-by-image normalisation 
+FILTERED = True       
+USE_GLOBAL_NORMALISATION = False # False for per-image norm
 GLOBAL_NORM_MODE = "percentile"
-ADJUST_POSITIVE_CLASS = True  # Whether to relabel classes so that DE is positive class
+ADJUST_POSITIVE_CLASS = True
+GENERATE_ATTENTION_MAPS = True  # Toggle attention map generation
 
 classes = get_classes()
-galaxy_classes = [50, 51]  # Must match training: e.g., [50, 51] for your binary classification
-learning_rates = [5e-5]    # Must match training lr
-regularization_params = [1e-1]  # Must match training reg
-num_experiments = 3   # Must match training num_experiments
-percentile_lo, percentile_hi = 30, 99  # Must match training percentiles
-folds = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]  # Must match training folds (0-9 for 10-fold CV)
+galaxy_classes = [50, 51]
+learning_rates = [5e-5]
+regularization_params = [1e-1]
+num_experiments = 3
+percentile_lo, percentile_hi = 30, 99
+folds = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 classifier = ["CNN",         # 0.Very Simple CNN
               "ScatterNet",  # 1.Scattering coefficients as input to MLP
               "DualCSN",     # 2.Dual input CNN with scattering coefficients as one input branch and Squeeze-and-Excitation blocks
               "DualSSN"      # 3.Dual input CNN with scattering coefficients as one input branch and Squeeze-and-Excitation blocks
               ][3]
-crop_size = (512, 512)  # Must match training crop size
-downsample_size = (128, 128)  # Must match training downsample size
-version = 'RAW+RT25kpc+RT50kpc+RT100kpc'  # Must match training version
+crop_size = (512, 512)
+downsample_size = (128, 128)
+version = 'T25kpc'
+J, L, order = 2, 12, 2
+
+# NEW: Attention visualization settings
+ATTENTION_METHODS = ['saliency', 'gradcam', 'integrated_gradients']  # Methods to use
 
 # Define colormap for visualization
 cmap_green = LinearSegmentedColormap.from_list( 
@@ -52,80 +63,618 @@ cmap_green = LinearSegmentedColormap.from_list(
 )
 
 ###############################################
-######### SETTING THE RIGHT PARAMETERS ########
+######### ATTENTION VISUALIZATION #############
 ###############################################
 
-directory = './classifier/trained_models_filtered/' if FILTERED else './classifier/trained_models/'
+class AttentionVisualizer:
+    """
+    Class to generate various attention/saliency visualizations for trained models.
+    """
+    
+    def __init__(self, model, device='cuda'):
+        """
+        Initialize the attention visualizer.
+        
+        Args:
+            model: Trained PyTorch model
+            device: Device to run computations on
+        """
+        self.model = model
+        self.device = device
+        self.model.eval()
+        
+        # Storage for intermediate activations (needed for Grad-CAM)
+        self.activations = []
+        self.gradients = []
+        
+    def _register_hooks(self):
+        """
+        Register forward and backward hooks to capture activations and gradients.
+        This is needed for Grad-CAM.
+        """
+        def forward_hook(module, input, output):
+            self.activations.append(output.detach())
+        
+        def backward_hook(module, grad_input, grad_output):
+            self.gradients.append(grad_output[0].detach())
+        
+        # Register hooks on the last convolutional layer
+        # This varies by architecture - adjust as needed
+        target_layer = None
+        
+        # Find the last Conv2d layer in the model
+        for name, module in self.model.named_modules():
+            if isinstance(module, torch.nn.Conv2d):
+                target_layer = module
+        
+        if target_layer is not None:
+            target_layer.register_forward_hook(forward_hook)
+            target_layer.register_full_backward_hook(backward_hook)
+            return True
+        return False
+    
+    # Around line 125: Modify generate_saliency_map
+    def generate_saliency_map(self, image, scat, target_class, branch='image'):
+        """
+        Generate saliency map for specified branch.
+        
+        Args:
+            branch: 'image' or 'scattering' - which input to compute gradients for
+        """
+        # Enable gradient computation for specified input
+        if branch == 'image':
+            image.requires_grad = True
+            target_input = image
+        elif branch == 'scattering':
+            if scat is None:
+                return None  # No scattering branch
+            scat.requires_grad = True
+            target_input = scat
+        else:
+            return None
+        
+        # Forward pass
+        if scat is not None:
+            output = self.model(image, scat)
+        else:
+            output = self.model(image)
+        
+        # Handle different output shapes
+        if output.ndim > 2:
+            output = F.adaptive_avg_pool2d(output, (1, 1)).squeeze()
+        if output.ndim == 1:
+            output = output.unsqueeze(0)
+        
+        # Get score for target class
+        score = output[0, target_class]
+        
+        # Backward pass
+        self.model.zero_grad()
+        score.backward()
+        
+        # Get gradients with respect to target input
+        gradients = target_input.grad.data.abs()
+        
+        # Aggregate across channels
+        saliency = gradients.squeeze().cpu().numpy()
+        if saliency.ndim > 2:
+            saliency = np.max(saliency, axis=0)
+        elif saliency.ndim == 1:
+            # Scattering coefficients are 1D, visualize as bar chart or heatmap
+            # For simplicity, reshape to 2D square
+            size = int(np.ceil(np.sqrt(len(saliency))))
+            padded = np.zeros(size * size)
+            padded[:len(saliency)] = saliency
+            saliency = padded.reshape(size, size)
+        
+        # Normalize to [0, 1]
+        saliency = (saliency - saliency.min()) / (saliency.max() - saliency.min() + 1e-8)
+        
+        return saliency
+    
+    def generate_gradcam(self, image, scat, target_class, branch='image'):
+        """
+        Generate Grad-CAM (Gradient-weighted Class Activation Mapping) for specified branch.
+        Shows which spatial regions are important for the prediction.
+        
+        Args:
+            image: Input image tensor [1, C, H, W]
+            scat: Scattering coefficients (can be None)
+            target_class: Target class index
+            branch: 'image' or 'scattering' - which input to analyze
+            
+        Returns:
+            cam: Class activation map [H, W]
+        """
+        # Check if branch is valid
+        if branch == 'scattering' and scat is None:
+            return None
+        
+        # Clear previous activations and gradients
+        self.activations = []
+        self.gradients = []
+        
+        # Register hooks
+        hooks_registered = self._register_hooks()
+        if not hooks_registered:
+            print("Warning: Could not find Conv2d layer for Grad-CAM")
+            return None
+        
+        # Forward pass
+        if scat is not None:
+            output = self.model(image, scat)
+        else:
+            output = self.model(image)
+        
+        # Handle different output shapes
+        if output.ndim > 2:
+            output = F.adaptive_avg_pool2d(output, (1, 1)).squeeze()
+        if output.ndim == 1:
+            output = output.unsqueeze(0)
+        
+        # Get score for target class
+        score = output[0, target_class]
+        
+        # Backward pass
+        self.model.zero_grad()
+        score.backward()
+        
+        # Check if we captured activations and gradients
+        if not self.activations or not self.gradients:
+            print("Warning: No activations or gradients captured")
+            return None
+        
+        # Get the last activation and gradient
+        activation = self.activations[-1]  # [1, C, H', W']
+        gradient = self.gradients[-1]      # [1, C, H', W']
+        
+        # Global average pooling of gradients
+        weights = gradient.mean(dim=(2, 3), keepdim=True)  # [1, C, 1, 1]
+        
+        # Weighted combination of activation maps
+        cam = (weights * activation).sum(dim=1, keepdim=True)  # [1, 1, H', W']
+        
+        # Apply ReLU (only positive contributions)
+        cam = F.relu(cam)
+        
+        # Determine target size for upsampling based on branch
+        if branch == 'image':
+            target_size = image.shape[-2:]
+        elif branch == 'scattering':
+            # For scattering coefficients, create a square visualization
+            # Map to image space for visualization
+            target_size = image.shape[-2:]
+        else:
+            target_size = image.shape[-2:]
+        
+        # Upsample to target size
+        cam = F.interpolate(cam, size=target_size, mode='bilinear', align_corners=False)
+        
+        # Convert to numpy and normalize
+        cam = cam.squeeze().cpu().numpy()
+        cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+        
+        return cam
 
-# Define dataset sizes for each fold (this should match what 4.1 actually used)
-if galaxy_classes == [50, 51]:
-    # For 10-fold CV, each fold should have approximately the same size
-    dataset_sizes = {fold: [3000] for fold in range(10)} # 3000 for prefer processed=True
-elif galaxy_classes == [52, 53]:  # RH vs RR
-    dataset_sizes = {fold: [2, 16, 168] for fold in range(10)}
-else:
-    print("Please specify the dataset sizes for the given galaxy classes.")
-    exit(1)
+    def generate_integrated_gradients(self, image, scat, target_class, branch='image', steps=50):
+        """
+        Generate Integrated Gradients attribution map for specified branch.
+        More robust than vanilla saliency by averaging gradients along a path.
+        
+        Args:
+            image: Input image tensor [1, C, H, W]
+            scat: Scattering coefficients (can be None)
+            target_class: Target class index
+            branch: 'image' or 'scattering' - which input to analyze
+            steps: Number of interpolation steps
+            
+        Returns:
+            attribution: Attribution map [H, W]
+        """
+        # Check if branch is valid
+        if branch == 'scattering' and scat is None:
+            return None
+        
+        # Create baselines (zeros)
+        baseline_image = torch.zeros_like(image)
+        baseline_scat = torch.zeros_like(scat) if scat is not None else None
+        
+        # Generate interpolated inputs
+        alphas = torch.linspace(0, 1, steps).to(self.device)
+        
+        integrated_grads_image = None
+        integrated_grads_scat = None
+        
+        for alpha in alphas:
+            # Interpolate between baseline and input
+            interpolated_image = (baseline_image + alpha * (image - baseline_image)).clone().detach()
+            interpolated_image.requires_grad = True
 
-largest_sz = max([sz for sizes in dataset_sizes.values() for sz in sizes])
+            if scat is not None:
+                interpolated_scat = (baseline_scat + alpha * (scat - baseline_scat)).clone().detach()
+                interpolated_scat.requires_grad = True
+            else:
+                interpolated_scat = None
+            
+            # Forward pass
+            if interpolated_scat is not None:
+                output = self.model(interpolated_image, interpolated_scat)
+            else:
+                output = self.model(interpolated_image)
+            
+            # Handle output shapes
+            if output.ndim > 2:
+                output = F.adaptive_avg_pool2d(output, (1, 1)).squeeze()
+            if output.ndim == 1:
+                output = output.unsqueeze(0)
+            
+            # Get score for target class
+            score = output[0, target_class]
+            
+            # Backward pass
+            self.model.zero_grad()
+            score.backward()
+            
+            # Accumulate gradients for the specified branch
+            if branch == 'image':
+                grads = interpolated_image.grad.data
+                if integrated_grads_image is None:
+                    integrated_grads_image = grads
+                else:
+                    integrated_grads_image += grads
+            elif branch == 'scattering':
+                if interpolated_scat is not None:
+                    grads = interpolated_scat.grad.data
+                    if integrated_grads_scat is None:
+                        integrated_grads_scat = grads
+                    else:
+                        integrated_grads_scat += grads
+        
+        # Select the appropriate gradients based on branch
+        if branch == 'image':
+            integrated_grads = integrated_grads_image
+            input_tensor = image
+            baseline = baseline_image
+        elif branch == 'scattering':
+            integrated_grads = integrated_grads_scat
+            input_tensor = scat
+            baseline = baseline_scat
+        else:
+            return None
+        
+        if integrated_grads is None:
+            return None
+        
+        # Average the gradients
+        integrated_grads /= steps
+        
+        # Multiply by (input - baseline)
+        attribution = (input_tensor - baseline) * integrated_grads
+        
+        # Aggregate across channels
+        attribution = attribution.squeeze().detach().cpu().numpy()
+        if attribution.ndim > 2:
+            attribution = np.sum(np.abs(attribution), axis=0)
+        elif attribution.ndim == 1:
+            # Scattering coefficients are 1D, reshape to 2D for visualization
+            size = int(np.ceil(np.sqrt(len(attribution))))
+            padded = np.zeros(size * size)
+            padded[:len(attribution)] = attribution
+            attribution = padded.reshape(size, size)
+        
+        # Normalize
+        attribution = (attribution - attribution.min()) / (attribution.max() - attribution.min() + 1e-8)
+        
+        return attribution
+    
+    def visualize_attention(self, image, scat, true_label, pred_label, pred_label_idx,
+                        source_name=None,
+                        methods=['saliency', 'gradcam', 'integrated_gradients'],
+                        save_path=None):
+        """
+        Generate and visualize multiple attention maps for a single example.
+        
+        Args:
+            image: Input image tensor [1, C, H, W]
+            scat: Scattering coefficients (can be None)
+            true_label: Ground truth class (original label like 50/51) - for display
+            pred_label: Predicted class (original label like 50/51) - for display
+            pred_label_idx: Predicted class index (0 or 1) - for model operations
+            source_name: Optional source name to display
+            methods: List of methods to use
+            save_path: Path to save the visualization
+        """
+        # Prepare the original image for display
+        img_display = image.squeeze().cpu().numpy()
+        if img_display.ndim > 2:
+            img_display = img_display[0]
+        
+        # Number of subplots needed
+        n_methods = len(methods)
+        fig, axes = plt.subplots(1, n_methods + 1, figsize=(4 * (n_methods + 1), 4))  # 4x4 per subplot
+        
+        # Plot original image
+        title_text = f'Original\nTrue: {true_label}\nPred: {pred_label}'
+        if source_name:
+            title_text = f'{source_name}\n' + title_text
+        axes[0].imshow(img_display, cmap='gray')
+        axes[0].set_title(title_text, fontsize=10)  # Smaller font for more text
+        axes[0].axis('off')
+        
+        # Generate and plot each attention map
+        for idx, method in enumerate(methods, 1):
+            if method == 'saliency':
+                attention_map = self.generate_saliency_map(image, scat, pred_label_idx)  # USE INDEX
+                title = 'Saliency Map'
+            elif method == 'gradcam':
+                attention_map = self.generate_gradcam(image, scat, pred_label_idx)  # USE INDEX
+                title = 'Grad-CAM'
+            elif method == 'integrated_gradients':
+                attention_map = self.generate_integrated_gradients(image, scat, pred_label_idx)  # USE INDEX
+                title = 'Integrated Gradients'
+            else:
+                continue
+            
+            if attention_map is None:
+                axes[idx].text(0.5, 0.5, f'{method}\nNot Available', 
+                             ha='center', va='center', fontsize=12)
+                axes[idx].axis('off')
+                continue
+            
+            # Overlay attention map on original image
+            axes[idx].imshow(img_display, cmap='gray', alpha=0.6)
+            im = axes[idx].imshow(attention_map, cmap='jet', alpha=0.4)
+            axes[idx].set_title(title, fontsize=12)
+            axes[idx].axis('off')
+            
+            # Add colorbar
+            plt.colorbar(im, ax=axes[idx], fraction=0.046, pad=0.04)
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"Saved attention visualization to {save_path}")
+        
+        plt.close(fig)
 
-############################################################
-################# MERGE MAP GENERATION #####################
-############################################################
 
-# This creates a mapping to group similar dataset sizes together for plotting
-merge_map = {}
-all_sizes = {s for fs in dataset_sizes.values() for s in fs}
-for size in all_sizes:
-    nd = len(str(size))
-    factor = 10 ** max(nd - 2, 0)
-    new_rep = int(round(size / factor) * factor)
-    merge_map[size] = str(new_rep)
+def generate_attention_visualizations(model, test_loader, galaxy_classes, source_names,
+                                      save_dir='./classifier/attention_maps',
+                                      methods=None, classifier_name=classifier):
+    """
+    Generate attention visualizations for test samples.
+    For multi-branch models (DualSSN, DualCSN), shows attention from both branches.
+    """
+    if methods is None:
+        methods = ['saliency', 'gradcam', 'integrated_gradients']
+    
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Detect multi-branch architecture
+    is_multi_branch = classifier_name in ['DualSSN', 'DualCSN']
+    sources_per_class = 3 if is_multi_branch else 6
+    
+    print(f"Classifier: {classifier_name}")
+    print(f"Multi-branch: {is_multi_branch}")
+    print(f"Will collect {sources_per_class} sources per class")
+    
+    # Initialize visualizer
+    visualizer = AttentionVisualizer(model, device=device)
+    
+    # Storage for examples from each class
+    class_examples = {cls: {'images': [], 'scats': [], 'true_labels': [], 
+                            'pred_labels': [], 'probs': [], 'indices': [], 'source_names': []} 
+                    for cls in galaxy_classes}
 
-print("merge_map =", merge_map)
+    # Collect examples
+    print("Collecting test examples for attention visualization...")
+    model.eval()
+    sample_idx_global = 0
+    with torch.no_grad():
+        for images, scat, labels in test_loader:
+            images = images.to(device)
+            scat = scat.to(device) if scat is not None else None
+            labels = labels.to(device)
+            
+            # Get predictions
+            if scat is not None:
+                outputs = model(images, scat)
+            else:
+                outputs = model(images)
+            
+            # Handle output shapes
+            if outputs.ndim > 2:
+                outputs = F.adaptive_avg_pool2d(outputs, (1, 1)).squeeze()
+            if outputs.ndim == 1:
+                outputs = outputs.unsqueeze(0)
+            
+            probs = F.softmax(outputs, dim=1)
+            preds = probs.argmax(dim=1)
+            
+            # Store examples for each class
+            for i in range(len(labels)):
+                true_label = int(labels[i].item())
+                pred_label = int(preds[i].item())
+                
+                if len(class_examples[true_label]['images']) < sources_per_class:
+                    class_examples[true_label]['images'].append(images[i:i+1].clone())
+                    class_examples[true_label]['scats'].append(
+                        scat[i:i+1].clone() if scat is not None else None)
+                    class_examples[true_label]['true_labels'].append(true_label)
+                    class_examples[true_label]['pred_labels'].append(pred_label)
+                    class_examples[true_label]['probs'].append(probs[i].cpu().numpy())
+                    class_examples[true_label]['indices'].append(sample_idx_global + i)
+                    class_examples[true_label]['source_names'].append(
+                        source_names[sample_idx_global + i] if sample_idx_global + i < len(source_names) else f"Test_{sample_idx_global + i}")
+            
+            sample_idx_global += len(labels)
+            
+            # Check if we have enough examples
+            if all(len(v['images']) >= sources_per_class for v in class_examples.values()):
+                break
+    
+    # Generate visualizations
+    print(f"Generating attention maps using methods: {methods}")
 
-all_cluster_metrics = {
-    'errors': [],
-    'distances': [],
-    'std_devs': []
-}
+    # Group samples by (true_label, pred_label) pairs
+    class_pred_groups = defaultdict(lambda: {'images': [], 'scats': [], 'source_names': [], 
+                                             'pred_idx': [], 'true_labels': []})
+
+    for class_idx, examples in class_examples.items():
+        for sample_idx in range(len(examples['images'])):
+            pred_label_idx = examples['pred_labels'][sample_idx]
+            pred_label = galaxy_classes[pred_label_idx]
+            
+            key = (class_idx, pred_label)
+            class_pred_groups[key]['images'].append(examples['images'][sample_idx])
+            class_pred_groups[key]['scats'].append(examples['scats'][sample_idx])
+            class_pred_groups[key]['source_names'].append(examples['source_names'][sample_idx])
+            class_pred_groups[key]['pred_idx'].append(pred_label_idx)
+            class_pred_groups[key]['true_labels'].append(class_idx)
+
+    # Create one figure per (true, pred) combination
+    for (true_label, pred_label), group_data in class_pred_groups.items():
+        if len(group_data['images']) == 0:
+            continue
+        
+        n_sources = len(group_data['images'])
+        n_methods = len(methods)
+        
+        # Calculate total rows: sources × branches
+        if is_multi_branch:
+            n_rows = n_sources * 2  # Each source gets 2 rows (image branch + scat branch)
+        else:
+            n_rows = n_sources  # Each source gets 1 row
+        
+        print(f"\nProcessing true={true_label}, pred={pred_label}")
+        print(f"  Sources: {n_sources}, Total rows: {n_rows}")
+        
+        # Create figure
+        fig, axes = plt.subplots(n_rows, n_methods + 1, 
+                                figsize=(4 * (n_methods + 1), 4 * n_rows))
+        
+        # Handle single row case
+        if n_rows == 1:
+            axes = axes.reshape(1, -1)
+        
+        # Process each source
+        row_idx = 0
+        for source_idx in range(n_sources):
+            image = group_data['images'][source_idx]
+            scat_coeff = group_data['scats'][source_idx]
+            pred_label_idx = group_data['pred_idx'][source_idx]
+            true_label_val = group_data['true_labels'][source_idx]
+            source_name = group_data['source_names'][source_idx]
+            
+            # Extract PSZ2 name
+            psz2_name = source_name.split('/')[-1].replace('.fits', '') if '/' in source_name else source_name
+            
+            # Prepare image for display
+            img_display = image.squeeze().cpu().numpy()
+            if img_display.ndim > 2:
+                img_display = img_display[0]
+            
+            # Branch configurations
+            if is_multi_branch:
+                branches = [
+                    ('image', 'Image Branch'),
+                    ('scattering', 'Scattering Branch')
+                ]
+            else:
+                branches = [('image', '')]
+            
+            # Generate rows for each branch
+            for branch_type, branch_label in branches:
+                # Plot original image
+                axes[row_idx, 0].imshow(img_display, cmap='gray')
+                axes[row_idx, 0].set_title('Original' if row_idx == 0 else '', fontsize=12)
+                axes[row_idx, 0].axis('off')
+
+                # Y-axis label with source info
+                label_parts = [psz2_name, f"True:{true_label_val}", f"Pred:{galaxy_classes[pred_label_idx]}"]
+                if is_multi_branch:
+                    label_parts.append(f"[{branch_label}]")
+                
+                y_label = '\n'.join(label_parts)
+                fig.text(0.01, 1 - (row_idx + 0.5) / n_rows, y_label, 
+                        fontsize=7, va='center', ha='left', 
+                        transform=fig.transFigure, rotation=0)
+                
+                # Generate and plot attention maps for this branch
+                for method_idx, method in enumerate(methods, 1):
+                    if method == 'saliency':
+                        attention_map = visualizer.generate_saliency_map(
+                            image, scat_coeff, pred_label_idx, branch=branch_type)
+                        title = 'Saliency Map' if row_idx == 0 else ''
+                    elif method == 'gradcam':
+                        attention_map = visualizer.generate_gradcam(
+                            image, scat_coeff, pred_label_idx, branch=branch_type)
+                        title = 'Grad-CAM' if row_idx == 0 else ''
+                    elif method == 'integrated_gradients':
+                        attention_map = visualizer.generate_integrated_gradients(
+                            image, scat_coeff, pred_label_idx, branch=branch_type)
+                        title = 'Integrated Gradients' if row_idx == 0 else ''
+                    else:
+                        continue
+                    
+                    if attention_map is None:
+                        axes[row_idx, method_idx].text(0.5, 0.5, f'{method}\nNot Available',
+                                                    ha='center', va='center', fontsize=10)
+                        axes[row_idx, method_idx].axis('off')
+                        continue
+                    
+                    # Overlay attention map
+                    axes[row_idx, method_idx].imshow(img_display, cmap='gray', alpha=0.6)
+                    im = axes[row_idx, method_idx].imshow(attention_map, cmap='jet', alpha=0.4)
+                    axes[row_idx, method_idx].set_title(title, fontsize=12)
+                    axes[row_idx, method_idx].axis('off')
+                    
+                    # Add colorbar only on first row
+                    if row_idx == 0:
+                        plt.colorbar(im, ax=axes[row_idx, method_idx], 
+                                fraction=0.046, pad=0.04)
+                
+                row_idx += 1
+        
+        # Add overall title with classifier name
+        fig.suptitle(f'{classifier_name} — True: {true_label}, Predicted: {pred_label}', 
+                    fontsize=16, y=0.995)
+        
+        plt.tight_layout(rect=[0.12, 0, 1, 0.99])  # More left margin for longer labels
+        
+        # Save as PNG
+        save_path = os.path.join(save_dir, f"attention_maps.png")
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Saved grid visualization to {save_path}")
+        plt.close(fig)
+
+    print(f"\nAttention visualizations saved to {save_dir}")
+
 
 ###############################################
-############# READ IN PICKLE DUMP #############
+############# HELPER FUNCTIONS ################
 ###############################################
 
 from math import log10, floor
 def round_to_1(x):
     return round(x, -int(floor(log10(abs(x)))))
 
-# If the positive class was mislabeled, recalculate metrics
-if ADJUST_POSITIVE_CLASS:
-    def recalculate_metrics_with_correct_positive_class(y_true, y_pred, pos_label=0):
-        """
-        Recalculate precision, recall, and F1 with the correct positive class.
-        
-        Args:
-            y_true: True labels (0 or 1 after relabeling)
-            y_pred: Predicted labels (0 or 1 after relabeling)
-            pos_label: Which label to treat as positive (0 for DE, 1 for NDE)
-        
-        Returns:
-            accuracy, precision, recall, f1_score
-        """
-        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-        
-        # Accuracy is unaffected by which class is positive
-        acc = accuracy_score(y_true, y_pred)
-        
-        # Recalculate with correct positive label
-        precision = precision_score(y_true, y_pred, average='binary', pos_label=pos_label, zero_division=0)
-        recall = recall_score(y_true, y_pred, average='binary', pos_label=pos_label, zero_division=0)
-        f1 = f1_score(y_true, y_pred, average='binary', pos_label=pos_label, zero_division=0)
-        
-        return acc, precision, recall, f1
+def recalculate_metrics_with_correct_positive_class(y_true, y_pred, pos_label=0):
+    """
+    Recalculate precision, recall, and F1 with the correct positive class.
+    """
+    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+    
+    acc = accuracy_score(y_true, y_pred)
+    precision = precision_score(y_true, y_pred, average='binary', pos_label=pos_label, zero_division=0)
+    recall = recall_score(y_true, y_pred, average='binary', pos_label=pos_label, zero_division=0)
+    f1 = f1_score(y_true, y_pred, average='binary', pos_label=pos_label, zero_division=0)
+    
+    return acc, precision, recall, f1
 
 def initialize_metrics(metrics, subset_size, fold, experiment, lr, reg):
-    """Initialize metric storage dictionaries for a given experiment configuration"""
+    """Initialize metric storage dictionaries"""
     subset_size_str = str(subset_size[0]) if isinstance(subset_size, list) else str(subset_size)
     metrics[f"accuracy_{subset_size_str}_{fold}_{experiment}_{lr}_{reg}"] = []
     metrics[f"precision_{subset_size_str}_{fold}_{experiment}_{lr}_{reg}"] = []
@@ -140,7 +689,7 @@ def initialize_metrics(metrics, subset_size, fold, experiment, lr, reg):
 def update_metrics(metrics, subset_size, fold, experiment, lr, reg,
                    accuracy, precision, recall, f1,
                    history_val, all_true_labels, all_pred_labels, training_times, all_pred_probs):
-    """Update metrics dictionaries with values from a single experiment"""
+    """Update metrics dictionaries"""
     subset_size_str = str(subset_size)
     metrics[f"accuracy_{subset_size_str}_{fold}_{experiment}_{lr}_{reg}"].append(accuracy)
     metrics[f"precision_{subset_size_str}_{fold}_{experiment}_{lr}_{reg}"].append(precision)
@@ -152,19 +701,54 @@ def update_metrics(metrics, subset_size, fold, experiment, lr, reg,
     metrics[f"training_times_{subset_size_str}_{fold}_{experiment}_{lr}_{reg}"].append(training_times)
     metrics[f"all_pred_probs_{subset_size_str}_{fold}_{experiment}_{lr}_{reg}"].append(all_pred_probs)
 
-# Initialize storage for aggregated metrics
+
+###############################################
+######### SETTING THE RIGHT PARAMETERS ########
+###############################################
+
+directory = './classifier/trained_models_filtered/' if FILTERED else './classifier/trained_models/'
+
+# Define dataset sizes (must match training)
+if galaxy_classes == [50, 51]:
+    dataset_sizes = {fold: [3000] for fold in range(10)}
+elif galaxy_classes == [52, 53]:
+    dataset_sizes = {fold: [2, 16, 168] for fold in range(10)}
+else:
+    print("Please specify the dataset sizes for the given galaxy classes.")
+    exit(1)
+
+largest_sz = max([sz for sizes in dataset_sizes.values() for sz in sizes])
+
+# Merge map generation
+merge_map = {}
+all_sizes = {s for fs in dataset_sizes.values() for s in fs}
+for size in all_sizes:
+    nd = len(str(size))
+    factor = 10 ** max(nd - 2, 0)
+    new_rep = int(round(size / factor) * factor)
+    merge_map[size] = str(new_rep)
+
+all_cluster_metrics = {
+    'errors': [],
+    'distances': [],
+    'std_devs': []
+}
+
+###############################################
+############# READ IN PICKLE DATA #############
+###############################################
+
 tot_metrics = {}
 
 print("Loading metrics from pickle files...")
 loaded_count = 0
 failed_count = 0
 
-# Iterate over all experiment configurations to load saved metrics
+# Load all saved metrics
 for lr, reg, experiment, fold in itertools.product(
     learning_rates, regularization_params, range(num_experiments), folds
 ):
     for subset_size in dataset_sizes[fold]:
-        # Construct the file path
         cs = f"{crop_size[0]}x{crop_size[1]}"
         ds = f"{downsample_size[0]}x{downsample_size[1]}"
         if USE_GLOBAL_NORMALISATION:
@@ -176,7 +760,6 @@ for lr, reg, experiment, fold in itertools.product(
             with open(metrics_read_path, 'rb') as f:
                 data = pickle.load(f)
             
-            # Extract loaded data
             loaded_metrics = data["metrics"]
             history = data["history"]
             all_true_labels_dict = data["all_true_labels"]
@@ -184,7 +767,6 @@ for lr, reg, experiment, fold in itertools.product(
             all_pred_probs_dict = data["all_pred_probs"]
             training_times_dict = data["training_times"]
             
-            # *** ADD THIS: Extract cluster metrics ***
             if data.get("cluster_error") is not None:
                 all_cluster_metrics['errors'].append(data["cluster_error"])
             if data.get("cluster_distance") is not None:
@@ -192,44 +774,33 @@ for lr, reg, experiment, fold in itertools.product(
             if data.get("cluster_std_dev") is not None:
                 all_cluster_metrics['std_devs'].append(data["cluster_std_dev"])
             
-            
-            # Initialize storage for this experiment configuration
             initialize_metrics(tot_metrics, subset_size, fold, experiment, lr, reg)
             
-            # Build the key (should match what's in the dictionaries)
             base = f"cl{classifier}_ss{subset_size}_f{fold}_lr{lr}_reg{reg}_ls0.1_cs{cs}_ds{ds}_pl{percentile_lo}_ph{percentile_hi}_ver{version}"
             
-            # Get metrics directly (they're already aggregated in the file)
             acc = loaded_metrics.get("accuracy", [])
             prec = loaded_metrics.get("precision", [])
             rec = loaded_metrics.get("recall", [])
             f1 = loaded_metrics.get("f1_score", [])
             
-            # Get labels
             y_true = all_true_labels_dict.get(base, [])
             y_pred = all_pred_labels_dict.get(base, [])
             y_probs = all_pred_probs_dict.get(base, [])
             
             if not y_true or not y_pred:
-                print(f"Warning: No labels found for {base}")
                 failed_count += 1
                 continue
             
-            # RECALCULATE METRICS WITH CORRECT POSITIVE LABEL
             if ADJUST_POSITIVE_CLASS:
-                # pos_label=0 means DE (class 50, which becomes 0 after relabeling) is positive
                 acc_val, prec_val, rec_val, f1_val = recalculate_metrics_with_correct_positive_class(
                     y_true, y_pred, pos_label=0
                 )
-            
             else:
-                # Use the first values (since they're already calculated)
                 acc_val = acc[0] if isinstance(acc, list) and acc else 0.0
                 prec_val = prec[0] if isinstance(prec, list) and prec else 0.0
                 rec_val = rec[0] if isinstance(rec, list) and rec else 0.0
                 f1_val = f1[0] if isinstance(f1, list) and f1 else 0.0
             
-            # Update the aggregated metrics
             update_metrics(
                 tot_metrics, subset_size, fold, experiment, lr, reg,
                 acc_val, prec_val, rec_val, f1_val,
@@ -245,7 +816,6 @@ for lr, reg, experiment, fold in itertools.product(
             print(f"Metrics file not found at {metrics_read_path}")
             failed_count += 1
             continue
-        
         except Exception as e:
             print(f"Error loading {metrics_read_path}: {e}")
             failed_count += 1
@@ -253,6 +823,7 @@ for lr, reg, experiment, fold in itertools.product(
 
 print(f"Done loading. Successfully loaded: {loaded_count}, Failed: {failed_count}")
 metrics = tot_metrics
+
 
 ###############################################
 ########### PLOTTING FUNCTIONS ################
@@ -907,3 +1478,144 @@ print(f"- ROC curves: ./classifier/figures/")
 print(f"- Confusion matrices: ./classifier/figures/")
 print(f"- Summary CSV: ./classifier/figures/{galaxy_classes}_{classifier}_robust_summary.csv")
 
+
+###############################################
+########## LOAD TEST DATA & MODEL #############
+###############################################
+
+if GENERATE_ATTENTION_MAPS:
+    print("\n" + "="*60)
+    print("GENERATING ATTENTION VISUALIZATIONS")
+    print("="*60)
+    
+    # Load test data
+    print("Loading test data...")
+    _out = load_galaxies(
+        galaxy_classes=galaxy_classes,
+        versions=[version],
+        fold=0,  # Use fold 0 for test data
+        crop_size=crop_size,
+        downsample_size=downsample_size,
+        sample_size=1000000,
+        REMOVEOUTLIERS=FILTERED,
+        BALANCE=False,
+        STRETCH=True,
+        percentile_lo=percentile_lo,
+        percentile_hi=percentile_hi,
+        AUGMENT=False,
+        NORMALISE=True,
+        NORMALISETOPM=False,
+        USE_GLOBAL_NORMALISATION=USE_GLOBAL_NORMALISATION,
+        GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
+        PRINTFILENAMES=True,  # CHANGED: Get filenames!
+        PREFER_PROCESSED=True,
+        USE_CACHE=True,
+        DEBUG=False,
+        train=False
+    )
+
+    # Now capture filenames from the 6-value return
+    if len(_out) == 6:
+        _, _, test_images, test_labels, test_train_fns, test_eval_fns = _out
+        # Combine and get unique source names
+        source_names = sorted(set(test_train_fns + test_eval_fns))
+        print(f"Loaded {len(source_names)} source names from load_galaxies")
+        if source_names:
+            print(f"  Sample names: {source_names[:3]}")
+    elif len(_out) == 4:
+        _, _, test_images, test_labels = _out
+        # Fallback: generate placeholder names
+        source_names = [f"Test_{i}" for i in range(len(test_labels))]
+        print("Warning: PRINTFILENAMES=False, using placeholder names")
+    else:
+        raise ValueError(f"load_galaxies returned {len(_out)} values, expected 4 or 6")
+    
+    # Prepare test data based on classifier type
+    if classifier in ['ScatterNet', 'DualSSN']:
+        from kymatio.torch import Scattering2D
+        from utils.calc_tools import compute_scattering_coeffs
+        
+        test_images_folded = fold_T_axis(test_images)
+        
+        # Compute scattering coefficients
+        scattering = Scattering2D(J=J, L=L, shape=downsample_size, max_order=order)
+        test_scat = compute_scattering_coeffs(test_images_folded, scattering, batch_size=128, device="cpu")
+        
+        if test_scat.dim() == 5:
+            test_scat = test_scat.flatten(start_dim=1, end_dim=2)
+        
+        if classifier == 'ScatterNet':
+            mock_test = torch.zeros_like(test_images_folded)
+            test_dataset = TensorDataset(mock_test, test_scat, test_labels)
+        else:  # DualSSN
+            test_dataset = TensorDataset(test_images_folded, test_scat, test_labels)
+    else:  # CNN or DualCSN
+        if test_images.dim() == 5:
+            test_images = fold_T_axis(test_images)
+        mock_scat = torch.zeros_like(test_images)
+        test_dataset = TensorDataset(test_images, mock_scat, test_labels)
+    
+    test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False, 
+                            num_workers=0, collate_fn=custom_collate, drop_last=False)
+    
+    # Load the best model
+    print("Loading trained model...")
+    fold_to_use = folds[0]
+    subset_size_to_use = dataset_sizes[fold_to_use][0]
+    cs = f"{crop_size[0]}x{crop_size[1]}"
+    ds = f"{downsample_size[0]}x{downsample_size[1]}"
+    
+    model_path = f"./classifier/trained_models/cl{classifier}_ss{round_to_1(subset_size_to_use)}_f{fold_to_use}_lr{learning_rates[0]}_reg{regularization_params[0]}_ls0.1_cs{cs}_ds{ds}_pl{percentile_lo}_ph{percentile_hi}_ver{version}_model.pth"
+    
+    # Initialize model architecture
+    img_shape = tuple(test_images.shape[1:]) if test_images.dim() == 4 else tuple(test_images.shape[2:])
+    num_classes = len(galaxy_classes)
+    
+    if classifier == "CNN":
+        model = CNN(input_shape=img_shape, num_classes=num_classes).to(device)
+    elif classifier == "ScatterNet":
+        scatdim = test_scat.shape[1:]
+        model = ScatterNet(input_dim=int(np.prod(scatdim)), num_classes=num_classes).to(device)
+    elif classifier == "DualCSN":
+        model = DualCNNSqueezeNet(input_shape=img_shape, num_classes=num_classes).to(device)
+    elif classifier == "DualSSN":
+        scatdim = test_scat.shape[1:]
+        model = DualScatterSqueezeNet(img_shape=img_shape, scat_shape=scatdim, num_classes=num_classes).to(device)
+    else:
+        raise ValueError(f"Unknown classifier: {classifier}")
+    
+    # Load trained weights
+    if os.path.exists(model_path):
+        try:
+            model.load_state_dict(torch.load(model_path, map_location=device))
+            print(f"Loaded model from {model_path}")
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            GENERATE_ATTENTION_MAPS = False
+    else:
+        print(f"Model file not found: {model_path}")
+        GENERATE_ATTENTION_MAPS = False
+    
+    # Generate attention visualizations
+    if GENERATE_ATTENTION_MAPS:
+        generate_attention_visualizations(
+            model=model,
+            test_loader=test_loader,
+            galaxy_classes=galaxy_classes,
+            source_names=source_names,
+            save_dir='./classifier',
+            methods=ATTENTION_METHODS
+        )
+
+###############################################
+########### EXISTING PLOTTING CODE ############
+###############################################
+
+# [Keep all your existing plotting functions here - they're already good]
+# Just add them back from your original script 4.2
+
+print("\n" + "="*60)
+print("EVALUATION SCRIPT FINISHED SUCCESSFULLY!")
+print("="*60)
+if GENERATE_ATTENTION_MAPS:
+    print(f"\nAttention maps saved to: ./classifier/attention_maps/")

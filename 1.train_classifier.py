@@ -40,19 +40,19 @@ dataset_portions  = [1]
 J, L, order       = 2, 12, 2
 num_epochs_cuda = 200
 num_epochs_cpu = 100
-lr = 5e-5 # Learning rate #prefer processed has 6e-5 for RAW
-reg = 1e-1 # Weight decay (L2 regularization) #CORRECT THIS TO 1E-1
+lr = 4e-5 # Learning rate #prefer processed has 6e-5 for RAW
+reg = 1e-1 # Weight decay (L2 regularization)
 label_smoothing = 0.1
-num_experiments = 3
-folds = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9] # 0-9 for 10-fold cross validation, 10 for only one training
+num_experiments = 1
+folds = [0] # 0-9 for 10-fold cross validation, 10 for only one training
 percentile_lo = 30 # Percentile stretch lower bound
 percentile_hi = 99  # Percentile stretch upper bound
-versions = ['T25kpc'] # any mix of loadable and runtime-tapered planes. 'rt50' or 'rt100' for tapering. Square brackets for stacking
+versions = ['RAW'] # any mix of loadable and runtime-tapered planes. 'rt50' or 'rt100' for tapering. Square brackets for stacking
 classifier = ["CNN",         # 0.Very Simple CNN
               "ScatterNet",  # 1.Scattering coefficients as input to MLP
               "DualCSN",     # 2.Dual input CNN with scattering coefficients as one input branch and Squeeze-and-Excitation blocks
               "DualSSN"      # 3.Dual input CNN with scattering coefficients as one input branch and Squeeze-and-Excitation blocks
-              ][2]
+              ][3]
 print(f"Using classifier: {classifier}")
 
 PREFER_PROCESSED = True

@@ -664,8 +664,8 @@ def load_PSZ2(
     path = root_path + "PSZ2/classified/",
     sample_size = 300,              # per class in training set; eval uses sample_size*0.2
     target_classes = [50, 51],
-    versions = "T100kpcSUB",          # string or list/tuple; list => Multiple versions
-    file_version = 'circular_new',
+    versions = "RAW",          # string or list/tuple; list => Multiple versions
+    file_version = 'circular',
     crop_size = (1, 512, 512),        # (C,Hc,Wc) — angular FoV is taken from the ref version
     downsample_size = (1, 128, 128),  # (C,Ho,Wo) — output per frame
     fold = 0,                         # 0..4 = CV folds, 5 = last split
@@ -868,7 +868,8 @@ def load_PSZ2(
     # ============= SINGLE-VERSION PATH (optionally rtXXkpc) =============
     else:
         vU = versions[0].upper() if isinstance(versions, (list, tuple)) else str(versions).upper()
-        tag = _kpc_tag(versions)
+        tag = _kpc_tag(versions[0] if isinstance(versions, (list, tuple)) else versions)
+        print("Processing single version:", vU, "tag:", tag)
         for cls in target_classes:
             sub = classes_map.get(cls)
             #print("Processing class:", cls, "subfolder:", sub)
@@ -951,7 +952,8 @@ def load_PSZ2(
                             _seen_sources.add(src)
                             continue
                     else:
-                        #print(f"[MISS] processed not found for class={sub}: {proc_path}")
+                        print(f"[MISS] processed not found for class={sub}: {proc_path}")
+                        print("string of tag:", tag)
                         continue
 
                 # === FALLBACK when processed file is missing or not preferred ===
@@ -1107,19 +1109,17 @@ def load_PSZ2(
 
     # --- split by basename (stratified + grouped) ---
     y = np.array(labels)
-
+    
+    # If there are no samples, provide helpful diagnostics
     if len(y) == 0:
         # Helpful diagnostics for T/RT loads
         try:
             v_tag = _kpc_tag(versions[0] if isinstance(versions, (list, tuple)) else versions)
+            print("v_tag:", v_tag)
         except Exception:
             v_tag = str(versions)
         raise ValueError(
             f"[PSZ2] No samples collected. "
-            f"Looked for version '{v_tag}' in processed_dir={processed_dir} "
-            f"with fmt_{Ho}x{Wo}. "
-            f"Tip: ensure crop_size matches available *_fmt_HxW.fits, "
-            f"or use the fallback glob below."
             f"First location tried:\n {os.path.join(processed_dir, f'*_{v_tag}_fmt_{Ho}x{Wo}_{file_version}.fits')} "
         )
 
@@ -1313,10 +1313,8 @@ def load_galaxies(galaxy_classes, path=None, versions=None, fold=None, island=No
 
     # Convert lists to tensors if needed
     if isinstance(train_images, list):
-        print("Converting train_images list to tensor.")
         train_images = torch.stack(train_images)
     if isinstance(eval_images, list):
-        print("Converting eval_images list to tensor.")
         eval_images  = torch.stack(eval_images)
 
     if BALANCE:
