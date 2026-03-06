@@ -3,9 +3,9 @@ _layouts/
 _sass/
 .ipynb_checkpoints/
 legacy_scripts/
-miscellaneous/
-scattering/
-taper_tools/
+outputs/
+data/
+core_*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -178,3 +178,4 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+.venv/
