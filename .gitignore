@@ -4,7 +4,7 @@ _sass/
 .ipynb_checkpoints/
 legacy_scripts/
 outputs/
-data/
+/data/
 core_*
 
 # Byte-compiled / optimized / DLL files

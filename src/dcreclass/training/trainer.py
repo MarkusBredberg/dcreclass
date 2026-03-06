@@ -1,9 +1,13 @@
+import os
+import hashlib
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from dcreclass.utils.calc_tools import round_to_1
 
 ###############################################
 ########### DATA STORING FUNCTIONS ###############
@@ -194,19 +198,23 @@ def img_hash(img: torch.Tensor) -> str:
     arr = img.cpu().contiguous().numpy()
     return hashlib.sha1(arr.tobytes()).hexdigest()
 
-def config_already_exists(classifier, galaxy_classes, lr, reg, percentile_lo, percentile_hi, 
-                          cs, ds, ver_key, fold, subset_size, experiment):
+def config_already_exists(classifier, galaxy_classes, lr, reg, percentile_lo, percentile_hi,
+                          cs, ds, ver_key, fold, subset_size, experiment,
+                          metrics_dir, use_global_norm=False, global_norm_mode='none'):
     """
     Check if a configuration has already been trained and saved.
-    
+
     Returns:
         bool: True if the PKL file exists, False otherwise
     """
-    if USE_GLOBAL_NORMALISATION:
-        metrics_path = f'./classifier/4.1.runs/{classifier}_{galaxy_classes}_lr{lr}_reg{reg}_lo{percentile_lo}_hi{percentile_hi}_cs{cs}_ds{ds}_ver{ver_key}_f{fold}_ss{round_to_1(subset_size)}_e{experiment}_{GLOBAL_NORM_MODE}_metrics_data.pkl'
+    base = (f"{classifier}_{galaxy_classes}_lr{lr}_reg{reg}"
+            f"_lo{percentile_lo}_hi{percentile_hi}_cs{cs}_ds{ds}"
+            f"_ver{ver_key}_f{fold}_ss{round_to_1(subset_size)}_e{experiment}")
+    if use_global_norm:
+        fname = f"{base}_{global_norm_mode}_metrics_data.pkl"
     else:
-        metrics_path = f'./classifier/4.1.runs/{classifier}_{galaxy_classes}_lr{lr}_reg{reg}_lo{percentile_lo}_hi{percentile_hi}_cs{cs}_ds{ds}_ver{ver_key}_f{fold}_ss{round_to_1(subset_size)}_e{experiment}_metrics_data.pkl'
-    
+        fname = f"{base}_metrics_data.pkl"
+    metrics_path = os.path.join(metrics_dir, fname)
     exists = os.path.exists(metrics_path)
     if exists:
         print(f"✓ Configuration already exists: fold={fold}, subset_size={subset_size}, experiment={experiment}")
@@ -301,14 +309,13 @@ def permute_like(x, perm):
         return tuple(x[i] for i in idx)
     return x
 
-def relabel(y):
+def relabel(y, galaxy_classes, multilabel=False):
     """
-    Convert raw single-class ids to 2-bit multi-label targets [RH, RR].
-    RH (52) -> [1,0]
-    RR (53) -> [0,1]
-    If you ever have 'both', set both bits to 1 *upstream*.
+    Convert raw single-class ids to zero-based indices or 2-bit multi-label targets.
+    multilabel=True: RH (52) -> [1,0],  RR (53) -> [0,1]
+    multilabel=False: subtract min(galaxy_classes) to get 0-based index labels.
     """
-    if MULTILABEL:
+    if multilabel:
         y = y.long()
         out = torch.zeros((y.shape[0], 2), dtype=torch.float32, device=y.device)
         out[:, 0] = (y == 52).float()   # RH

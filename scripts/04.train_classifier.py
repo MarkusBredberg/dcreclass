@@ -1,9 +1,18 @@
 import os, time, random, pickle, hashlib, itertools, torch
-from lotssdcre.data_loader import load_galaxies, get_classes
-from lotssdcre.models import CNN, ScatterNet, DualCNNSqueezeNet, DualScatterSqueezeNet
-from lotssdcre.training import EarlyStopping, reset_weights
-from lotssdcre.utils import cluster_metrics, normalise_images, check_tensor, fold_T_axis, compute_scattering_coeffs, custom_collate
-from lotssdcre.utils import plot_histograms, plot_images_by_class, plot_image_grid, plot_background_histogram
+from dcreclass.data import load_galaxies, get_classes
+from dcreclass.models import CNN, ScatterNet, DualCNNSqueezeNet, DualScatterSqueezeNet
+from dcreclass.training import (EarlyStopping, reset_weights,
+                                relabel, permute_like,
+                                mixup_data, mixup_criterion,
+                                config_already_exists,
+                                initialise_history, initialise_labels, initialise_metrics,
+                                compute_classification_metrics, update_metrics,
+                                plot_training_history, plot_intensity_histogram,
+                                check_overfitting, img_hash)
+from dcreclass.utils import (cluster_metrics, normalise_images, check_tensor, fold_T_axis,
+                             compute_scattering_coeffs, custom_collate, round_to_1,
+                             plot_histograms, plot_images_by_class, plot_image_grid,
+                             plot_background_histogram)
 import numpy as np
 import torch.nn as nn
 from torch.optim import AdamW
@@ -85,7 +94,9 @@ else:
     MODELS_DIR  = os.path.join(OUTDIR_BASE, 'classifier', 'trained_models')
     METRICS_DIR = os.path.join(OUTDIR_BASE, 'classifier', 'runs')
 
-PREFER_PROCESSED = True
+CROP_MODE = 'beam_crop'  # 'beam_crop' | 'fov_crop' | 'cheat_crop' | 'pixel_crop'
+if os.environ.get('CROP_MODE'):
+    CROP_MODE = os.environ['CROP_MODE']
 STRETCH = True  # Arcsinh stretch
 USE_GLOBAL_NORMALISATION = False          # single on/off switch . False - image-by-image normalisation 
 GLOBAL_NORM_MODE = "percentile"           # "percentile" or "flux". Becomes "none" if USE_GLOBAL_NORMALISATION is 
@@ -124,6 +135,7 @@ with open(_config_file, 'a') as _cf:
     _cf.write(f"SEED:                    {SEED}\n")
     _cf.write(f"classifier:              {classifier}\n")
     _cf.write(f"versions:                {versions}\n")
+    _cf.write(f"CROP_MODE:               {CROP_MODE}\n")
     _cf.write(f"galaxy_classes:          {galaxy_classes}\n")
     _cf.write(f"folds:                   {folds}\n")
     _cf.write(f"num_experiments:         {num_experiments}\n")
@@ -137,7 +149,6 @@ with open(_config_file, 'a') as _cf:
     _cf.write(f"J, L, order:             {J}, {L}, {order}\n")
     _cf.write(f"percentile_lo:           {percentile_lo}\n")
     _cf.write(f"percentile_hi:           {percentile_hi}\n")
-    _cf.write(f"PREFER_PROCESSED:        {PREFER_PROCESSED}\n")
     _cf.write(f"STRETCH:                 {STRETCH}\n")
     _cf.write(f"USE_GLOBAL_NORMALISATION:{USE_GLOBAL_NORMALISATION}\n")
     _cf.write(f"GLOBAL_NORM_MODE:        {GLOBAL_NORM_MODE}\n")
@@ -258,11 +269,11 @@ dataset_sizes = {}
 ###############################################
 
 _out  = load_galaxies(galaxy_classes=galaxy_classes,
-            versions=versions, 
+            versions=versions,
             fold=max(folds), #Any fold other than 5 gives me the test data for the five fold cross validation
             crop_size=crop_size,
             downsample_size=downsample_size,
-            sample_size=max_num_galaxies, 
+            sample_size=max_num_galaxies,
             REMOVEOUTLIERS=FILTERED,
             BALANCE=BALANCE,           # Reduce the larger classes to the size of the smallest class
             STRETCH=STRETCH,
@@ -274,9 +285,10 @@ _out  = load_galaxies(galaxy_classes=galaxy_classes,
             USE_GLOBAL_NORMALISATION=USE_GLOBAL_NORMALISATION,
             GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
             PRINTFILENAMES=PRINTFILENAMES,
-            PREFER_PROCESSED=PREFER_PROCESSED,
+
             USE_CACHE=USE_CACHE,
             DEBUG=DEBUG,
+            crop_mode=CROP_MODE,
             train=False)  # Obtain the test set
 
 if len(_out) == 4:
@@ -292,7 +304,7 @@ test_images, test_labels = test_images[perm_test], test_labels[perm_test]
 if PRINTFILENAMES and test_fns is not None:
     test_fns = permute_like(test_fns, perm_test)
 
-test_labels = relabel(test_labels)
+test_labels = relabel(test_labels, galaxy_classes, multilabel=MULTILABEL)
 print("Labels of the test set after relabelling:", torch.unique(test_labels, return_counts=True))
 
 
@@ -311,9 +323,9 @@ if classifier in ['ScatterNet', 'DualSSN']: # When scattering is used
     
     # Define cache paths
     if USE_GLOBAL_NORMALISATION:
-        test_cache = f"./.cache/scattering_coefficients/test_scat_{galaxy_classes}_{versions}_{GLOBAL_NORM_MODE}_{PREFER_PROCESSED}.pt"
+        test_cache = f"./.cache/scattering_coefficients/test_scat_{galaxy_classes}_{versions}_{GLOBAL_NORM_MODE}_{CROP_MODE}.pt"
     else:
-        test_cache = f"./.cache/scattering_coefficients/test_scat_{galaxy_classes}_{versions}_{PREFER_PROCESSED}.pt"
+        test_cache = f"./.cache/scattering_coefficients/test_scat_{galaxy_classes}_{versions}_{CROP_MODE}.pt"
 
     # Load or compute test scattering coefficients
     if os.path.exists(test_cache) and USE_CACHE:
@@ -332,9 +344,9 @@ if classifier in ['ScatterNet', 'DualSSN']: # When scattering is used
         # Now we need to normalise the scattering coefficients globally, and thus compute the scattering coeffs for all data
         trainval_images = fold_T_axis(train_val_images)
         if USE_GLOBAL_NORMALISATION:
-            trainval_cache = f"./.cache/scattering_coefficients/trainval_scat_{galaxy_classes}_{versions}_{GLOBAL_NORM_MODE}_{PREFER_PROCESSED}.pt"
+            trainval_cache = f"./.cache/scattering_coefficients/trainval_scat_{galaxy_classes}_{versions}_{GLOBAL_NORM_MODE}_{CROP_MODE}.pt"
         else:
-            trainval_cache = f"./.cache/scattering_coefficients/trainval_scat_{galaxy_classes}_{versions}_{PREFER_PROCESSED}.pt"
+            trainval_cache = f"./.cache/scattering_coefficients/trainval_scat_{galaxy_classes}_{versions}_{CROP_MODE}.pt"
         if os.path.exists(trainval_cache) and USE_CACHE:
             print(f"✓ Loading trainval scattering coefficients from cache: {trainval_cache}")
             trainval_scat_coeffs = torch.load(trainval_cache)
@@ -381,7 +393,7 @@ for fold in folds:
     f"J={J}, L={L}, crop={crop_size}, down={downsample_size}, ver={versions}, "
     f"lo={percentile_lo}, hi={percentile_hi}, classifier={classifier}, "
     f"global_norm={USE_GLOBAL_NORMALISATION}, norm_mode={GLOBAL_NORM_MODE}, "
-    f"PREFER_PROCESSED={PREFER_PROCESSED} ◀")
+    f"CROP_MODE={CROP_MODE} ◀")
 
     log_path = f"{LOGS_DIR}/log_{classifier}_{runname}.txt"
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
@@ -389,8 +401,10 @@ for fold in folds:
     if USE_CACHE:
         fold_subset_sizes = [round_to_1(max(2, int(len(train_val_images) * p))) for p in dataset_portions]
         all_configs_exist = all(
-            config_already_exists(classifier, galaxy_classes, lr, reg, percentile_lo, percentile_hi, 
-                                cs, ds, ver_key, fold, ss, exp)
+            config_already_exists(classifier, galaxy_classes, lr, reg, percentile_lo, percentile_hi,
+                                cs, ds, ver_key, fold, ss, exp,
+                                metrics_dir=METRICS_DIR, use_global_norm=USE_GLOBAL_NORMALISATION,
+                                global_norm_mode=GLOBAL_NORM_MODE)
             for ss in fold_subset_sizes
             for exp in range(num_experiments)
         )
@@ -402,11 +416,11 @@ for fold in folds:
     
     _out = load_galaxies(
             galaxy_classes=galaxy_classes,
-            versions=versions, 
+            versions=versions,
             fold=fold, #Any fold other than 5 gives me the test data for the five fold cross validation
             crop_size=crop_size,
             downsample_size=downsample_size,
-            sample_size=max_num_galaxies, 
+            sample_size=max_num_galaxies,
             REMOVEOUTLIERS=FILTERED,
             BALANCE=BALANCE,           # Reduce the larger classes to the size of the smallest class
             STRETCH=STRETCH,
@@ -418,9 +432,10 @@ for fold in folds:
             USE_GLOBAL_NORMALISATION=USE_GLOBAL_NORMALISATION,
             GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
             PRINTFILENAMES=PRINTFILENAMES,
-            PREFER_PROCESSED=PREFER_PROCESSED,
+
             USE_CACHE=USE_CACHE,
             DEBUG=DEBUG,
+            crop_mode=CROP_MODE,
             train=True) # Obtain the train and validation set. Not test set
     
     if len(_out) == 4:
@@ -441,7 +456,8 @@ for fold in folds:
         train_fns = permute_like(train_fns, perm_train)
         valid_fns = permute_like(valid_fns, perm_valid)
         
-    train_labels, valid_labels = relabel(train_labels), relabel(valid_labels)       
+    train_labels, valid_labels = (relabel(train_labels, galaxy_classes, multilabel=MULTILABEL),
+                                  relabel(valid_labels, galaxy_classes, multilabel=MULTILABEL))
 
     # ——— Data sanity checks ———
     if DEBUG:
@@ -498,8 +514,8 @@ for fold in folds:
         mock_valid = torch.zeros_like(valid_images)
 
         # Define cache paths
-        train_cache = f"./.cache/scattering_coefficients/train_scat_{galaxy_classes}_{versions}_{fold}_{FILTERED}_{PREFER_PROCESSED}.pt"
-        valid_cache = f"./.cache/scattering_coefficients/valid_scat_{galaxy_classes}_{versions}_{fold}_{FILTERED}_{PREFER_PROCESSED}.pt"
+        train_cache = f"./.cache/scattering_coefficients/train_scat_{galaxy_classes}_{versions}_{fold}_{FILTERED}_{CROP_MODE}.pt"
+        valid_cache = f"./.cache/scattering_coefficients/valid_scat_{galaxy_classes}_{versions}_{fold}_{FILTERED}_{CROP_MODE}.pt"
 
         # Load or compute train scattering coefficients
         if os.path.exists(train_cache) and USE_CACHE:
@@ -720,8 +736,10 @@ for fold in folds:
             continue
         
         all_experiments_cached = all(
-            config_already_exists(classifier,galaxy_classes, lr, reg, percentile_lo, percentile_hi,
-                                cs, ds, ver_key, fold, subset_size, exp)
+            config_already_exists(classifier, galaxy_classes, lr, reg, percentile_lo, percentile_hi,
+                                cs, ds, ver_key, fold, subset_size, exp,
+                                metrics_dir=METRICS_DIR, use_global_norm=USE_GLOBAL_NORMALISATION,
+                                global_norm_mode=GLOBAL_NORM_MODE)
             for exp in range(num_experiments)
         )
         if USE_CACHE and all_experiments_cached:
@@ -735,7 +753,8 @@ for fold in folds:
 
         for experiment in range(num_experiments):
             
-            if USE_CACHE and config_already_exists(classifier, galaxy_classes, lr, reg, percentile_lo, percentile_hi, cs, ds, ver_key, fold, subset_size, experiment):
+            if USE_CACHE and config_already_exists(classifier, galaxy_classes, lr, reg, percentile_lo, percentile_hi, cs, ds, ver_key, fold, subset_size, experiment,
+                                                    metrics_dir=METRICS_DIR, use_global_norm=USE_GLOBAL_NORMALISATION, global_norm_mode=GLOBAL_NORM_MODE):
                 print(f"⏭️  Skipping: fold={fold}, subset_size={subset_size}, experiment={experiment} - configuration already trained")
                 continue
             
