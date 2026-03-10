@@ -25,11 +25,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ── Import reusable check from the package ────────────────────────────────────
 from dcreclass.data.loaders import check_complete_download
 
-# ── Paths resolved relative to project root ───────────────────────────────────
-# This file lives at scripts/, so .parents[1] is the project root
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-OUT_ROOT     = PROJECT_ROOT / "data" / "PSZ2"
-FITS_ROOT    = OUT_ROOT / "fits"
+# ── Paths ─────────────────────────────────────────────────────────────────────
+OUT_ROOT  = Path("/users/mbredber/scratch/data/PSZ2")
+FITS_ROOT = OUT_ROOT / "fits"
 OUT_ROOT.mkdir(parents=True, exist_ok=True)
 FITS_ROOT.mkdir(parents=True, exist_ok=True)
 

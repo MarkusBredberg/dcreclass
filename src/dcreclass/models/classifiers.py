@@ -177,6 +177,75 @@ class SEBlock(nn.Module):
         return x * self.fc(self.pool(x))
     
 
+class ImageCNN(nn.Module):
+    """Single image-encoder branch from DualCNNSqueezeNet / DualScatterSqueezeNet, with FCN head."""
+    def __init__(self, input_shape, num_classes=2, hidden_dim=32, classifier_hidden_dim=32):
+        super(ImageCNN, self).__init__()
+
+        in_channels, H, W = input_shape
+
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels, 8, kernel_size=5, stride=1, padding=2, bias=True),
+            nn.BatchNorm2d(8, momentum=0.1),
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.3),
+
+            nn.Conv2d(8, 16, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(16, momentum=0.1),
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.3),
+
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            nn.Conv2d(16, 32, kernel_size=5, stride=1, padding=2, bias=True),
+            nn.BatchNorm2d(32, momentum=0.1),
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.4),
+        )
+
+        self.to_latent = nn.Sequential(
+            nn.Conv2d(32, 32, kernel_size=3, stride=2, padding=1, bias=True),
+            nn.BatchNorm2d(32, momentum=0.1),
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.4),
+
+            nn.Conv2d(32, 32, kernel_size=3, stride=2, padding=1, bias=True),
+            nn.BatchNorm2d(32, momentum=0.1),
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.4),
+
+            nn.Conv2d(32, 32, kernel_size=3, stride=2, padding=1, bias=True),
+            nn.BatchNorm2d(32, momentum=0.1),
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.4),
+
+            nn.Conv2d(32, 32, kernel_size=3, stride=2, padding=1, bias=True),
+            nn.BatchNorm2d(32, momentum=0.1),
+            nn.LeakyReLU(0.2),
+            nn.Dropout2d(0.5),
+        )
+
+        with torch.no_grad():
+            dummy = torch.zeros(1, in_channels, H, W)
+            feature_dim = self.to_latent(self.encoder(dummy)).view(1, -1).size(1)
+
+        self.FC_input      = nn.Linear(feature_dim, hidden_dim)
+        self.bn1           = nn.BatchNorm1d(hidden_dim, momentum=0.1)
+        self.dropout1      = nn.Dropout(0.5)
+        self.FC_hidden     = nn.Linear(hidden_dim, classifier_hidden_dim)
+        self.bn2           = nn.BatchNorm1d(classifier_hidden_dim, momentum=0.1)
+        self.dropout2      = nn.Dropout(0.5)
+        self.FC_classifier = nn.Linear(classifier_hidden_dim, num_classes)
+        self.act           = nn.LeakyReLU(0.2)
+
+    def forward(self, x):
+        x = self.to_latent(self.encoder(x))
+        x = x.view(x.size(0), -1)
+        x = self.dropout1(self.act(self.bn1(self.FC_input(x))))
+        x = self.dropout2(self.act(self.bn2(self.FC_hidden(x))))
+        return self.FC_classifier(x)
+
+
 #DualCSN
 class DualCNNSqueezeNet(nn.Module):
     """

@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader
 
 # Import your classifiers
-from utils.classifiers import CNN, ScatterNet, DualCNNSqueezeNet, DualScatterSqueezeNet
+from utils.classifiers import CNN, ImageCNN, ScatterNet, DualCNNSqueezeNet, DualScatterSqueezeNet
 from utils.calc_tools import fold_T_axis, custom_collate
 
 # Create output directories
@@ -46,7 +46,8 @@ folds = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 classifier = ["CNN",         # 0.Very Simple CNN
               "ScatterNet",  # 1.Scattering coefficients as input to MLP
               "DualCSN",     # 2.Dual input CNN with scattering coefficients as one input branch and Squeeze-and-Excitation blocks
-              "DualSSN"      # 3.Dual input CNN with scattering coefficients as one input branch and Squeeze-and-Excitation blocks
+              "DualSSN",     # 3.Dual input CNN with scattering coefficients as one input branch and Squeeze-and-Excitation blocks
+              "ImageCNN",    # 4.Single image-encoder branch from DualCSN/DualSSN
               ][3]
 crop_size = (512, 512)
 downsample_size = (128, 128)
@@ -377,6 +378,8 @@ if GENERATE_ATTENTION_MAPS:
     
     if classifier == "CNN":
         model = CNN(input_shape=img_shape, num_classes=num_classes).to(device)
+    elif classifier == "ImageCNN":
+        model = ImageCNN(input_shape=img_shape, num_classes=num_classes).to(device)
     elif classifier == "ScatterNet":
         scatdim = test_scat.shape[1:]
         model = ScatterNet(input_dim=int(np.prod(scatdim)), num_classes=num_classes).to(device)

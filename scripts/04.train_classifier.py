@@ -1,6 +1,6 @@
 import os, time, random, pickle, hashlib, itertools, torch
 from dcreclass.data import load_galaxies, get_classes
-from dcreclass.models import CNN, ScatterNet, DualCNNSqueezeNet, DualScatterSqueezeNet
+from dcreclass.models import CNN, ImageCNN, ScatterNet, DualCNNSqueezeNet, DualScatterSqueezeNet
 from dcreclass.training import (EarlyStopping, reset_weights,
                                 relabel, permute_like,
                                 mixup_data, mixup_criterion,
@@ -60,7 +60,8 @@ versions = ['RAW'] # any mix of loadable and runtime-tapered planes. 'rt50' or '
 classifier = ["CNN",         # 0.Very Simple CNN
               "ScatterNet",  # 1.Scattering coefficients as input to MLP
               "DualCSN",     # 2.Dual input CNN with scattering coefficients as one input branch and Squeeze-and-Excitation blocks
-              "DualSSN"      # 3.Dual input CNN with scattering coefficients as one input branch and Squeeze-and-Excitation blocks
+              "DualSSN",     # 3.Dual input CNN with scattering coefficients as one input branch and Squeeze-and-Excitation blocks
+              "ImageCNN",    # 4.Single image-encoder branch from DualCSN/DualSSN
               ][3]
 
 # Override configuration from environment variables set by the SLURM job script
@@ -105,6 +106,7 @@ NORMALISEIMGSTOPM = False  # Normalise images to [-1, 1]
 NORMALISESCS = False  # Normalise scattering coefficients to [0, 1]
 NORMALISESCSTOPM = False  # Normalise scattering coefficients to [-1, 1]
 FILTERED = True  # Remove in training and validation for the classifier
+BALANCE = True   # Reduce the larger classes to the size of the smallest class
 FILTERGEN = False  # Remove generated images that are too similar to other generated images
 AUGMENT = True  # Use classical data augmentation (flips, rotations)
 MIXUP = True  # Use MixUp augmentation as a means to reduce overfitting
@@ -312,7 +314,7 @@ print("Labels of the test set after relabelling:", torch.unique(test_labels, ret
 ################# NORMALISE AND PACKAGE TEST DATA ############################
 ##############################################################################
 
-if classifier in ['CNN', 'DualCSN', 'DualSSN']: # When images are used
+if classifier in ['CNN', 'ImageCNN', 'DualCSN', 'DualSSN']: # When images are used
     test_images = _as_5d(test_images).to(DEVICE)
 
 if classifier in ['ScatterNet', 'DualSSN']: # When scattering is used
@@ -683,6 +685,8 @@ for fold in folds:
     # Directly create the model for the selected classifier
     if classifier == "CNN":
         model = CNN(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)
+    elif classifier == "ImageCNN":
+        model = ImageCNN(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)
     elif classifier == "ScatterNet":
         model = ScatterNet(input_dim=int(np.prod(scatdim)), num_classes=num_classes).to(DEVICE)
     elif classifier == "DualCSN":

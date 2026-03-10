@@ -68,7 +68,7 @@ def add_beam_patch_simple(ax, header, color='white', alpha=0.8,
     ny, nx   = int(header['NAXIS2']), int(header['NAXIS1'])
     asx, asy = arcsec_per_pix(header)
     bmaj_pix = bmaj_as / asx; bmin_pix = bmin_as / asy
-    margin   = 0.15
+    margin   = 0.10
     bmaj_f   = bmaj_pix / ny; bmin_f = bmin_pix / nx
     yc_n = margin + bmaj_f / 2 if 'lower' in loc else 1 - margin - bmaj_f / 2
     xc_n = margin + bmin_f / 2 if 'left'  in loc else 1 - margin - bmin_f / 2
@@ -77,10 +77,10 @@ def add_beam_patch_simple(ax, header, color='white', alpha=0.8,
     ax.add_patch(Ellipse(xy=(xc_n * nx, yc_n * ny), width=bmaj_pix, height=bmin_pix,
                          angle=bpa_deg, transform=ax.transData,
                          facecolor=color, edgecolor='black', alpha=alpha, linewidth=0.8))
-    yt_n = yc_n + bmaj_f / 2 + 0.03 if 'lower' in loc else yc_n - bmaj_f / 2 - 0.03
+    yt_n = yc_n - bmaj_f / 2 - 0.03 if 'lower' in loc else yc_n + bmaj_f / 2 + 0.03
     ax.text(xc_n, yt_n, f"{bmaj_as:.1f}\u2033\u00d7{bmin_as:.1f}\u2033",
             transform=ax.transAxes, fontsize=fontsize, color=color, weight='bold',
-            ha='center', va='bottom' if 'lower' in loc else 'top',
+            ha='center', va='top' if 'lower' in loc else 'bottom',
             bbox=dict(boxstyle='round,pad=0.15', facecolor='black', alpha=0.7, edgecolor='none'))
 
 

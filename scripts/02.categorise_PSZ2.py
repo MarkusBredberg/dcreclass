@@ -26,7 +26,7 @@ import shutil
 from pathlib import Path
 
 # Paths
-BASE_DIR = "./data/PSZ2"
+BASE_DIR = "/users/mbredber/scratch/data/PSZ2"
 FITS_DIR = os.path.join(BASE_DIR, "fits")
 CLASSIFIED_DIR = os.path.join(BASE_DIR, "classified")
 SOURCEDATA_CSV = os.path.join(BASE_DIR, "cluster_source_data.csv")

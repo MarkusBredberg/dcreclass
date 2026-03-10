@@ -34,16 +34,26 @@ def circular_cov_kpc(z, fwhm_kpc=50.0):
     return np.array([[sigma2, 0.0], [0.0, sigma2]], float)
 
 
-def circular_kernel_from_z(z, raw_hdr, fwhm_kpc=50.0):
-    """Circular Gaussian convolution kernel on the RAW pixel grid."""
+def circular_kernel_from_z(z, raw_hdr, fwhm_kpc=50.0, subtract_beam=True):
+    """Circular Gaussian convolution kernel on the RAW pixel grid.
+
+    subtract_beam=True  (default): C_ker = C_target - C_beam, so the final
+                                   effective PSF equals C_target exactly.
+    subtract_beam=False           : C_ker = C_target, so the final effective
+                                   PSF is C_beam + C_target (larger), matching
+                                   more closely what uv-tapering produces.
+    """
     C_raw  = beam_cov_world(raw_hdr)
     C_circ = circular_cov_kpc(z, fwhm_kpc=fwhm_kpc)
     if C_circ is None:
         raise ValueError(f"Invalid redshift z={z} for circular kernel")
-    C_ker_world = C_circ - C_raw
-    w, V = np.linalg.eigh(C_ker_world)
-    w    = np.clip(w, 0.0, None)
-    C_ker_world = (V * w) @ V.T
+    if subtract_beam:
+        C_ker_world = C_circ - C_raw
+        w, V = np.linalg.eigh(C_ker_world)
+        w    = np.clip(w, 0.0, None)
+        C_ker_world = (V * w) @ V.T
+    else:
+        C_ker_world = C_circ
     J    = _cd_matrix_rad(raw_hdr)
     Jinv = np.linalg.inv(J)
     Cpix = Jinv @ C_ker_world @ Jinv.T
@@ -55,6 +65,35 @@ def circular_kernel_from_z(z, raw_hdr, fwhm_kpc=50.0):
     nker    = int(np.ceil(8.0 * max(s_major, s_minor))) | 1
     return Gaussian2DKernel(x_stddev=s_major, y_stddev=s_minor, theta=theta,
                             x_size=nker, y_size=nker)
+
+
+def effective_rt_beam_deg(z, raw_hdr, fwhm_kpc: float,
+                          subtract_beam: bool = True) -> Tuple[float, float, float]:
+    """Return (BMAJ_deg, BMIN_deg, BPA_deg) for the effective RT image PSF.
+
+    The effective covariance is C_raw + C_ker, where C_ker is the convolution
+    kernel covariance (same logic as circular_kernel_from_z):
+      subtract_beam=True : C_ker = clip(C_circ - C_raw)  → C_eff ≈ C_circ
+      subtract_beam=False: C_ker = C_circ                → C_eff = C_raw + C_circ
+    """
+    C_raw  = beam_cov_world(raw_hdr)
+    C_circ = circular_cov_kpc(z, fwhm_kpc=fwhm_kpc)
+    if C_circ is None:
+        raise ValueError(f"Invalid redshift z={z}")
+    if subtract_beam:
+        C_ker = C_circ - C_raw
+        w, V  = np.linalg.eigh(C_ker)
+        C_ker = (V * np.clip(w, 0.0, None)) @ V.T
+    else:
+        C_ker = C_circ
+    C_eff      = C_raw + C_ker
+    w_eff, V_eff = np.linalg.eigh(C_eff)
+    w_eff      = np.clip(w_eff, 0.0, None)
+    fwhm2sigma = 2.0 * np.sqrt(2.0 * np.log(2.0))
+    bmaj_rad   = float(np.sqrt(w_eff[1])) * fwhm2sigma   # larger eigenvalue → major axis
+    bmin_rad   = float(np.sqrt(w_eff[0])) * fwhm2sigma
+    bpa_deg    = float(np.degrees(np.arctan2(V_eff[1, 1], V_eff[0, 1])))
+    return np.degrees(bmaj_rad), np.degrees(bmin_rad), bpa_deg
 
 
 def load_z_table(csv_path) -> Dict[str, float]:
@@ -200,6 +239,168 @@ def compute_global_nbeams_per_version(root_dir: Path,
     return global_nbeams
 
 
+def compute_global_nbeams_raw(root_dir: Path) -> float:
+    """Global minimum n_beams from RAW files across all sources."""
+    print('[compute_global_nbeams_raw] Scanning RAW files...')
+    nbeams_list = []
+    for src_dir in sorted(p for p in Path(root_dir).glob('*') if p.is_dir()):
+        raw_path = src_dir / f"{src_dir.name}.fits"
+        if not raw_path.exists():
+            continue
+        try:
+            arr, hdr, _ = read_fits_array_header_wcs(raw_path)
+            max_side_as = _nan_free_centred_square_side_as(arr, hdr)
+            if max_side_as <= 0:
+                continue
+            nbeams_list.append(max_side_as / fwhm_major_as(hdr))
+        except Exception:
+            continue
+    if nbeams_list:
+        nmin = min(nbeams_list)
+        print(f'[scan] RAW: n_beams={nmin:.1f} '
+              f'(min={min(nbeams_list):.1f}, max={max(nbeams_list):.1f})')
+        return nmin
+    return 100.0
+
+
+def compute_global_nbeams_equalized(root_dir: Path,
+                                    scales: List[float],
+                                    slug_to_z: Dict[str, float],
+                                    subtract_beam: bool = True) -> Dict:
+    """Per-version equalized n_beams ensuring comparable average FOV across all 7 versions.
+
+    For each of the 7 dataset versions (RAW reference, T_X taper, RT_X blurring per scale):
+      1. Scan all sources → n_beams_i = NaN-free_side / beam_FWHM for that image type.
+      2. n_min_v = min(n_beams_i across sources); mean_fwhm_v = mean(beam_FWHM).
+      3. avg_fov_v = n_min_v * mean_fwhm_v  (arcsec, representative of version FOV).
+      4. Equalize: n_adj_v = n_min_v * (global_min_avg_fov / avg_fov_v).
+
+    RT_X NaN-free region is approximated from T_X (both on same H_common grid).
+    RT_X effective beam is computed via effective_rt_beam_deg(z, H_raw, scale).
+
+    Returns:
+        {
+            'RAW': float,                     # adjusted n_beams for reference images
+            scale: {'T': float, 'RT': float}  # adjusted n_beams for taper/blurring
+            for scale in scales
+        }
+    """
+    print('[compute_global_nbeams_equalized] Scanning all 7 dataset versions...')
+
+    # Accumulate per-version n_beams and beam_fwhm lists
+    # Keys: 'RAW', (scale, 'T'), (scale, 'RT')
+    vdata: Dict = {
+        'RAW': {'nbeams': [], 'fwhm': []},
+        **{(sc, 'T'):  {'nbeams': [], 'fwhm': []} for sc in scales},
+        **{(sc, 'RT'): {'nbeams': [], 'fwhm': []} for sc in scales},
+    }
+
+    for src_dir in sorted(p for p in Path(root_dir).glob('*') if p.is_dir()):
+        name     = src_dir.name
+        raw_path = src_dir / f"{name}.fits"
+        if not raw_path.exists():
+            continue
+
+        # RAW version
+        hdr_raw = None
+        try:
+            arr_raw, hdr_raw, _ = read_fits_array_header_wcs(raw_path)
+            nf_raw = _nan_free_centred_square_side_as(arr_raw, hdr_raw)
+            fw_raw = fwhm_major_as(hdr_raw)
+            if nf_raw > 0 and fw_raw > 0:
+                vdata['RAW']['nbeams'].append(nf_raw / fw_raw)
+                vdata['RAW']['fwhm'].append(fw_raw)
+        except Exception:
+            pass
+
+        z = slug_to_z.get(name, np.nan)
+
+        for scale in scales:
+            scale_str = f"{int(scale)}" if scale == int(scale) else f"{scale}"
+            t_path = src_dir / f"{name}T{scale_str}kpc.fits"
+            if not t_path.exists():
+                continue
+
+            # T version
+            nf_t = 0.0
+            try:
+                arr_t, hdr_t, _ = read_fits_array_header_wcs(t_path)
+                nf_t = _nan_free_centred_square_side_as(arr_t, hdr_t)
+                fw_t = fwhm_major_as(hdr_t)
+                if nf_t > 0 and fw_t > 0:
+                    vdata[(scale, 'T')]['nbeams'].append(nf_t / fw_t)
+                    vdata[(scale, 'T')]['fwhm'].append(fw_t)
+            except Exception:
+                continue
+
+            # RT version: NaN-free ≈ T NaN-free; effective beam from effective_rt_beam_deg
+            if hdr_raw is not None and np.isfinite(z) and z > 0 and nf_t > 0:
+                try:
+                    bmaj_deg, _, _ = effective_rt_beam_deg(
+                        z, hdr_raw, fwhm_kpc=scale, subtract_beam=subtract_beam)
+                    fw_rt = bmaj_deg * 3600.0
+                    if fw_rt > 0:
+                        vdata[(scale, 'RT')]['nbeams'].append(nf_t / fw_rt)
+                        vdata[(scale, 'RT')]['fwhm'].append(fw_rt)
+                except Exception:
+                    pass
+
+    # Compute n_min, mean_fwhm, and avg_fov per version
+    version_keys = ['RAW'] + [(sc, t) for sc in scales for t in ('T', 'RT')]
+    n_min:     Dict = {}
+    mean_fwhm: Dict = {}
+    avg_fov:   Dict = {}
+
+    def _vlabel(vk):
+        if isinstance(vk, str):
+            return vk
+        sc, tp = vk
+        sc_s = int(sc) if sc == int(sc) else sc
+        return f"T{sc_s}kpc/{tp}"
+
+    print(f"\n  {'Version':<18} {'n_min':>8} {'mean_fwhm':>12} {'avg_fov':>10}")
+    print('  ' + '-' * 52)
+    for vk in version_keys:
+        nb = vdata[vk]['nbeams']
+        fw = vdata[vk]['fwhm']
+        if nb and fw:
+            n_min[vk]     = min(nb)
+            mean_fwhm[vk] = float(np.mean(fw))
+            avg_fov[vk]   = n_min[vk] * mean_fwhm[vk]
+            print(f"  {_vlabel(vk):<18} {n_min[vk]:>8.1f} {mean_fwhm[vk]:>10.1f}\" "
+                  f"{avg_fov[vk]:>9.1f}\"")
+        else:
+            n_min[vk]     = 20.0
+            mean_fwhm[vk] = 1.0
+            avg_fov[vk]   = 20.0
+            print(f"  {_vlabel(vk):<18} {'N/A':>8} {'N/A':>12} {'N/A':>10}")
+
+    # Equalize: scale n_beams so all versions have the same average FOV
+    valid_fovs = [v for v in avg_fov.values() if v > 0]
+    global_min_fov = min(valid_fovs) if valid_fovs else 1.0
+    print(f"\n  Reference (min avg FOV): {global_min_fov:.1f}\"")
+    print(f"\n  {'Version':<18} {'n_adj':>8} {'adj_avg_fov':>12}")
+    print('  ' + '-' * 42)
+
+    n_adj: Dict = {}
+    for vk in version_keys:
+        if avg_fov[vk] > 0:
+            n_adj[vk] = n_min[vk] * (global_min_fov / avg_fov[vk])
+        else:
+            n_adj[vk] = n_min[vk]
+        adj_fov = n_adj[vk] * mean_fwhm[vk]
+        print(f"  {_vlabel(vk):<18} {n_adj[vk]:>8.2f} {adj_fov:>10.1f}\"")
+
+    # Assemble result dict
+    result: Dict = {'RAW': n_adj['RAW']}
+    for scale in scales:
+        result[scale] = {
+            'T':  n_adj.get((scale, 'T'),  20.0),
+            'RT': n_adj.get((scale, 'RT'), 20.0),
+        }
+    return result
+
+
 def compute_global_nbeams_min_t50(root_dir: Path) -> Optional[float]:
     """Global minimum n_beams from T50kpc files (comparison plot reference)."""
     n_beams = []
@@ -244,12 +445,20 @@ def process_images_for_scale(source_name: str,
                              sub_path: Optional[Path],
                              z: float,
                              fwhm_kpc: float,
-                             target_nbeams: float,
+                             target_nbeams_T: float,
+                             target_nbeams_RT: float,
+                             target_nbeams_I: float,
                              downsample_size=(1, 128, 128),
                              cheat_rt: bool = False,
+                             subtract_beam: bool = True,
                              offsets_px: Optional[Dict[str, Tuple[float, float]]] = None,
                              fov_arcsec: Optional[float] = None):
-    """Process RAW + T_X (+ T_XSUB) for one source at one scale. Returns dict of arrays."""
+    """Process RAW + T_X (+ T_XSUB) for one source at one scale.
+
+    Each image type (T taper, RT blurring, I reference) is cropped independently
+    to its own target field-of-view, determined by its version-specific n_beams.
+    Returns dict of arrays and per-type FITS headers with correct WCS.
+    """
     if offsets_px is None:
         offsets_px = {}
     if not cheat_rt:
@@ -275,7 +484,7 @@ def process_images_for_scale(source_name: str,
     if cheat_rt:
         ker = kernel_from_beams(H_raw, H_tgt)
     else:
-        ker = circular_kernel_from_z(z, H_raw, fwhm_kpc=fwhm_kpc)
+        ker = circular_kernel_from_z(z, H_raw, fwhm_kpc=fwhm_kpc, subtract_beam=subtract_beam)
     I_smt        = convolve_fft(I_raw, ker, boundary='fill', fill_value=np.nan,
                                 nan_treatment='interpolate', normalize_kernel=True,
                                 psf_pad=True, fft_pad=True, allow_huge=True)
@@ -297,30 +506,54 @@ def process_images_for_scale(source_name: str,
         yc_i += dy_px; xc_i += dx_px
         center_note += f" | manual offset (dy,dx)=({dy_px:.1f},{dx_px:.1f}) px"
 
-    beam_fwhm_as = fwhm_major_as(H_common)
+    # Per-type beam FWHMs and NaN-free limits
+    beam_fwhm_T_as  = fwhm_major_as(H_common)   # T/common-grid beam
+    beam_fwhm_I_as  = fwhm_major_as(H_raw)      # native RAW beam
     max_side_as_T   = _nan_free_centred_square_side_as(T_common,     H_common)
     max_side_as_I   = _nan_free_centred_square_side_as(I_on_common,  H_common)
     max_side_as_RT  = _nan_free_centred_square_side_as(RT_on_common, H_common)
-    max_side_as     = min(max_side_as_T, max_side_as_I, max_side_as_RT)
-    if has_sub and SUB_on_common is not None:
-        max_side_as = min(max_side_as,
-                          _nan_free_centred_square_side_as(SUB_on_common, H_common))
-    if fov_arcsec is not None:
-        desired_side_as = float(fov_arcsec)
+    max_side_as_SUB = (_nan_free_centred_square_side_as(SUB_on_common, H_common)
+                       if has_sub and SUB_on_common is not None else max_side_as_T)
+
+    # Effective RT beam FWHM (computed once; reused for both desired_RT and H_rt_fmt)
+    bmaj_rt_deg = bmin_rt_deg = bpa_rt_deg = None
+    if not cheat_rt and np.isfinite(z) and z > 0:
+        try:
+            bmaj_rt_deg, bmin_rt_deg, bpa_rt_deg = effective_rt_beam_deg(
+                z, H_raw, fwhm_kpc=fwhm_kpc, subtract_beam=subtract_beam)
+            beam_fwhm_RT_as = bmaj_rt_deg * 3600.0
+        except Exception:
+            beam_fwhm_RT_as = beam_fwhm_T_as
     else:
-        desired_side_as = target_nbeams * beam_fwhm_as
-    actual_side_as = min(desired_side_as, max_side_as)
-    actual_nbeams  = actual_side_as / beam_fwhm_as
-    if actual_side_as < desired_side_as:
-        if fov_arcsec is not None:
-            print(f"[crop] WARNING: {source_name}/{fwhm_kpc:.1f}kpc: "
-                  f"requested FOV={fov_arcsec:.1f}\" but NaN-free limit={max_side_as:.1f}\" "
-                  f"(T={max_side_as_T:.1f}\" I={max_side_as_I:.1f}\" RT={max_side_as_RT:.1f}\")")
-        else:
-            print(f"[crop] WARNING: {source_name}/{fwhm_kpc:.1f}kpc: "
-                  f"target={target_nbeams:.2f} beams, actual={actual_nbeams:.2f} beams "
-                  f"({actual_side_as:.1f}\" | NaN-free: T={max_side_as_T:.1f}\" "
-                  f"I={max_side_as_I:.1f}\" RT={max_side_as_RT:.1f}\")")
+        beam_fwhm_RT_as = beam_fwhm_T_as
+
+    # Desired crop size per version
+    if fov_arcsec is not None:
+        desired_T  = float(fov_arcsec)
+        desired_RT = float(fov_arcsec)
+        desired_I  = float(fov_arcsec)
+    else:
+        desired_T  = target_nbeams_T  * beam_fwhm_T_as
+        desired_RT = target_nbeams_RT * beam_fwhm_RT_as
+        desired_I  = target_nbeams_I  * beam_fwhm_I_as
+
+    actual_T   = min(desired_T,  max_side_as_T)
+    actual_RT  = min(desired_RT, max_side_as_RT)
+    actual_I   = min(desired_I,  max_side_as_I)
+    actual_SUB = min(desired_T,  max_side_as_SUB)
+
+    for _lbl, _desired, _actual, _beam in [
+            ('T',  desired_T,  actual_T,  beam_fwhm_T_as),
+            ('RT', desired_RT, actual_RT, beam_fwhm_RT_as),
+            ('I',  desired_I,  actual_I,  beam_fwhm_I_as),
+    ]:
+        if _actual < _desired:
+            if fov_arcsec is not None:
+                print(f"[crop] WARNING: {source_name}/{fwhm_kpc:.1f}kpc/{_lbl}: "
+                      f"requested FOV={_desired:.1f}\" clipped to NaN-free {_actual:.1f}\"")
+            else:
+                print(f"[crop] WARNING: {source_name}/{fwhm_kpc:.1f}kpc/{_lbl}: "
+                      f"target={_desired/_beam:.2f} beams clipped to {_actual/_beam:.2f} beams")
 
     header_sky_common = header_cluster_coord(H_common)
     if header_sky_common is None:
@@ -338,16 +571,18 @@ def process_images_for_scale(source_name: str,
         yc_common += dy_px_common
         xc_common += dx_px_common
 
-    if has_sub:
-        (I_crop, RT_crop, T_crop, SUB_crop), (nyc, nxc), (cy_eff, cx_eff) = \
-            crop_to_side_arcsec_on_raw(I_on_common, H_common, actual_side_as,
-                                       RT_on_common, T_common, SUB_on_common,
-                                       center=(yc_common, xc_common))
+    # Crop each image type independently (same cluster centre, type-specific FOV)
+    center_common = (yc_common, xc_common)
+    (T_crop,),  (nyc_T,  nxc_T),  (cy_T,  cx_T)  = crop_to_side_arcsec_on_raw(
+        T_common,     H_common, actual_T,   center=center_common)
+    (RT_crop,), (nyc_RT, nxc_RT), (cy_RT, cx_RT) = crop_to_side_arcsec_on_raw(
+        RT_on_common, H_common, actual_RT,  center=center_common)
+    (I_crop,),  (nyc_I,  nxc_I),  (cy_I,  cx_I)  = crop_to_side_arcsec_on_raw(
+        I_on_common,  H_common, actual_I,   center=center_common)
+    if has_sub and SUB_on_common is not None:
+        (SUB_crop,), _, _ = crop_to_side_arcsec_on_raw(
+            SUB_on_common, H_common, actual_SUB, center=center_common)
     else:
-        (I_crop, RT_crop, T_crop), (nyc, nxc), (cy_eff, cx_eff) = \
-            crop_to_side_arcsec_on_raw(I_on_common, H_common, actual_side_as,
-                                       RT_on_common, T_common,
-                                       center=(yc_common, xc_common))
         SUB_crop = None
 
     check_nan_fraction(I_crop,  f"{source_name} I_crop")
@@ -370,18 +605,34 @@ def process_images_for_scale(source_name: str,
     T_fmt_np   = _maybe_downsample(T_crop,   Ho, Wo)
     SUB_fmt_np = _maybe_downsample(SUB_crop, Ho, Wo) if has_sub else None
 
+    # Per-type WCS headers (pixel scale differs when crop sizes differ)
     H0_common, W0_common = T_common.shape
     W_i_fmt, H_i_fmt = wcs_after_center_crop_and_resize(
-        H_common, H0_common, W0_common, nyc, nxc, Ho, Wo,
-        int(round(cy_eff)), int(round(cx_eff)))
+        H_common, H0_common, W0_common, nyc_I,  nxc_I,  Ho, Wo,
+        int(round(cy_I)),  int(round(cx_I)))
+    _,        H_t_fmt = wcs_after_center_crop_and_resize(
+        H_common, H0_common, W0_common, nyc_T,  nxc_T,  Ho, Wo,
+        int(round(cy_T)),  int(round(cx_T)))
+    _,        H_rt_fmt = wcs_after_center_crop_and_resize(
+        H_common, H0_common, W0_common, nyc_RT, nxc_RT, Ho, Wo,
+        int(round(cy_RT)), int(round(cx_RT)))
+
+    # RT header: update with effective PSF beam
+    if bmaj_rt_deg is not None:
+        H_rt_fmt['BMAJ'] = bmaj_rt_deg
+        H_rt_fmt['BMIN'] = bmin_rt_deg
+        H_rt_fmt['BPA']  = bpa_rt_deg
 
     return {
         'I_raw': I_raw, 'RT_rawgrid': RT_rawgrid,
         'T_on_common': T_common, 'SUB_on_common': SUB_on_common,
         'I_fmt_np': I_fmt_np, 'RT_fmt_np': RT_fmt_np,
         'T_fmt_np': T_fmt_np, 'SUB_fmt_np': SUB_fmt_np,
-        'H_raw': H_raw, 'H_tgt': H_tgt, 'H_i_fmt': H_i_fmt,
+        'H_raw': H_raw, 'H_tgt': H_tgt,
+        'H_i_fmt': H_i_fmt, 'H_t_fmt': H_t_fmt, 'H_rt_fmt': H_rt_fmt,
         'W_raw': W_raw, 'W_i_fmt': W_i_fmt,
         'has_sub': has_sub, 'center_note': center_note,
-        'actual_side_as': actual_side_as,
+        'actual_side_T_as': actual_T,
+        'actual_side_RT_as': actual_RT,
+        'actual_side_I_as': actual_I,
     }

@@ -36,14 +36,13 @@ from dcreclass.utils.fits import (
     ARCSEC_PER_RAD,
     arcsec_per_pix, fwhm_major_as, beam_solid_angle_sr,
     read_fits_array_header_wcs, reproject_like,
-    header_cluster_coord, robust_vmin_vmax,
+    header_cluster_coord, robust_vmin_vmax, kernel_from_beams,
 )
 from dcreclass.data.processing import (
     circular_kernel_from_z, load_z_table, _canon_size,
     crop_to_side_arcsec_on_raw, find_pairs_in_tree, report_nans,
-    _nan_free_centred_square_side_as, compute_global_nbeams_per_version,
-    compute_global_nbeams_min_t50, check_nan_fraction,
-    process_images_for_scale,
+    _nan_free_centred_square_side_as, compute_global_nbeams_equalized,
+    check_nan_fraction, process_images_for_scale,
 )
 from dcreclass.utils.annotation import (
     add_beam_patch, add_scalebar_kpc,
@@ -53,7 +52,7 @@ from dcreclass.utils.annotation import (
 print("Running 03.create_processed_images.py")
 
 # ------------------- manual per-source centre offsets (INPUT pixels) -------------------
-OFFSETS_PX: Dict[str, Tuple[int, int]] = {
+OFFSETS_PX: Dict[str, Tuple[int, int]] = { # (dy, dx) to add to header centre pixel
     "PSZ2G048.10+57.16": (-100, 100),
     "PSZ2G066.34+26.14": (150, 200),
     "PSZ2G107.10+65.32": (-100, 100),
@@ -63,6 +62,7 @@ OFFSETS_PX: Dict[str, Tuple[int, int]] = {
     "PSZ2G135.17+65.43": (-150, 50),
     "PSZ2G141.05-32.61": (50, 200),
     "PSZ2G143.44+53.66": (100, 100),
+    "PSZ2G149.22+54.18": (-100, 0),
     "PSZ2G150.56+46.67": (-300, 200),
     "PSZ2G205.90+73.76": (-100, 100),
 }
@@ -73,11 +73,12 @@ def make_multi_scale_montage(source_name: str,
                              raw_path: Path,
                              scales: List[float],
                              z: float,
-                             global_nbeams: Dict[float, float],
+                             global_nbeams: Dict,
                              root_dir: Path,
                              downsample_size=(1, 128, 128),
                              save_fits: bool = False,
                              cheat_rt: bool = False,
+                             subtract_beam: bool = True,
                              force: bool = False,
                              out_png: Optional[Path] = None,
                              out_fits_dir: Optional[Path] = None,
@@ -92,6 +93,29 @@ def make_multi_scale_montage(source_name: str,
       SUB    [o][c]   [o][c]   [o][c]
     Optionally save beam-cropped FITS for each scale with updated WCS.
     """
+    # For fov_arcsec mode: compute shared side = min(Ω, min_{s'∈S} ℓ_{T_{s'}}^{NaN-free})
+    # so that all scales are cropped to the same field of view.
+    effective_fov_arcsec = fov_arcsec
+    if fov_arcsec is not None:
+        source_dir = raw_path.parent
+        min_nanfree = float('inf')
+        for _sc in scales:
+            _sc_str = int(_sc) if _sc == int(_sc) else _sc
+            _t = source_dir / f"{source_name}T{_sc_str}kpc.fits"
+            if _t.exists():
+                try:
+                    _arr, _hdr, _ = read_fits_array_header_wcs(_t)
+                    _nf = _nan_free_centred_square_side_as(_arr, _hdr)
+                    if _nf > 0:
+                        min_nanfree = min(min_nanfree, _nf)
+                except Exception:
+                    pass
+        if min_nanfree < float('inf'):
+            effective_fov_arcsec = min(fov_arcsec, min_nanfree)
+            if effective_fov_arcsec < fov_arcsec:
+                print(f"[fov_crop] {source_name}: clipping Ω={fov_arcsec:.0f}\" "
+                      f"to NaN-free limit {min_nanfree:.0f}\" -> {effective_fov_arcsec:.0f}\"")
+
     processed_scales = []
     for scale in scales:
         source_dir = raw_path.parent
@@ -104,13 +128,17 @@ def make_multi_scale_montage(source_name: str,
         if not sub_path.exists():
             sub_path = None
         try:
+            _nb = global_nbeams.get(scale, {'T': 20.0, 'RT': 20.0})
             processed = process_images_for_scale(
                 source_name=source_name, raw_path=raw_path,
                 t_path=t_path, sub_path=sub_path,
                 z=z, fwhm_kpc=float(scale),
-                target_nbeams=global_nbeams.get(scale, 20.0),
+                target_nbeams_T=_nb.get('T',  20.0),
+                target_nbeams_RT=_nb.get('RT', 20.0),
+                target_nbeams_I=global_nbeams.get('RAW', 20.0),
                 downsample_size=downsample_size, cheat_rt=cheat_rt,
-                offsets_px=OFFSETS_PX, fov_arcsec=fov_arcsec)
+                subtract_beam=subtract_beam,
+                offsets_px=OFFSETS_PX, fov_arcsec=effective_fov_arcsec)
             processed['scale']    = scale
             processed['t_path']   = t_path
             processed['sub_path'] = sub_path
@@ -227,8 +255,12 @@ def make_multi_scale_montage(source_name: str,
                 ax_crop.set_title(f"{nf*100:.0f}% NaN" if nf > 0 else "", fontsize=8)
 
     mode_str   = "header" if cheat_rt else "circular"
-    nbeams_str = ", ".join([f"{int(s) if s == int(s) else s}kpc: {global_nbeams.get(s, 20.0):.1f}b"
-                            for s in [d['scale'] for d in processed_scales]])
+    nbeams_str = ", ".join([
+        f"{int(d['scale']) if d['scale']==int(d['scale']) else d['scale']}kpc: "
+        f"T={global_nbeams.get(d['scale'], {}).get('T', 20.0):.1f}b "
+        f"RT={global_nbeams.get(d['scale'], {}).get('RT', 20.0):.1f}b"
+        for d in processed_scales
+    ]) + f"  I={global_nbeams.get('RAW', 20.0):.1f}b"
     center_note = processed_scales[0]['center_note'] if processed_scales else ""
     fig.suptitle(f"{source_name} — Multi-scale ({mode_str}) — z={z:.4f}\n"
                  f"Crop: {nbeams_str}\n{center_note}", fontsize=11, y=0.995)
@@ -246,19 +278,21 @@ def make_multi_scale_montage(source_name: str,
             sc = data['scale']; sc_str = int(sc) if sc == int(sc) else sc
             rt_label = f"RT{sc_str}kpc"; t_label = f"T{sc_str}kpc"
             H_i_fmt  = data['H_i_fmt']
+            H_t_fmt  = data.get('H_t_fmt',  H_i_fmt)  # T/SUB-specific WCS
+            H_rt_fmt = data.get('H_rt_fmt', H_i_fmt)  # RT-specific WCS + effective beam
             raw_fits_path = out_fits_dir / f"{source_name}_RAW_fmt_{Ho}x{Wo}_{suffix}.fits"
             if not raw_fits_path.exists():
                 fits.writeto(raw_fits_path, data['I_fmt_np'].astype(np.float32),
                              H_i_fmt, overwrite=True)
                 report_nans(raw_fits_path)
             fits.writeto(out_fits_dir / f"{source_name}_{rt_label}_fmt_{Ho}x{Wo}_{suffix}.fits",
-                         data['RT_fmt_np'].astype(np.float32), H_i_fmt, overwrite=True)
+                         data['RT_fmt_np'].astype(np.float32), H_rt_fmt, overwrite=True)
             fits.writeto(out_fits_dir / f"{source_name}_{t_label}_fmt_{Ho}x{Wo}_{suffix}.fits",
-                         data['T_fmt_np'].astype(np.float32), H_i_fmt, overwrite=True)
+                         data['T_fmt_np'].astype(np.float32), H_t_fmt, overwrite=True)
             if data['has_sub']:
                 sub_label = t_label + "SUB"
                 fits.writeto(out_fits_dir / f"{source_name}_{sub_label}_fmt_{Ho}x{Wo}_{suffix}.fits",
-                             data['SUB_fmt_np'].astype(np.float32), H_i_fmt, overwrite=True)
+                             data['SUB_fmt_np'].astype(np.float32), H_t_fmt, overwrite=True)
                 report_nans(out_fits_dir / f"{source_name}_{sub_label}_fmt_{Ho}x{Wo}_{suffix}.fits")
             report_nans(out_fits_dir / f"{source_name}_{rt_label}_fmt_{Ho}x{Wo}_{suffix}.fits")
             report_nans(out_fits_dir / f"{source_name}_{t_label}_fmt_{Ho}x{Wo}_{suffix}.fits")
@@ -290,7 +324,7 @@ def get_classified_sources_from_loader(root: Path,
             _, _, _, _, train_fns, eval_fns = load_galaxies(
                 galaxy_classes=[galaxy_class], versions='RAW', fold=0, train=False,
                 NORMALISE=False, AUGMENT=False, BALANCE=False, PRINTFILENAMES=True,
-                USE_CACHE=False, DEBUG=False, PREFER_PROCESSED=False)
+                USE_CACHE=False, DEBUG=False)
             for src in sorted(set(train_fns + eval_fns)):
                 if _validate_source_has_scales(src, root, scales):
                     valid_list.append(src)
@@ -352,22 +386,49 @@ def _get_annotation_header(source_name: str, root: Path,
 
 def _add_comparison_annotations(ax, source_name: str, root: Path,
                                  scale: Optional[float], z: float,
-                                 global_nbeams: float,
+                                 global_nbeams: Dict,
                                  downsample_size: Tuple[int, int],
-                                 image_type: str, color: str = 'yellow'):
+                                 image_type: str, color: str = 'yellow',
+                                 subtract_beam: bool = True):
     """Add beam patch and scale bar to one panel of the comparison plot."""
+    from dcreclass.data.processing import effective_rt_beam_deg
     try:
         ref_scale     = 50 if scale is None else scale
         ref_scale_int = int(ref_scale) if float(ref_scale).is_integer() else ref_scale
         t_path = root / source_name / f"{source_name}T{ref_scale_int}kpc.fits"
         _, H_ref, _ = read_fits_array_header_wcs(t_path)
-        fwhm_as  = fwhm_major_as(H_ref)
-        side_as  = global_nbeams * fwhm_as
+
+        # Determine nbeams and fwhm_as per image type
+        if image_type == 'RAW' or scale is None:
+            raw_path_ann = root / source_name / f"{source_name}.fits"
+            _, H_raw_ann, _ = read_fits_array_header_wcs(raw_path_ann)
+            fwhm_as = fwhm_major_as(H_raw_ann)
+            nbeams  = global_nbeams.get('RAW', 20.0)
+        elif image_type == 'Blur':
+            raw_path_ann = root / source_name / f"{source_name}.fits"
+            _, H_raw_ann, _ = read_fits_array_header_wcs(raw_path_ann)
+            try:
+                bmaj_rt_deg, _, _ = effective_rt_beam_deg(
+                    z, H_raw_ann, fwhm_kpc=float(scale), subtract_beam=subtract_beam)
+                fwhm_as = bmaj_rt_deg * 3600.0
+            except Exception:
+                fwhm_as = fwhm_major_as(H_ref)
+            nbeams = global_nbeams.get(scale, {}).get('RT', 20.0)
+        else:  # T (taper)
+            fwhm_as = fwhm_major_as(H_ref)
+            nbeams  = global_nbeams.get(scale, {}).get('T', 20.0)
+
+        side_as  = nbeams * fwhm_as
         ann_hdr  = _get_annotation_header(source_name, root, scale, side_as, downsample_size)
-        if image_type == 'RT':
-            DA_kpc   = COSMO.angular_diameter_distance(z).to_value(u.kpc)
-            fwhm_deg = (float(scale) / DA_kpc) * ARCSEC_PER_RAD / 3600.0
-            ann_hdr['BMAJ'] = fwhm_deg; ann_hdr['BMIN'] = fwhm_deg; ann_hdr['BPA'] = 0.0
+
+        if image_type == 'Blur':
+            raw_path = root / source_name / f"{source_name}.fits"
+            _, H_raw_ann, _ = read_fits_array_header_wcs(raw_path)
+            bmaj_deg, bmin_deg, bpa_deg = effective_rt_beam_deg(
+                z, H_raw_ann, fwhm_kpc=float(scale), subtract_beam=subtract_beam)
+            ann_hdr['BMAJ'] = bmaj_deg
+            ann_hdr['BMIN'] = bmin_deg
+            ann_hdr['BPA']  = bpa_deg
             add_beam_patch_simple(ax, ann_hdr, color='cyan', loc='lower left', fontsize=6)
         else:
             add_beam_patch_simple(ax, ann_hdr, color=color, loc='lower left', fontsize=6)
@@ -382,8 +443,11 @@ def _process_source_for_comparison(source_name: str,
                                    root: Path,
                                    scales: List[float],
                                    slug_to_z: Dict[str, float],
-                                   global_nbeams: float,
-                                   downsample_size: Tuple[int, int]) -> Dict[str, np.ndarray]:
+                                   global_nbeams: Dict,
+                                   downsample_size: Tuple[int, int],
+                                   subtract_beam: bool = True,
+                                   cheat_rt: bool = False,
+                                   fov_arcsec: Optional[float] = None) -> Dict[str, np.ndarray]:
     """Load and crop a single source for the comparison plot."""
     z = _load_redshift(source_name, slug_to_z)
     print(f"  z={z:.4f} for {source_name}")
@@ -414,54 +478,74 @@ def _process_source_for_comparison(source_name: str,
         out[mask_d.squeeze(0).squeeze(0).cpu().numpy() > 0.5] = np.nan
         return out
 
+    from dcreclass.data.processing import effective_rt_beam_deg
+
     results = {}
     for scale in scales:
         scale_int = int(scale) if float(scale).is_integer() else scale
-        key_t = f'T{scale_int}'; key_rt = f'RT{scale_int}'
+        key_t = f'T{scale_int}'; key_blur = f'Blur{scale_int}'
         T_nat, H_tgt, _ = read_fits_array_header_wcs(
             root / source_name / f"{source_name}T{scale_int}kpc.fits")
-        side_as = global_nbeams * fwhm_major_as(H_tgt)
+
+        # Per-type crop sizes
+        if fov_arcsec is not None:
+            side_as_T  = float(fov_arcsec)
+            side_as_RT = float(fov_arcsec)
+        else:
+            side_as_T = global_nbeams.get(scale, {}).get('T', 20.0) * fwhm_major_as(H_tgt)
+            try:
+                bmaj_rt_deg, _, _ = effective_rt_beam_deg(
+                    z, H_raw, fwhm_kpc=scale, subtract_beam=subtract_beam)
+                fwhm_rt_as = bmaj_rt_deg * 3600.0
+            except Exception:
+                fwhm_rt_as = fwhm_major_as(H_tgt)
+            side_as_RT = global_nbeams.get(scale, {}).get('RT', 20.0) * fwhm_rt_as
 
         T_on_raw = reproject_like(T_nat, H_tgt, H_raw)
-        (T_crop,), _, _ = crop_to_side_arcsec_on_raw(T_on_raw, H_raw, side_as, center=(yc, xc))
+        (T_crop,), _, _ = crop_to_side_arcsec_on_raw(T_on_raw, H_raw, side_as_T, center=(yc, xc))
         results[key_t] = _downsample_nan_safe(T_crop)
 
-        ker   = circular_kernel_from_z(z, H_raw, fwhm_kpc=scale)
-        I_smt = convolve_fft(I_raw, ker, boundary="fill", fill_value=np.nan,
-                             nan_treatment="interpolate", normalize_kernel=True,
-                             psf_pad=True, fft_pad=True, allow_huge=True)
-        DA_kpc   = COSMO.angular_diameter_distance(z).to_value(u.kpc)
-        sigma_r  = (scale / DA_kpc) / (2.0 * np.sqrt(2.0 * np.log(2.0)))
-        omega_t  = 2.0 * np.pi * sigma_r ** 2
-        RT_raw   = I_smt * (omega_t / beam_solid_angle_sr(H_raw))
-        (RT_crop,), _, _ = crop_to_side_arcsec_on_raw(RT_raw, H_raw, side_as, center=(yc, xc))
-        results[key_rt] = _downsample_nan_safe(RT_crop)
-        print(f"  {key_t} side={side_as:.0f}\" -> {results[key_t].shape}")
+        if cheat_rt:
+            ker          = kernel_from_beams(H_raw, H_tgt)
+            scale_factor = beam_solid_angle_sr(H_tgt) / beam_solid_angle_sr(H_raw)
+        else:
+            ker          = circular_kernel_from_z(z, H_raw, fwhm_kpc=scale, subtract_beam=subtract_beam)
+            DA_kpc       = COSMO.angular_diameter_distance(z).to_value(u.kpc)
+            sigma_r      = (scale / DA_kpc) / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+            scale_factor = 2.0 * np.pi * sigma_r ** 2 / beam_solid_angle_sr(H_raw)
+        blurred_img = convolve_fft(I_raw, ker, boundary="fill", fill_value=np.nan,
+                                   nan_treatment="interpolate", normalize_kernel=True,
+                                   psf_pad=True, fft_pad=True, allow_huge=True)
+        blurred_img = blurred_img * scale_factor
+        (blurred_crop,), _, _ = crop_to_side_arcsec_on_raw(blurred_img, H_raw, side_as_RT, center=(yc, xc))
+        results[key_blur] = _downsample_nan_safe(blurred_crop)
+        print(f"  {key_t} side_T={side_as_T:.0f}\" side_RT={side_as_RT:.0f}\" -> {results[key_t].shape}")
 
-    t50_key = next((f'T{int(s) if float(s).is_integer() else s}' for s in scales
-                    if (int(s) if float(s).is_integer() else s) == 50), None)
-    if t50_key is None:
-        scale_int = int(scales[0]) if float(scales[0]).is_integer() else scales[0]
-        t50_key = f'T{scale_int}'
-    _, H_t50, _ = read_fits_array_header_wcs(
-        root / source_name / f"{source_name}{t50_key}kpc.fits")
-    side_raw = global_nbeams * fwhm_major_as(H_t50)
+    # RAW crop uses its own version-specific n_beams
+    if fov_arcsec is not None:
+        side_raw = float(fov_arcsec)
+    else:
+        side_raw = global_nbeams.get('RAW', 20.0) * fwhm_major_as(H_raw)
     (I_crop,), _, _ = crop_to_side_arcsec_on_raw(I_raw, H_raw, side_raw, center=(yc, xc))
     results['RAW'] = _downsample_nan_safe(I_crop)
-    print(f"  RAW -> {results['RAW'].shape}")
+    print(f"  RAW side={side_raw:.0f}\" -> {results['RAW'].shape}")
     return results
 
 
 def _plot_comparison_row(source_name: str, root: Path,
                          scales: List[float], slug_to_z: Dict[str, float],
-                         global_nbeams: float, downsample_size: Tuple[int, int],
+                         global_nbeams: Dict, downsample_size: Tuple[int, int],
                          gs, grid_row: int, n_cols: int,
                          is_first_row: bool, fig: plt.Figure,
-                         annotate: bool = True) -> int:
+                         annotate: bool = True,
+                         subtract_beam: bool = True,
+                         cheat_rt: bool = False,
+                         fov_arcsec: Optional[float] = None) -> int:
     """Render one source row in the comparison grid. Returns next grid_row."""
     try:
         images = _process_source_for_comparison(
-            source_name, root, scales, slug_to_z, global_nbeams, downsample_size)
+            source_name, root, scales, slug_to_z, global_nbeams, downsample_size,
+            subtract_beam=subtract_beam, cheat_rt=cheat_rt, fov_arcsec=fov_arcsec)
         try:
             z = _load_redshift(source_name, slug_to_z)
         except Exception:
@@ -477,10 +561,11 @@ def _plot_comparison_row(source_name: str, root: Path,
                       cmap=cmap, interpolation='nearest')
             ax.axis('off')
             if is_first_row:
-                ax.set_title('RAW', fontsize=10, fontweight='bold', pad=0)
+                ax.set_title('Reference', fontsize=10, fontweight='bold', pad=0)
             if z is not None and annotate:
                 _add_comparison_annotations(ax, source_name, root, None, z,
-                                            global_nbeams, downsample_size, 'RAW')
+                                            global_nbeams, downsample_size, 'RAW',
+                                            subtract_beam=subtract_beam)
             ax.text(-0.015, 0.5, source_name, transform=ax.transAxes,
                     fontsize=9, va='center', ha='right', rotation=90)
         else:
@@ -491,7 +576,9 @@ def _plot_comparison_row(source_name: str, root: Path,
 
         for scale in scales:
             scale_int = int(scale) if float(scale).is_integer() else scale
-            for key, img_type in [(f'T{scale_int}', 'T'), (f'RT{scale_int}', 'RT')]:
+            for key, img_type, col_title in [
+                    (f'T{scale_int}',    'T',    f'Tap.\u2009{scale_int}\u2009kpc'),
+                    (f'Blur{scale_int}', 'Blur', f'Blur\u2009{scale_int}\u2009kpc')]:
                 ax = fig.add_subplot(gs[grid_row, col_idx])
                 if key in images:
                     vmin, vmax = robust_vmin_vmax(images[key])
@@ -499,10 +586,11 @@ def _plot_comparison_row(source_name: str, root: Path,
                               cmap='viridis', interpolation='nearest')
                     ax.axis('off')
                     if is_first_row:
-                        ax.set_title(f'{key}kpc', fontsize=10, fontweight='bold', pad=0)
+                        ax.set_title(col_title, fontsize=10, fontweight='bold', pad=0)
                     if z is not None and annotate:
                         _add_comparison_annotations(ax, source_name, root, scale, z,
-                                                    global_nbeams, downsample_size, img_type)
+                                                    global_nbeams, downsample_size, img_type,
+                                                    subtract_beam=subtract_beam)
                 else:
                     ax.axis('off')
                     ax.text(0.5, 0.5, 'MISSING', transform=ax.transAxes,
@@ -527,12 +615,15 @@ def create_comparison_plot(sources: List[str],
                            root: Path,
                            scales: List[float],
                            slug_to_z: Dict[str, float],
-                           global_nbeams: float,
+                           global_nbeams: Dict,
                            output_path: Path,
                            downsample_size: Tuple[int, int] = (128, 128),
                            figsize: Tuple[float, float] = (10, 9),
                            dpi: int = 200,
-                           annotate: bool = True):
+                           annotate: bool = True,
+                           subtract_beam: bool = True,
+                           cheat_rt: bool = False,
+                           fov_arcsec: Optional[float] = None):
     """Multi-source comparison grid: RAW | T25kpc | RT25kpc | T50kpc | RT50kpc | ..."""
     de_indices  = [i for i, s in enumerate(sources) if s in de_sources_all]
     nde_indices = [i for i, s in enumerate(sources) if s in nde_sources_all]
@@ -550,14 +641,16 @@ def create_comparison_plot(sources: List[str],
     for i in de_indices:
         grid_row = _plot_comparison_row(
             sources[i], root, scales, slug_to_z, global_nbeams, downsample_size,
-            gs, grid_row, n_cols, is_first_row=(grid_row == 0), fig=fig, annotate=annotate)
+            gs, grid_row, n_cols, is_first_row=(grid_row == 0), fig=fig, annotate=annotate,
+            subtract_beam=subtract_beam, cheat_rt=cheat_rt, fov_arcsec=fov_arcsec)
     if de_indices and nde_indices:
         grid_row += 1
     for i in nde_indices:
         is_first = (grid_row == len(de_indices) + (1 if de_indices and nde_indices else 0))
         grid_row = _plot_comparison_row(
             sources[i], root, scales, slug_to_z, global_nbeams, downsample_size,
-            gs, grid_row, n_cols, is_first_row=is_first, fig=fig, annotate=annotate)
+            gs, grid_row, n_cols, is_first_row=is_first, fig=fig, annotate=annotate,
+            subtract_beam=subtract_beam, cheat_rt=cheat_rt, fov_arcsec=fov_arcsec)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=dpi, bbox_inches='tight', pad_inches=0.01)
     plt.close(fig)
@@ -575,6 +668,7 @@ def process_single_source_wrapper(args_tuple):
             scales=scale_values, z=z, global_nbeams=global_nbeams,
             root_dir=args_dict['root'], downsample_size=args_dict['down'],
             save_fits=args_dict['save_fits'], cheat_rt=args_dict['cheat_rt'],
+            subtract_beam=args_dict.get('subtract_beam', True),
             force=args_dict['force'], out_png=out_png,
             out_fits_dir=args_dict['out_fits_dir'], suffix=args_dict['suffix'],
             fov_arcsec=args_dict.get('fov_arcsec'))
@@ -584,48 +678,187 @@ def process_single_source_wrapper(args_tuple):
         return (source_name, False, traceback.format_exc())
 
 
+def _fov_from_fits_header(hdr) -> float:
+    """Return FOV side length in arcsec from a FITS header (CDELT or CD matrix)."""
+    n1 = int(hdr.get('NAXIS1', 0))
+    if 'CD1_1' in hdr:
+        import math
+        cd11 = hdr['CD1_1']
+        cd21 = hdr.get('CD2_1', 0.0)
+        pix_deg = math.hypot(cd11, cd21)
+    else:
+        pix_deg = abs(hdr.get('CDELT1', 0.0))
+    return pix_deg * 3600.0 * n1
+
+
 def generate_diagnostic_histograms(root_dir: Path, scales: List[float],
-                                   global_nbeams: Dict[float, float],
-                                   output_path: Path):
-    """FOV distribution histograms per version."""
-    print("\n[diagnostics] Generating distribution histograms...")
-    data = {scale: {'fov': []} for scale in scales}
-    for src_dir in sorted(p for p in root_dir.glob("*") if p.is_dir()):
-        for scale in scales:
-            scale_str = f"{int(scale)}" if scale == int(scale) else f"{scale}"
-            t_path = src_dir / f"{src_dir.name}T{scale_str}kpc.fits"
-            if not t_path.exists(): continue
+                                   global_nbeams: Dict,
+                                   output_path: Path,
+                                   processed_dir: Optional[Path] = None,
+                                   fov_arcsec: Optional[float] = None,
+                                   mode: str = 'beam_crop'):
+    """FOV distribution histograms for Reference, Tap. X kpc (solid), Blur X kpc (dashed).
+
+    Reads FOV from the actual processed FITS files in *processed_dir* when available,
+    falling back to analytical computation from raw files otherwise.
+    """
+    from astropy.io import fits as _fits
+    from matplotlib.lines import Line2D
+    print("\n[diagnostics] Generating FOV distribution histograms...")
+
+    scale_palette = ['#E74C3C', '#3498DB', '#2ECC71', '#9B59B6', '#F39C12']
+    scale_colors  = {sc: scale_palette[i % len(scale_palette)] for i, sc in enumerate(scales)}
+    ref_color     = '#111111'
+    alpha_hist    = 0.6   # transparency for step histograms
+    alpha_vline   = 0.7   # transparency for mean lines
+
+    fov_raw: List[float] = []
+    fov_t:  Dict[float, List[float]] = {sc: [] for sc in scales}
+    fov_rt: Dict[float, List[float]] = {sc: [] for sc in scales}
+
+    # ── Read FOV from actual processed FITS files ──────────────────────────
+    if processed_dir is not None and Path(processed_dir).is_dir():
+        proc = Path(processed_dir)
+        # Group files by source name (prefix before first '_')
+        source_map: Dict[str, List[Path]] = {}
+        for f in sorted(proc.glob("*.fits")):
+            src = f.name.split('_')[0]
+            source_map.setdefault(src, []).append(f)
+
+        for src, files in source_map.items():
+            file_by_tag = {f.name: f for f in files}
+
+            def _fov_for_tag(tag: str) -> Optional[float]:
+                """Find the processed file matching *tag* and return its FOV."""
+                for fname, fpath in file_by_tag.items():
+                    if f'_{tag}_fmt_' in fname:
+                        try:
+                            with _fits.open(fpath) as hdul:
+                                return _fov_from_fits_header(hdul[0].header)
+                        except Exception:
+                            return None
+                return None
+
+            raw_fov = _fov_for_tag('RAW')
+            if raw_fov is not None:
+                fov_raw.append(raw_fov)
+
+            for sc in scales:
+                sc_int = int(sc) if float(sc).is_integer() else sc
+                t_fov  = _fov_for_tag(f'T{sc_int}kpc')
+                rt_fov = _fov_for_tag(f'RT{sc_int}kpc')
+                if t_fov is not None:
+                    fov_t[sc].append(t_fov)
+                if rt_fov is not None:
+                    fov_rt[sc].append(rt_fov)
+
+        print(f"[diagnostics] Read from processed dir: "
+              f"RAW={len(fov_raw)}, "
+              + ", ".join(f"T{int(sc)}kpc={len(fov_t[sc])}/RT={len(fov_rt[sc])}"
+                          for sc in scales))
+
+    # ── Fallback: analytical computation from raw FITS ─────────────────────
+    else:
+        print("[diagnostics] No processed_dir — computing FOVs analytically from raw files.")
+        ref_scale     = next((s for s in scales if (int(s) if float(s).is_integer() else s) == 50), scales[0])
+        ref_scale_int = int(ref_scale) if float(ref_scale).is_integer() else ref_scale
+
+        for src_dir in sorted(p for p in Path(root_dir).glob("*") if p.is_dir()):
+            src = src_dir.name
+            raw_path = src_dir / f"{src}.fits"
+            if not raw_path.exists():
+                continue
             try:
-                arr, hdr, _ = read_fits_array_header_wcs(t_path)
-                max_side_as = _nan_free_centred_square_side_as(arr, hdr)
-                if max_side_as <= 0: continue
-                beam_fwhm_as = fwhm_major_as(hdr)
-                actual_side_as = min(global_nbeams[scale] * beam_fwhm_as, max_side_as)
-                data[scale]['fov'].append(actual_side_as)
+                raw_arr, raw_hdr, _ = read_fits_array_header_wcs(raw_path)
+                nan_free_raw = _nan_free_centred_square_side_as(raw_arr, raw_hdr)
+                fwhm_raw     = fwhm_major_as(raw_hdr)
             except Exception:
                 continue
-    fig, ax = plt.subplots(figsize=(16, 6))
-    colors = ['#E74C3C', '#3498DB', '#2ECC71']
-    for scale, color in zip(scales, colors):
-        if data[scale]['fov']:
-            sc_str = int(scale) if scale == int(scale) else scale
-            ax.hist(data[scale]['fov'], bins=20, alpha=0.5, color=color,
-                    label=f'T{sc_str}kpc (mu={np.mean(data[scale]["fov"]):.0f}")',
-                    edgecolor='black', linewidth=1.2)
-            ax.axvline(np.mean(data[scale]['fov']), color=color, linestyle='--',
-                       linewidth=2.5, alpha=0.9)
+
+            if fov_arcsec is not None:
+                raw_fov = (min(fov_arcsec, nan_free_raw) if nan_free_raw > 0
+                           else fov_arcsec)
+            else:
+                raw_fov = global_nbeams.get('RAW', 20.0) * fwhm_raw
+            fov_raw.append(raw_fov)
+
+            for sc in scales:
+                sc_int = int(sc) if float(sc).is_integer() else sc
+                t_path = src_dir / f"{src}T{sc_int}kpc.fits"
+                if not t_path.exists():
+                    continue
+                try:
+                    t_arr, t_hdr, _ = read_fits_array_header_wcs(t_path)
+                    fwhm_t     = fwhm_major_as(t_hdr)
+                    nan_free_t = _nan_free_centred_square_side_as(t_arr, t_hdr)
+                except Exception:
+                    continue
+                if fov_arcsec is not None:
+                    t_fov  = min(fov_arcsec, nan_free_t)  if nan_free_t  > 0 else fov_arcsec
+                    rt_fov = min(fov_arcsec, nan_free_raw) if nan_free_raw > 0 else fov_arcsec
+                else:
+                    t_fov  = global_nbeams.get(sc, {}).get('T',  20.0) * fwhm_t
+                    rt_fov = global_nbeams.get(sc, {}).get('RT', 20.0) * fwhm_t
+                fov_t[sc].append(t_fov)
+                fov_rt[sc].append(rt_fov)
+
+    # ── Plot ───────────────────────────────────────────────────────────────
+    all_vals = fov_raw[:]
+    for sc in scales:
+        all_vals += fov_t[sc] + fov_rt[sc]
+    bins = np.linspace(min(all_vals), max(all_vals), 21) if all_vals else 20
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+
+    if fov_raw:
+        ax.hist(fov_raw, bins=bins, histtype='step', color=ref_color,
+                linewidth=2.2, linestyle='-', alpha=alpha_hist)
+        ax.axvline(np.mean(fov_raw), color=ref_color, linestyle='-',
+                   linewidth=2.2, alpha=alpha_vline)
+
+    for sc in scales:
+        color = scale_colors[sc]
+        if fov_t[sc]:
+            ax.hist(fov_t[sc], bins=bins, histtype='step', color=color,
+                    linewidth=2.2, linestyle='-', alpha=alpha_hist)
+            ax.axvline(np.mean(fov_t[sc]), color=color, linestyle='-',
+                       linewidth=2.2, alpha=alpha_vline)
+        if fov_rt[sc]:
+            ax.hist(fov_rt[sc], bins=bins, histtype='step', color=color,
+                    linewidth=2.0, linestyle='--', alpha=alpha_hist)
+            ax.axvline(np.mean(fov_rt[sc]), color=color, linestyle='--',
+                       linewidth=2.2, alpha=alpha_vline)
+
+    color_handles = [Line2D([0], [0], color=ref_color, linewidth=2.2, linestyle='-',
+                            alpha=alpha_hist, label='Reference')]
+    for sc in scales:
+        sc_str = int(sc) if sc == int(sc) else sc
+        color_handles.append(Line2D([0], [0], color=scale_colors[sc], linewidth=2.2,
+                                    linestyle='-', alpha=alpha_hist,
+                                    label=rf'{sc_str}$\,$kpc'))
+    style_handles = [
+        Line2D([0], [0], color='#888888', linestyle='-',  linewidth=2.2,
+               alpha=alpha_hist, label='Tap. (solid mean)'),
+        Line2D([0], [0], color='#888888', linestyle='--', linewidth=2.0,
+               alpha=alpha_hist, label='Blur (dashed mean)'),
+    ]
+    ax.legend(handles=color_handles + style_handles, fontsize=10, ncol=2)
     ax.set_xlabel('Field of View (arcsec)', fontsize=13, fontweight='bold')
     ax.set_ylabel('Number of Sources',      fontsize=13, fontweight='bold')
-    ax.set_title('FOV Distribution Per Version', fontsize=15, fontweight='bold')
-    ax.legend(fontsize=11); ax.grid(True, alpha=0.3)
+    ax.set_title(f'FOV Distribution — {mode.replace("_", " ").title()}',
+                 fontsize=14, fontweight='bold')
+    ax.grid(True, alpha=0.3)
     plt.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
     print(f"[diagnostics] Saved to {output_path}")
-    for scale in scales:
-        if data[scale]['fov']:
-            sc_str = int(scale) if scale == int(scale) else scale
-            print(f"  T{sc_str}kpc: target={global_nbeams.get(scale, 20.0):.1f}, "
-                  f"mean FOV={np.mean(data[scale]['fov']):.1f}\"")
+    for sc in scales:
+        sc_str = int(sc) if sc == int(sc) else sc
+        if fov_t[sc]:
+            print(f"  Tap. {sc_str}kpc: mean={np.mean(fov_t[sc]):.0f}\"  (N={len(fov_t[sc])})")
+        if fov_rt[sc]:
+            print(f"  Blur {sc_str}kpc: mean={np.mean(fov_rt[sc]):.0f}\"  (N={len(fov_rt[sc])})")
 
 # --------------------------------- CLI ---------------------------------------
 
@@ -651,6 +884,9 @@ def main():
     ap.add_argument("--scales",   type=str,   default="25, 50, 100")
     ap.add_argument("--fov-arcmin", type=float, default=50.0)
     ap.add_argument("--cheat-rt",  action="store_true", default=False)
+    ap.add_argument("--no-beam-sub", action="store_true", default=False,
+                    help="Convolve with C_target directly (no beam subtraction). "
+                         "Final PSF = C_beam + C_target, closer to uv-tapered images.")
     ap.add_argument("--fov-crop",  action="store_true", default=False,
                     help="Crop all images to a fixed FOV in arcseconds (ignores beam count).")
     ap.add_argument("--fov-arcsec", type=float, default=300.0,
@@ -679,12 +915,16 @@ def main():
 
     if args.fov_crop and args.cheat_rt:
         ap.error("--fov-crop and --cheat-rt are mutually exclusive.")
+    if args.no_beam_sub and (args.fov_crop or args.cheat_rt):
+        ap.error("--no-beam-sub is only compatible with the default beam_crop mode.")
 
     # Set mode-dependent output directories
     if args.fov_crop:
         mode_subdir = "fov_crop"
     elif args.cheat_rt:
         mode_subdir = "cheat_crop"
+    elif args.no_beam_sub:
+        mode_subdir = "beam_crop_no_sub"
     else:
         mode_subdir = "beam_crop"
     if args.out is None:
@@ -720,6 +960,8 @@ def main():
         suffix = "fov"
     elif args.cheat_rt:
         suffix = "cheat"
+    elif args.no_beam_sub:
+        suffix = "circ_nosub"
     else:
         suffix = "circ"
     fov_arcsec   = args.fov_arcsec if args.fov_crop else None
@@ -732,18 +974,25 @@ def main():
     print("\n" + "=" * 80)
     print("STEP 1: Computing global crop size (NaN-free across all files)")
     print("=" * 80)
+    DIAG_OUT = Path("/users/mbredber/p2_DCRECLASS/outputs/comparison_plots")
+    diag_path = DIAG_OUT / f"diagnostics_nbeams_{mode_subdir}.png"
     if args.fov_crop:
-        global_nbeams = {scale: 0.0 for scale in scale_values}
+        global_nbeams = {'RAW': 0.0,
+                         **{scale: {'T': 0.0, 'RT': 0.0} for scale in scale_values}}
         print(f"[fov_crop] Skipping beam scan — using fixed FOV={fov_arcsec:.0f}\"")
-        diag_path = None
     else:
-        global_nbeams = compute_global_nbeams_per_version(args.root, scale_values)
+        global_nbeams = compute_global_nbeams_equalized(
+            args.root, scale_values, slug_to_z, subtract_beam=not args.no_beam_sub)
+        print(f"  RAW: {global_nbeams.get('RAW', 0.0):.2f} beams")
         for scale in scale_values:
             sc_str = int(scale) if scale == int(scale) else scale
-            print(f"  T{sc_str}kpc: {global_nbeams[scale]:.1f} beams")
-        diag_path = args.out.parent / "diagnostics_nbeams_distribution.png"
-    if diag_path:
-        generate_diagnostic_histograms(args.root, scale_values, global_nbeams, diag_path)
+            nb = global_nbeams.get(scale, {'T': 0.0, 'RT': 0.0})
+            print(f"  T{sc_str}kpc: T={nb['T']:.2f}b  RT={nb['RT']:.2f}b")
+    psz2_base = args.root.parent
+    proc_dir  = psz2_base / mode_subdir / 'fits_files'
+    generate_diagnostic_histograms(args.root, scale_values, global_nbeams, diag_path,
+                                   processed_dir=proc_dir if proc_dir.is_dir() else None,
+                                   fov_arcsec=fov_arcsec, mode=mode_subdir)
 
     if not args.no_montage:
         print("\n" + "=" * 80)
@@ -764,6 +1013,7 @@ def main():
         print(f"[PARALLEL] Using {n_workers} workers")
         args_dict = dict(out=args.out, suffix=suffix, root=args.root, down=args.down,
                          save_fits=args.save_fits, cheat_rt=args.cheat_rt,
+                         subtract_beam=not args.no_beam_sub,
                          force=args.force, out_fits_dir=out_fits_dir,
                          fov_arcsec=fov_arcsec)
         tasks = []; n_skip_z = 0
@@ -822,10 +1072,8 @@ def main():
         print("=" * 80)
         annotate = not args.no_annotate
         figsize  = tuple(float(x) for x in args.comp_figsize.split(','))
-        comp_nbeams = compute_global_nbeams_min_t50(args.root)
-        if comp_nbeams is None:
-            print("[ERROR] Could not compute global nbeams for comparison plot — skipping.")
-        else:
+        comp_nbeams = global_nbeams  # equalized dict already computed in STEP 1
+        if True:
             if args.comp_sources:
                 sources = [s.strip() for s in args.comp_sources.split(',') if s.strip()]
                 de_sources_all, nde_sources_all = get_classified_sources_from_loader(
@@ -844,7 +1092,9 @@ def main():
                 if not sources:
                     print("[ERROR] No valid sources found — skipping comparison plot.")
                     return
-            print(f"[comparison] annotate={annotate}, nbeams={comp_nbeams:.1f}")
+            _nb50 = comp_nbeams.get(50.0, comp_nbeams.get(scale_values[0], {'T': 0.0}))
+            print(f"[comparison] annotate={annotate}, "
+                  f"nbeams_T50={_nb50.get('T', 0.0):.2f} RT50={_nb50.get('RT', 0.0):.2f}")
             create_comparison_plot(
                 sources=sources,
                 de_sources_all=de_sources_all,
@@ -856,6 +1106,9 @@ def main():
                 output_path=args.comp_out,
                 figsize=figsize,
                 annotate=annotate,
+                subtract_beam=not args.no_beam_sub,
+                cheat_rt=args.cheat_rt,
+                fov_arcsec=fov_arcsec,
             )
     else:
         print("[comparison] Skipped (use --comparison-plot to enable).")

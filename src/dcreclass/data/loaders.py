@@ -681,10 +681,11 @@ def _load_cache(
 
 _PSZ2_DATA_DIR = "/users/mbredber/scratch/data/PSZ2"
 _CROP_MODE_MAP = {
-    'beam_crop':  dict(use_processed=True,  filename_suffix='circ',  processed_subdir='beam_crop/fits_files'),
-    'fov_crop':   dict(use_processed=True,  filename_suffix='fov',   processed_subdir='fov_crop/fits_files'),
-    'cheat_crop': dict(use_processed=True,  filename_suffix='cheat', processed_subdir='cheat_crop/fits_files'),
-    'pixel_crop': dict(use_processed=False, filename_suffix=None,    processed_subdir=None),
+    'beam_crop':        dict(use_processed=True,  filename_suffix='circ',       processed_subdir='beam_crop/fits_files'),
+    'beam_crop_no_sub': dict(use_processed=True,  filename_suffix='circ_nosub', processed_subdir='beam_crop_no_sub/fits_files'),
+    'fov_crop':         dict(use_processed=True,  filename_suffix='fov',        processed_subdir='fov_crop/fits_files'),
+    'cheat_crop':       dict(use_processed=True,  filename_suffix='cheat',      processed_subdir='cheat_crop/fits_files'),
+    'pixel_crop':       dict(use_processed=False, filename_suffix=None,         processed_subdir=None),
 }
 
 def load_PSZ2(
@@ -960,7 +961,7 @@ def load_PSZ2(
 
                 # Prefer pre-formatted processed file
                 use_processed = use_processed and (
-                    vU.startswith("T") or vU.startswith("RT") or vU == "RAW")
+                    vU.startswith("T") or vU.startswith("RT") or vU.startswith("RTNOSUB") or vU == "RAW")
 
                 if use_processed:
                     proc_path = os.path.join(
@@ -1027,9 +1028,14 @@ def load_PSZ2(
                     C_raw_w  = _beam_cov_world(raw_hdr)
                     C_tgt_w  = _beam_cov_world(txx_hdr)
                     sigma2   = float(np.sqrt(max(0.0, np.linalg.det(C_tgt_w))))
-                    C_ker_w  = np.array([[sigma2, 0.0], [0.0, sigma2]], float) - C_raw_w
-                    w, V     = np.linalg.eigh(C_ker_w)
-                    C_ker_w  = (V * np.clip(w, 0.0, None)) @ V.T
+                    C_circ_w = np.array([[sigma2, 0.0], [0.0, sigma2]], float)
+                    if vU.startswith("RTNOSUB"):
+                        # No beam subtraction: C_ker = C_target (final PSF = C_beam + C_target)
+                        C_ker_w = C_circ_w
+                    else:
+                        C_ker_w  = C_circ_w - C_raw_w
+                        w, V     = np.linalg.eigh(C_ker_w)
+                        C_ker_w  = (V * np.clip(w, 0.0, None)) @ V.T
 
                     J    = _cd_matrix_rad(raw_hdr)
                     Cpix = np.linalg.inv(J) @ C_ker_w @ np.linalg.inv(J).T
