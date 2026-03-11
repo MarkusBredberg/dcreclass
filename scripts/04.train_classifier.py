@@ -1,4 +1,4 @@
-import os, time, random, pickle, hashlib, itertools, torch
+import os, time, random, pickle, hashlib, itertools, torch, datetime
 from dcreclass.data import load_galaxies, get_classes
 from dcreclass.models import CNN, ImageCNN, ScatterNet, DualCNNSqueezeNet, DualScatterSqueezeNet
 from dcreclass.training import (EarlyStopping, reset_weights,
@@ -90,14 +90,18 @@ if _RUN_DIR and _DATA_RUN_DIR:
     MODELS_DIR  = os.path.join(_DATA_RUN_DIR, 'models')
     METRICS_DIR = os.path.join(_DATA_RUN_DIR, 'metrics')
 else:
-    FIGURES_DIR = os.path.join(OUTDIR_BASE, 'classifier', 'figures')
-    LOGS_DIR    = os.path.join(OUTDIR_BASE, 'classifier', 'logfiles')
-    MODELS_DIR  = os.path.join(OUTDIR_BASE, 'classifier', 'trained_models')
-    METRICS_DIR = os.path.join(OUTDIR_BASE, 'classifier', 'runs')
+    _SCRATCH    = "/users/mbredber/scratch"
+    FIGURES_DIR = os.path.join(_SCRATCH, 'figures', 'classifying')
+    LOGS_DIR    = os.path.join(_SCRATCH, 'data', 'logs')
+    MODELS_DIR  = os.path.join(_SCRATCH, 'data', 'models')
+    METRICS_DIR = os.path.join(_SCRATCH, 'data', 'metrics')
 
-CROP_MODE = 'beam_crop'  # 'beam_crop' | 'fov_crop' | 'cheat_crop' | 'pixel_crop'
+CROP_MODE   = 'beam_crop'   # 'beam_crop' | 'fov_crop' | 'pixel_crop'
+BLUR_METHOD = 'circular'    # 'circular'  | 'circular_no_sub' | 'cheat'
 if os.environ.get('CROP_MODE'):
     CROP_MODE = os.environ['CROP_MODE']
+if os.environ.get('BLUR_METHOD'):
+    BLUR_METHOD = os.environ['BLUR_METHOD']
 STRETCH = True  # Arcsinh stretch
 USE_GLOBAL_NORMALISATION = False          # single on/off switch . False - image-by-image normalisation 
 GLOBAL_NORM_MODE = "percentile"           # "percentile" or "flux". Becomes "none" if USE_GLOBAL_NORMALISATION is 
@@ -128,45 +132,53 @@ os.makedirs(LOGS_DIR, exist_ok=True)
 os.makedirs(METRICS_DIR, exist_ok=True)
 os.makedirs(f'{OUTDIR_BASE}/.cache/scattering_coefficients', exist_ok=True)
 
-# Append full Python-side hyperparameters to the shared config file
-_config_file = os.environ.get('CONFIG_FILE', os.path.join(LOGS_DIR, 'config.txt'))
-with open(_config_file, 'a') as _cf:
-    _cf.write("\n========================================\n")
-    _cf.write("HYPERPARAMETERS (Python script)\n")
-    _cf.write("========================================\n")
-    _cf.write(f"SEED:                    {SEED}\n")
-    _cf.write(f"classifier:              {classifier}\n")
-    _cf.write(f"versions:                {versions}\n")
-    _cf.write(f"CROP_MODE:               {CROP_MODE}\n")
-    _cf.write(f"galaxy_classes:          {galaxy_classes}\n")
-    _cf.write(f"folds:                   {folds}\n")
-    _cf.write(f"num_experiments:         {num_experiments}\n")
-    _cf.write(f"dataset_portions:        {dataset_portions}\n")
-    _cf.write(f"max_num_galaxies:        {max_num_galaxies}\n")
-    _cf.write(f"lr:                      {lr}\n")
-    _cf.write(f"reg:                     {reg}\n")
-    _cf.write(f"label_smoothing:         {label_smoothing}\n")
-    _cf.write(f"num_epochs_cuda:         {num_epochs_cuda}\n")
-    _cf.write(f"num_epochs_cpu:          {num_epochs_cpu}\n")
-    _cf.write(f"J, L, order:             {J}, {L}, {order}\n")
-    _cf.write(f"percentile_lo:           {percentile_lo}\n")
-    _cf.write(f"percentile_hi:           {percentile_hi}\n")
-    _cf.write(f"STRETCH:                 {STRETCH}\n")
-    _cf.write(f"USE_GLOBAL_NORMALISATION:{USE_GLOBAL_NORMALISATION}\n")
-    _cf.write(f"GLOBAL_NORM_MODE:        {GLOBAL_NORM_MODE}\n")
-    _cf.write(f"NORMALISEIMGS:           {NORMALISEIMGS}\n")
-    _cf.write(f"NORMALISEIMGSTOPM:       {NORMALISEIMGSTOPM}\n")
-    _cf.write(f"NORMALISESCS:            {NORMALISESCS}\n")
-    _cf.write(f"NORMALISESCSTOPM:        {NORMALISESCSTOPM}\n")
-    _cf.write(f"FILTERED:                {FILTERED}\n")
-    _cf.write(f"FILTERGEN:               {FILTERGEN}\n")
-    _cf.write(f"AUGMENT:                 {AUGMENT}\n")
-    _cf.write(f"MIXUP:                   {MIXUP}\n")
-    _cf.write(f"USE_CLASS_WEIGHTS:       {USE_CLASS_WEIGHTS}\n")
-    _cf.write(f"ES:                      {ES}\n")
-    _cf.write(f"patience:                {patience}\n")
-    _cf.write(f"SCHEDULER:               {SCHEDULER}\n")
-    _cf.write(f"USE_CACHE:               {USE_CACHE}\n")
+# Build the per-run log filename and write the complete configuration header
+_ts = datetime.datetime.now().strftime('%Y%m%d_%H%M')
+_ver_key_early = '+'.join(map(str, versions)) if isinstance(versions, (list, tuple)) else str(versions)
+log_path = os.path.join(LOGS_DIR,
+    f"log_{classifier}_{_ver_key_early}_{CROP_MODE}_{BLUR_METHOD}_{lr}_{reg}"
+    f"_{percentile_lo}_{percentile_hi}_{label_smoothing}_{_ts}.txt")
+with open(log_path, 'w') as _lf:
+    _lf.write(f"Log file: {log_path}\n")
+    _lf.write(f"Created:  {datetime.datetime.now()}\n")
+    _lf.write("\n========================================\n")
+    _lf.write("COMPLETE CONFIGURATION\n")
+    _lf.write("========================================\n")
+    _lf.write(f"SEED:                    {SEED}\n")
+    _lf.write(f"classifier:              {classifier}\n")
+    _lf.write(f"versions:                {versions}\n")
+    _lf.write(f"CROP_MODE:               {CROP_MODE}\n")
+    _lf.write(f"BLUR_METHOD:             {BLUR_METHOD}\n")
+    _lf.write(f"galaxy_classes:          {galaxy_classes}\n")
+    _lf.write(f"folds:                   {folds}\n")
+    _lf.write(f"num_experiments:         {num_experiments}\n")
+    _lf.write(f"dataset_portions:        {dataset_portions}\n")
+    _lf.write(f"max_num_galaxies:        {max_num_galaxies}\n")
+    _lf.write(f"lr:                      {lr}\n")
+    _lf.write(f"reg:                     {reg}\n")
+    _lf.write(f"label_smoothing:         {label_smoothing}\n")
+    _lf.write(f"num_epochs_cuda:         {num_epochs_cuda}\n")
+    _lf.write(f"num_epochs_cpu:          {num_epochs_cpu}\n")
+    _lf.write(f"J, L, order:             {J}, {L}, {order}\n")
+    _lf.write(f"percentile_lo:           {percentile_lo}\n")
+    _lf.write(f"percentile_hi:           {percentile_hi}\n")
+    _lf.write(f"STRETCH:                 {STRETCH}\n")
+    _lf.write(f"USE_GLOBAL_NORMALISATION:{USE_GLOBAL_NORMALISATION}\n")
+    _lf.write(f"GLOBAL_NORM_MODE:        {GLOBAL_NORM_MODE}\n")
+    _lf.write(f"NORMALISEIMGS:           {NORMALISEIMGS}\n")
+    _lf.write(f"NORMALISEIMGSTOPM:       {NORMALISEIMGSTOPM}\n")
+    _lf.write(f"NORMALISESCS:            {NORMALISESCS}\n")
+    _lf.write(f"NORMALISESCSTOPM:        {NORMALISESCSTOPM}\n")
+    _lf.write(f"FILTERED:                {FILTERED}\n")
+    _lf.write(f"FILTERGEN:               {FILTERGEN}\n")
+    _lf.write(f"AUGMENT:                 {AUGMENT}\n")
+    _lf.write(f"MIXUP:                   {MIXUP}\n")
+    _lf.write(f"USE_CLASS_WEIGHTS:       {USE_CLASS_WEIGHTS}\n")
+    _lf.write(f"ES:                      {ES}\n")
+    _lf.write(f"patience:                {patience}\n")
+    _lf.write(f"SCHEDULER:               {SCHEDULER}\n")
+    _lf.write(f"USE_CACHE:               {USE_CACHE}\n")
+    _lf.write("========================================\n\n")
 
 if torch.cuda.is_available():
     DEVICE = "cuda"
@@ -291,6 +303,7 @@ _out  = load_galaxies(galaxy_classes=galaxy_classes,
             USE_CACHE=USE_CACHE,
             DEBUG=DEBUG,
             crop_mode=CROP_MODE,
+            blur_method=BLUR_METHOD,
             train=False)  # Obtain the test set
 
 if len(_out) == 4:
@@ -397,9 +410,6 @@ for fold in folds:
     f"global_norm={USE_GLOBAL_NORMALISATION}, norm_mode={GLOBAL_NORM_MODE}, "
     f"CROP_MODE={CROP_MODE} ◀")
 
-    log_path = f"{LOGS_DIR}/log_{classifier}_{runname}.txt"
-    os.makedirs(os.path.dirname(log_path), exist_ok=True)
-    
     if USE_CACHE:
         fold_subset_sizes = [round_to_1(max(2, int(len(train_val_images) * p))) for p in dataset_portions]
         all_configs_exist = all(
@@ -438,6 +448,7 @@ for fold in folds:
             USE_CACHE=USE_CACHE,
             DEBUG=DEBUG,
             crop_mode=CROP_MODE,
+            blur_method=BLUR_METHOD,
             train=True) # Obtain the train and validation set. Not test set
     
     if len(_out) == 4:

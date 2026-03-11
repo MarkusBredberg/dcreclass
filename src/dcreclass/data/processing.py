@@ -281,18 +281,18 @@ def compute_global_nbeams_equalized(root_dir: Path,
     Returns:
         {
             'RAW': float,                     # adjusted n_beams for reference images
-            scale: {'T': float, 'RT': float}  # adjusted n_beams for taper/blurring
+            scale: {'T': float, 'Blur': float}  # adjusted n_beams for taper/blurring
             for scale in scales
         }
     """
     print('[compute_global_nbeams_equalized] Scanning all 7 dataset versions...')
 
     # Accumulate per-version n_beams and beam_fwhm lists
-    # Keys: 'RAW', (scale, 'T'), (scale, 'RT')
+    # Keys: 'RAW', (scale, 'T'), (scale, 'Blur')
     vdata: Dict = {
         'RAW': {'nbeams': [], 'fwhm': []},
         **{(sc, 'T'):  {'nbeams': [], 'fwhm': []} for sc in scales},
-        **{(sc, 'RT'): {'nbeams': [], 'fwhm': []} for sc in scales},
+        **{(sc, 'Blur'): {'nbeams': [], 'fwhm': []} for sc in scales},
     }
 
     for src_dir in sorted(p for p in Path(root_dir).glob('*') if p.is_dir()):
@@ -340,13 +340,13 @@ def compute_global_nbeams_equalized(root_dir: Path,
                         z, hdr_raw, fwhm_kpc=scale, subtract_beam=subtract_beam)
                     fw_rt = bmaj_deg * 3600.0
                     if fw_rt > 0:
-                        vdata[(scale, 'RT')]['nbeams'].append(nf_t / fw_rt)
-                        vdata[(scale, 'RT')]['fwhm'].append(fw_rt)
+                        vdata[(scale, 'Blur')]['nbeams'].append(nf_t / fw_rt)
+                        vdata[(scale, 'Blur')]['fwhm'].append(fw_rt)
                 except Exception:
                     pass
 
     # Compute n_min, mean_fwhm, and avg_fov per version
-    version_keys = ['RAW'] + [(sc, t) for sc in scales for t in ('T', 'RT')]
+    version_keys = ['RAW'] + [(sc, t) for sc in scales for t in ('T', 'Blur')]
     n_min:     Dict = {}
     mean_fwhm: Dict = {}
     avg_fov:   Dict = {}
@@ -396,7 +396,7 @@ def compute_global_nbeams_equalized(root_dir: Path,
     for scale in scales:
         result[scale] = {
             'T':  n_adj.get((scale, 'T'),  20.0),
-            'RT': n_adj.get((scale, 'RT'), 20.0),
+            'Blur': n_adj.get((scale, 'Blur'), 20.0),
         }
     return result
 
@@ -544,7 +544,7 @@ def process_images_for_scale(source_name: str,
 
     for _lbl, _desired, _actual, _beam in [
             ('T',  desired_T,  actual_T,  beam_fwhm_T_as),
-            ('RT', desired_RT, actual_RT, beam_fwhm_RT_as),
+            ('Blur', desired_RT, actual_RT, beam_fwhm_RT_as),
             ('I',  desired_I,  actual_I,  beam_fwhm_I_as),
     ]:
         if _actual < _desired:

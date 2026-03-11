@@ -59,7 +59,7 @@ def add_scalebar_kpc(ax, header, z, length_kpc=100.0, color='white', loc='lower 
 
 
 def add_beam_patch_simple(ax, header, color='white', alpha=0.8,
-                          loc='lower left', fontsize=6):
+                          loc='lower left', fontsize=6, x_offset=0.0):
     """Add beam ellipse to a plain (non-WCS) imshow axis."""
     from matplotlib.patches import Ellipse
     bmaj_as  = float(header['BMAJ']) * 3600.0
@@ -72,6 +72,7 @@ def add_beam_patch_simple(ax, header, color='white', alpha=0.8,
     bmaj_f   = bmaj_pix / ny; bmin_f = bmin_pix / nx
     yc_n = margin + bmaj_f / 2 if 'lower' in loc else 1 - margin - bmaj_f / 2
     xc_n = margin + bmin_f / 2 if 'left'  in loc else 1 - margin - bmin_f / 2
+    xc_n += x_offset
     yc_n = np.clip(yc_n, bmaj_f / 2 + 0.05, 1 - bmaj_f / 2 - 0.05)
     xc_n = np.clip(xc_n, bmin_f / 2 + 0.05, 1 - bmin_f / 2 - 0.05)
     ax.add_patch(Ellipse(xy=(xc_n * nx, yc_n * ny), width=bmaj_pix, height=bmin_pix,

@@ -13,10 +13,16 @@ from torch.utils.data import TensorDataset, DataLoader
 from utils.classifiers import CNN, ImageCNN, ScatterNet, DualCNNSqueezeNet, DualScatterSqueezeNet
 from utils.calc_tools import fold_T_axis, custom_collate
 
-# Create output directories
-os.makedirs('./classifier/trained_models', exist_ok=True)
-os.makedirs('./classifier/trained_models_filtered', exist_ok=True)
-os.makedirs('./classifier/attention_maps', exist_ok=True)
+_SCRATCH     = "/users/mbredber/scratch"
+MODELS_DIR   = os.path.join(_SCRATCH, 'data', 'models')
+METRICS_DIR  = os.path.join(_SCRATCH, 'data', 'metrics')
+FIGURES_DIR  = os.path.join(_SCRATCH, 'figures', 'classifying')
+ATTN_DIR     = os.path.join(_SCRATCH, 'figures', 'classifying', 'attention_maps')
+
+os.makedirs(MODELS_DIR, exist_ok=True)
+os.makedirs(os.path.join(MODELS_DIR, 'filtered'), exist_ok=True)
+os.makedirs(ATTN_DIR, exist_ok=True)
+os.makedirs(FIGURES_DIR, exist_ok=True)
 
 print("Running enhanced evaluation script 2.0 with attention visualization")
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -51,7 +57,9 @@ classifier = ["CNN",         # 0.Very Simple CNN
               ][3]
 crop_size = (512, 512)
 downsample_size = (128, 128)
-version = 'T25kpc'
+version     = 'T25kpc'
+crop_mode   = 'beam_crop'   # 'beam_crop' | 'fov_crop' | 'pixel_crop'
+blur_method = 'circular'    # 'circular'  | 'circular_no_sub' | 'cheat'
 J, L, order = 2, 12, 2
 
 # NEW: Attention visualization settings
@@ -67,7 +75,7 @@ cmap_green = LinearSegmentedColormap.from_list(
 ######### SETTING THE RIGHT PARAMETERS ########
 ###############################################
 
-directory = './classifier/trained_models_filtered/' if FILTERED else './classifier/trained_models/'
+directory = os.path.join(MODELS_DIR, 'filtered') + os.sep if FILTERED else MODELS_DIR + os.sep
 
 # Define dataset sizes (must match training)
 if galaxy_classes == [50, 51]:
@@ -113,9 +121,9 @@ for lr, reg, experiment, fold in itertools.product(
         cs = f"{crop_size[0]}x{crop_size[1]}"
         ds = f"{downsample_size[0]}x{downsample_size[1]}"
         if USE_GLOBAL_NORMALISATION:
-            metrics_read_path = f"./classifier/4.1.runs/global_norm/{classifier}_{galaxy_classes}_lr{lr}_reg{reg}_lo{percentile_lo}_hi{percentile_hi}_cs{cs}_ds{ds}_ver{version}_f{fold}_ss{round_to_1(subset_size)}_e{experiment}_{GLOBAL_NORM_MODE}_metrics_data.pkl"
+            metrics_read_path = os.path.join(METRICS_DIR, f"{classifier}_{galaxy_classes}_lr{lr}_reg{reg}_lo{percentile_lo}_hi{percentile_hi}_cs{cs}_ds{ds}_ver{version}_f{fold}_ss{round_to_1(subset_size)}_e{experiment}_{GLOBAL_NORM_MODE}_metrics_data.pkl")
         else:
-            metrics_read_path = f"./classifier/4.1.runs/{classifier}_{galaxy_classes}_lr{lr}_reg{reg}_lo{percentile_lo}_hi{percentile_hi}_cs{cs}_ds{ds}_ver{version}_f{fold}_ss{round_to_1(subset_size)}_e{experiment}_metrics_data.pkl"
+            metrics_read_path = os.path.join(METRICS_DIR, f"{classifier}_{galaxy_classes}_lr{lr}_reg{reg}_lo{percentile_lo}_hi{percentile_hi}_cs{cs}_ds{ds}_ver{version}_f{fold}_ss{round_to_1(subset_size)}_e{experiment}_metrics_data.pkl")
         
         try:
             with open(metrics_read_path, 'rb') as f:
@@ -281,11 +289,11 @@ plot_cluster_metrics(all_cluster_metrics)
 print("\n" + "="*60)
 print("EVALUATION SCRIPT FINISHED SUCCESSFULLY!")
 print("="*60)
-print(f"\nPlots and summaries saved to: ./classifier/")
-print(f"- Histograms: ./classifier/figures/")
-print(f"- ROC curves: ./classifier/figures/")
-print(f"- Confusion matrices: ./classifier/figures/")
-print(f"- Summary CSV: ./classifier/figures/{galaxy_classes}_{classifier}_robust_summary.csv")
+print(f"\nPlots and summaries saved to: {FIGURES_DIR}")
+print(f"- Histograms: {FIGURES_DIR}")
+print(f"- ROC curves: {FIGURES_DIR}")
+print(f"- Confusion matrices: {FIGURES_DIR}")
+print(f"- Summary CSV: {os.path.join(FIGURES_DIR, f'{galaxy_classes}_{classifier}_robust_summary.csv')}")
 
 
 if GENERATE_ATTENTION_MAPS:
@@ -370,7 +378,7 @@ if GENERATE_ATTENTION_MAPS:
     cs = f"{crop_size[0]}x{crop_size[1]}"
     ds = f"{downsample_size[0]}x{downsample_size[1]}"
     
-    model_path = f"./classifier/trained_models/cl{classifier}_ss{round_to_1(subset_size_to_use)}_f{fold_to_use}_lr{learning_rates[0]}_reg{regularization_params[0]}_ls0.1_cs{cs}_ds{ds}_pl{percentile_lo}_ph{percentile_hi}_ver{version}_model.pth"
+    model_path = os.path.join(MODELS_DIR, f"cl{classifier}_ss{round_to_1(subset_size_to_use)}_f{fold_to_use}_lr{learning_rates[0]}_reg{regularization_params[0]}_ls0.1_cs{cs}_ds{ds}_pl{percentile_lo}_ph{percentile_hi}_ver{version}_model.pth")
     
     # Initialize model architecture
     img_shape = tuple(test_images.shape[1:]) if test_images.dim() == 4 else tuple(test_images.shape[2:])
@@ -410,7 +418,7 @@ if GENERATE_ATTENTION_MAPS:
             test_loader=test_loader,
             galaxy_classes=galaxy_classes,
             source_names=source_names,
-            save_dir='./classifier',
+            save_dir=ATTN_DIR,
             methods=ATTENTION_METHODS
         )
 
@@ -425,4 +433,4 @@ print("\n" + "="*60)
 print("EVALUATION SCRIPT FINISHED SUCCESSFULLY!")
 print("="*60)
 if GENERATE_ATTENTION_MAPS:
-    print(f"\nAttention maps saved to: ./classifier/attention_maps/")
+    print(f"\nAttention maps saved to: {ATTN_DIR}")

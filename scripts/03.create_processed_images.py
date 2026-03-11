@@ -128,13 +128,13 @@ def make_multi_scale_montage(source_name: str,
         if not sub_path.exists():
             sub_path = None
         try:
-            _nb = global_nbeams.get(scale, {'T': 20.0, 'RT': 20.0})
+            _nb = global_nbeams.get(scale, {'T': 20.0, 'Blur': 20.0})
             processed = process_images_for_scale(
                 source_name=source_name, raw_path=raw_path,
                 t_path=t_path, sub_path=sub_path,
                 z=z, fwhm_kpc=float(scale),
                 target_nbeams_T=_nb.get('T',  20.0),
-                target_nbeams_RT=_nb.get('RT', 20.0),
+                target_nbeams_RT=_nb.get('Blur', 20.0),
                 target_nbeams_I=global_nbeams.get('RAW', 20.0),
                 downsample_size=downsample_size, cheat_rt=cheat_rt,
                 subtract_beam=subtract_beam,
@@ -156,7 +156,7 @@ def make_multi_scale_montage(source_name: str,
         if save_fits and all_outputs_exist:
             for data in processed_scales:
                 sc = data['scale']; sc_str = int(sc) if sc == int(sc) else sc
-                rt_l = f"RT{sc_str}kpc"; t_l = f"T{sc_str}kpc"
+                rt_l = f"Blur{sc_str}kpc"; t_l = f"T{sc_str}kpc"
                 required = [
                     out_fits_dir / f"{source_name}_RAW_fmt_{Ho}x{Wo}_{suffix}.fits",
                     out_fits_dir / f"{source_name}_{rt_l}_fmt_{Ho}x{Wo}_{suffix}.fits",
@@ -192,7 +192,7 @@ def make_multi_scale_montage(source_name: str,
                  fontsize=11, fontweight='bold', ha='center', va='bottom',
                  transform=fig.transFigure)
 
-    row_label_names = ['RT', 'T', 'SUB'] if has_sub else ['RT', 'T']
+    row_label_names = ['Blur', 'T', 'SUB'] if has_sub else ['Blur', 'T']
     total_height = sum(row_heights)
     for row_idx, label in enumerate(row_label_names, start=1):
         y_top = 1.0 - sum(row_heights[:row_idx]) / total_height
@@ -220,13 +220,13 @@ def make_multi_scale_montage(source_name: str,
                           + (f" {nan_frac*100:.1f}% NaN" if nan_frac > 0 else ""),
                           fontsize=12, pad=8)
 
-    row_labels = ['RT', 'T', 'SUB'] if has_sub else ['RT', 'T']
+    row_labels = ['Blur', 'T', 'SUB'] if has_sub else ['Blur', 'T']
     for row_idx, row_label in enumerate(row_labels, start=1):
         for scale_idx, data in enumerate(processed_scales):
             sc_str   = int(data['scale']) if data['scale'] == int(data['scale']) else data['scale']
             col_orig = scale_idx * 2
             col_crop = scale_idx * 2 + 1
-            if row_label == 'RT':
+            if row_label == 'Blur':
                 arr_orig, arr_crop = data['RT_rawgrid'], data['RT_fmt_np']
             elif row_label == 'T':
                 arr_orig, arr_crop = data['T_on_common'], data['T_fmt_np']
@@ -258,7 +258,7 @@ def make_multi_scale_montage(source_name: str,
     nbeams_str = ", ".join([
         f"{int(d['scale']) if d['scale']==int(d['scale']) else d['scale']}kpc: "
         f"T={global_nbeams.get(d['scale'], {}).get('T', 20.0):.1f}b "
-        f"RT={global_nbeams.get(d['scale'], {}).get('RT', 20.0):.1f}b"
+        f"Blur={global_nbeams.get(d['scale'], {}).get('Blur', 20.0):.1f}b"
         for d in processed_scales
     ]) + f"  I={global_nbeams.get('RAW', 20.0):.1f}b"
     center_note = processed_scales[0]['center_note'] if processed_scales else ""
@@ -276,7 +276,7 @@ def make_multi_scale_montage(source_name: str,
         out_fits_dir.mkdir(parents=True, exist_ok=True)
         for data in processed_scales:
             sc = data['scale']; sc_str = int(sc) if sc == int(sc) else sc
-            rt_label = f"RT{sc_str}kpc"; t_label = f"T{sc_str}kpc"
+            rt_label = f"Blur{sc_str}kpc"; t_label = f"T{sc_str}kpc"
             H_i_fmt  = data['H_i_fmt']
             H_t_fmt  = data.get('H_t_fmt',  H_i_fmt)  # T/SUB-specific WCS
             H_rt_fmt = data.get('H_rt_fmt', H_i_fmt)  # RT-specific WCS + effective beam
@@ -389,7 +389,9 @@ def _add_comparison_annotations(ax, source_name: str, root: Path,
                                  global_nbeams: Dict,
                                  downsample_size: Tuple[int, int],
                                  image_type: str, color: str = 'yellow',
-                                 subtract_beam: bool = True):
+                                 subtract_beam: bool = True,
+                                 fov_arcsec: Optional[float] = None,
+                                 cheat_rt: bool = False):
     """Add beam patch and scale bar to one panel of the comparison plot."""
     from dcreclass.data.processing import effective_rt_beam_deg
     try:
@@ -405,33 +407,49 @@ def _add_comparison_annotations(ax, source_name: str, root: Path,
             fwhm_as = fwhm_major_as(H_raw_ann)
             nbeams  = global_nbeams.get('RAW', 20.0)
         elif image_type == 'Blur':
-            raw_path_ann = root / source_name / f"{source_name}.fits"
-            _, H_raw_ann, _ = read_fits_array_header_wcs(raw_path_ann)
-            try:
-                bmaj_rt_deg, _, _ = effective_rt_beam_deg(
-                    z, H_raw_ann, fwhm_kpc=float(scale), subtract_beam=subtract_beam)
-                fwhm_as = bmaj_rt_deg * 3600.0
-            except Exception:
+            if cheat_rt:
+                # Cheat mode: Blur image was convolved to match the T beam exactly
                 fwhm_as = fwhm_major_as(H_ref)
-            nbeams = global_nbeams.get(scale, {}).get('RT', 20.0)
+            else:
+                raw_path_ann = root / source_name / f"{source_name}.fits"
+                _, H_raw_ann, _ = read_fits_array_header_wcs(raw_path_ann)
+                try:
+                    bmaj_rt_deg, _, _ = effective_rt_beam_deg(
+                        z, H_raw_ann, fwhm_kpc=float(scale), subtract_beam=subtract_beam)
+                    fwhm_as = bmaj_rt_deg * 3600.0
+                except Exception:
+                    fwhm_as = fwhm_major_as(H_ref)
+            nbeams = global_nbeams.get(scale, {}).get('Blur', 20.0)
         else:  # T (taper)
             fwhm_as = fwhm_major_as(H_ref)
             nbeams  = global_nbeams.get(scale, {}).get('T', 20.0)
 
-        side_as  = nbeams * fwhm_as
+        # In fov_crop mode nbeams==0; use the fixed FOV directly
+        if fov_arcsec is not None and nbeams == 0.0:
+            side_as = float(fov_arcsec)
+        else:
+            side_as = nbeams * fwhm_as
         ann_hdr  = _get_annotation_header(source_name, root, scale, side_as, downsample_size)
 
         if image_type == 'Blur':
-            raw_path = root / source_name / f"{source_name}.fits"
-            _, H_raw_ann, _ = read_fits_array_header_wcs(raw_path)
-            bmaj_deg, bmin_deg, bpa_deg = effective_rt_beam_deg(
-                z, H_raw_ann, fwhm_kpc=float(scale), subtract_beam=subtract_beam)
-            ann_hdr['BMAJ'] = bmaj_deg
-            ann_hdr['BMIN'] = bmin_deg
-            ann_hdr['BPA']  = bpa_deg
-            add_beam_patch_simple(ax, ann_hdr, color='cyan', loc='lower left', fontsize=6)
+            if cheat_rt:
+                # Cheat mode: Blur beam = T beam
+                ann_hdr['BMAJ'] = H_ref['BMAJ']
+                ann_hdr['BMIN'] = H_ref['BMIN']
+                ann_hdr['BPA']  = H_ref.get('BPA', 0.0)
+            else:
+                raw_path = root / source_name / f"{source_name}.fits"
+                _, H_raw_ann, _ = read_fits_array_header_wcs(raw_path)
+                bmaj_deg, bmin_deg, bpa_deg = effective_rt_beam_deg(
+                    z, H_raw_ann, fwhm_kpc=float(scale), subtract_beam=subtract_beam)
+                ann_hdr['BMAJ'] = bmaj_deg
+                ann_hdr['BMIN'] = bmin_deg
+                ann_hdr['BPA']  = bpa_deg
+            add_beam_patch_simple(ax, ann_hdr, color='cyan', loc='lower left', fontsize=6,
+                                  x_offset=0.07)
         else:
-            add_beam_patch_simple(ax, ann_hdr, color=color, loc='lower left', fontsize=6)
+            add_beam_patch_simple(ax, ann_hdr, color=color, loc='lower left', fontsize=6,
+                                  x_offset=0.07)
         add_scalebar_kpc_simple(ax, ann_hdr, z, length_kpc=1000.0,
                                 color='white', loc='lower right', fontsize=6)
     except Exception as e:
@@ -499,7 +517,7 @@ def _process_source_for_comparison(source_name: str,
                 fwhm_rt_as = bmaj_rt_deg * 3600.0
             except Exception:
                 fwhm_rt_as = fwhm_major_as(H_tgt)
-            side_as_RT = global_nbeams.get(scale, {}).get('RT', 20.0) * fwhm_rt_as
+            side_as_RT = global_nbeams.get(scale, {}).get('Blur', 20.0) * fwhm_rt_as
 
         T_on_raw = reproject_like(T_nat, H_tgt, H_raw)
         (T_crop,), _, _ = crop_to_side_arcsec_on_raw(T_on_raw, H_raw, side_as_T, center=(yc, xc))
@@ -565,7 +583,9 @@ def _plot_comparison_row(source_name: str, root: Path,
             if z is not None and annotate:
                 _add_comparison_annotations(ax, source_name, root, None, z,
                                             global_nbeams, downsample_size, 'RAW',
-                                            subtract_beam=subtract_beam)
+                                            subtract_beam=subtract_beam,
+                                            fov_arcsec=fov_arcsec,
+                                            cheat_rt=cheat_rt)
             ax.text(-0.015, 0.5, source_name, transform=ax.transAxes,
                     fontsize=9, va='center', ha='right', rotation=90)
         else:
@@ -590,7 +610,9 @@ def _plot_comparison_row(source_name: str, root: Path,
                     if z is not None and annotate:
                         _add_comparison_annotations(ax, source_name, root, scale, z,
                                                     global_nbeams, downsample_size, img_type,
-                                                    subtract_beam=subtract_beam)
+                                                    subtract_beam=subtract_beam,
+                                                    fov_arcsec=fov_arcsec,
+                                                    cheat_rt=cheat_rt)
                 else:
                     ax.axis('off')
                     ax.text(0.5, 0.5, 'MISSING', transform=ax.transAxes,
@@ -746,7 +768,7 @@ def generate_diagnostic_histograms(root_dir: Path, scales: List[float],
             for sc in scales:
                 sc_int = int(sc) if float(sc).is_integer() else sc
                 t_fov  = _fov_for_tag(f'T{sc_int}kpc')
-                rt_fov = _fov_for_tag(f'RT{sc_int}kpc')
+                rt_fov = _fov_for_tag(f'Blur{sc_int}kpc')
                 if t_fov is not None:
                     fov_t[sc].append(t_fov)
                 if rt_fov is not None:
@@ -754,7 +776,7 @@ def generate_diagnostic_histograms(root_dir: Path, scales: List[float],
 
         print(f"[diagnostics] Read from processed dir: "
               f"RAW={len(fov_raw)}, "
-              + ", ".join(f"T{int(sc)}kpc={len(fov_t[sc])}/RT={len(fov_rt[sc])}"
+              + ", ".join(f"T{int(sc)}kpc={len(fov_t[sc])}/Blur={len(fov_rt[sc])}"
                           for sc in scales))
 
     # ── Fallback: analytical computation from raw FITS ─────────────────────
@@ -798,7 +820,7 @@ def generate_diagnostic_histograms(root_dir: Path, scales: List[float],
                     rt_fov = min(fov_arcsec, nan_free_raw) if nan_free_raw > 0 else fov_arcsec
                 else:
                     t_fov  = global_nbeams.get(sc, {}).get('T',  20.0) * fwhm_t
-                    rt_fov = global_nbeams.get(sc, {}).get('RT', 20.0) * fwhm_t
+                    rt_fov = global_nbeams.get(sc, {}).get('Blur', 20.0) * fwhm_t
                 fov_t[sc].append(t_fov)
                 fov_rt[sc].append(rt_fov)
 
@@ -883,14 +905,14 @@ def main():
     ap.add_argument("--down",     type=parse_tuple3, default="128,128")
     ap.add_argument("--scales",   type=str,   default="25, 50, 100")
     ap.add_argument("--fov-arcmin", type=float, default=50.0)
-    ap.add_argument("--cheat-rt",  action="store_true", default=False)
-    ap.add_argument("--no-beam-sub", action="store_true", default=False,
-                    help="Convolve with C_target directly (no beam subtraction). "
-                         "Final PSF = C_beam + C_target, closer to uv-tapered images.")
-    ap.add_argument("--fov-crop",  action="store_true", default=False,
-                    help="Crop all images to a fixed FOV in arcseconds (ignores beam count).")
+    ap.add_argument("--crop-mode", type=str, default="beam_crop",
+                    choices=["beam_crop", "fov_crop", "pixel_crop"],
+                    help="Cropping strategy (default: beam_crop).")
+    ap.add_argument("--blur-method", type=str, default="circular",
+                    choices=["circular", "circular_no_sub", "cheat"],
+                    help="Blurring kernel (default: circular).")
     ap.add_argument("--fov-arcsec", type=float, default=300.0,
-                    help="FOV size in arcseconds for --fov-crop mode (default: 300).")
+                    help="FOV size in arcseconds when --crop-mode fov_crop (default: 300).")
     ap.add_argument("--force",    action="store_true", default=False)
     ap.add_argument("--only-offsets", action="store_true")
     ap.add_argument("--only",     type=str,   default="")
@@ -913,26 +935,19 @@ def main():
 
     args = ap.parse_args()
 
-    if args.fov_crop and args.cheat_rt:
-        ap.error("--fov-crop and --cheat-rt are mutually exclusive.")
-    if args.no_beam_sub and (args.fov_crop or args.cheat_rt):
-        ap.error("--no-beam-sub is only compatible with the default beam_crop mode.")
+    crop_mode   = args.crop_mode
+    blur_method = args.blur_method
+    cheat_rt      = (blur_method == 'cheat')
+    subtract_beam = (blur_method != 'circular_no_sub')
+    fov_arcsec    = args.fov_arcsec if crop_mode == 'fov_crop' else None
 
-    # Set mode-dependent output directories
-    if args.fov_crop:
-        mode_subdir = "fov_crop"
-    elif args.cheat_rt:
-        mode_subdir = "cheat_crop"
-    elif args.no_beam_sub:
-        mode_subdir = "beam_crop_no_sub"
-    else:
-        mode_subdir = "beam_crop"
+    mode_subdir = f"{crop_mode}/{blur_method}"
     if args.out is None:
-        args.out = PSZ2_DIR / mode_subdir / "montages"
+        args.out = PSZ2_DIR / crop_mode / blur_method / "montages"
     if args.fits_out is None:
-        args.fits_out = PSZ2_DIR / mode_subdir / "fits_files"
+        args.fits_out = PSZ2_DIR / crop_mode / blur_method / "fits_files"
     if args.comp_out is None:
-        args.comp_out = PSZ2_DIR / mode_subdir / "comparison_plot.pdf"
+        args.comp_out = Path("/users/mbredber/scratch/figures/processing") / f"comparison_{mode_subdir.replace('/', '_')}.pdf"
 
     print(f"[init] Loading redshift table from {args.z_csv}")
     slug_to_z = load_z_table(args.z_csv)
@@ -955,16 +970,8 @@ def main():
     if not scale_values:
         print("[ERROR] No valid scales provided"); return
 
-    only_names   = set(s.strip() for s in args.only.split(",") if s.strip())
-    if args.fov_crop:
-        suffix = "fov"
-    elif args.cheat_rt:
-        suffix = "cheat"
-    elif args.no_beam_sub:
-        suffix = "circ_nosub"
-    else:
-        suffix = "circ"
-    fov_arcsec   = args.fov_arcsec if args.fov_crop else None
+    only_names = set(s.strip() for s in args.only.split(",") if s.strip())
+    suffix     = blur_method
     Ho, Wo       = _canon_size(args.down)[-2:]
     out_fits_dir = args.fits_out
 
@@ -974,22 +981,22 @@ def main():
     print("\n" + "=" * 80)
     print("STEP 1: Computing global crop size (NaN-free across all files)")
     print("=" * 80)
-    DIAG_OUT = Path("/users/mbredber/p2_DCRECLASS/outputs/comparison_plots")
-    diag_path = DIAG_OUT / f"diagnostics_nbeams_{mode_subdir}.png"
-    if args.fov_crop:
+    DIAG_OUT = Path("/users/mbredber/scratch/figures/processing")
+    diag_path = DIAG_OUT / f"diagnostics_nbeams_{mode_subdir.replace('/', '_')}.png"
+    if crop_mode == 'fov_crop':
         global_nbeams = {'RAW': 0.0,
-                         **{scale: {'T': 0.0, 'RT': 0.0} for scale in scale_values}}
+                         **{scale: {'T': 0.0, 'Blur': 0.0} for scale in scale_values}}
         print(f"[fov_crop] Skipping beam scan — using fixed FOV={fov_arcsec:.0f}\"")
     else:
         global_nbeams = compute_global_nbeams_equalized(
-            args.root, scale_values, slug_to_z, subtract_beam=not args.no_beam_sub)
+            args.root, scale_values, slug_to_z, subtract_beam=subtract_beam)
         print(f"  RAW: {global_nbeams.get('RAW', 0.0):.2f} beams")
         for scale in scale_values:
             sc_str = int(scale) if scale == int(scale) else scale
-            nb = global_nbeams.get(scale, {'T': 0.0, 'RT': 0.0})
-            print(f"  T{sc_str}kpc: T={nb['T']:.2f}b  RT={nb['RT']:.2f}b")
+            nb = global_nbeams.get(scale, {'T': 0.0, 'Blur': 0.0})
+            print(f"  T{sc_str}kpc: T={nb['T']:.2f}b  Blur={nb['Blur']:.2f}b")
     psz2_base = args.root.parent
-    proc_dir  = psz2_base / mode_subdir / 'fits_files'
+    proc_dir  = psz2_base / crop_mode / blur_method / 'fits_files'
     generate_diagnostic_histograms(args.root, scale_values, global_nbeams, diag_path,
                                    processed_dir=proc_dir if proc_dir.is_dir() else None,
                                    fov_arcsec=fov_arcsec, mode=mode_subdir)
@@ -1012,14 +1019,14 @@ def main():
         n_workers = args.n_workers if args.n_workers else cpu_count()
         print(f"[PARALLEL] Using {n_workers} workers")
         args_dict = dict(out=args.out, suffix=suffix, root=args.root, down=args.down,
-                         save_fits=args.save_fits, cheat_rt=args.cheat_rt,
-                         subtract_beam=not args.no_beam_sub,
+                         save_fits=args.save_fits, cheat_rt=cheat_rt,
+                         subtract_beam=subtract_beam,
                          force=args.force, out_fits_dir=out_fits_dir,
                          fov_arcsec=fov_arcsec)
         tasks = []; n_skip_z = 0
         for source_name, raw_path in sources_to_process:
             z = slug_to_z.get(source_name, np.nan)
-            if not args.cheat_rt and (not np.isfinite(z) or z <= 0):
+            if not cheat_rt and (not np.isfinite(z) or z <= 0):
                 print(f"[SKIP] {source_name}: no valid redshift (z={z})")
                 n_skip_z += 1; continue
             tasks.append((source_name, raw_path, scale_values, z, global_nbeams, args_dict))
@@ -1094,7 +1101,7 @@ def main():
                     return
             _nb50 = comp_nbeams.get(50.0, comp_nbeams.get(scale_values[0], {'T': 0.0}))
             print(f"[comparison] annotate={annotate}, "
-                  f"nbeams_T50={_nb50.get('T', 0.0):.2f} RT50={_nb50.get('RT', 0.0):.2f}")
+                  f"nbeams_T50={_nb50.get('T', 0.0):.2f} Blur50={_nb50.get('Blur', 0.0):.2f}")
             create_comparison_plot(
                 sources=sources,
                 de_sources_all=de_sources_all,
@@ -1106,8 +1113,8 @@ def main():
                 output_path=args.comp_out,
                 figsize=figsize,
                 annotate=annotate,
-                subtract_beam=not args.no_beam_sub,
-                cheat_rt=args.cheat_rt,
+                subtract_beam=subtract_beam,
+                cheat_rt=cheat_rt,
                 fov_arcsec=fov_arcsec,
             )
     else:

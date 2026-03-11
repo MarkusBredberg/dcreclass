@@ -154,8 +154,8 @@ def _canon_ver(v: Any) -> str:
     """
     Normalise a version token to a canonical folder name.
 
-    Accepts: 'RAW'/'raw'/'i', 'T50kpc', 't50', '50', 'RT50kpc', 'rt50', etc.
-    Returns: 'RAW', 'T{N}kpc', 'T{N}kpcSUB', or 'RT{N}kpc'.
+    Accepts: 'RAW'/'raw'/'i', 'T50kpc', 't50', '50', 'Blur50kpc', 'blur50', etc.
+    Returns: 'RAW', 'T{N}kpc', 'T{N}kpcSUB', or 'Blur{N}kpc'.
     Units: kpc (default if omitted), mpc (converted to kpc).
     """
     s_raw = str(v).strip()
@@ -680,13 +680,25 @@ def _load_cache(
 
 
 _PSZ2_DATA_DIR = "/users/mbredber/scratch/data/PSZ2"
+# crop_mode → whether a fixed arcsec FOV is used (beam_crop uses beam-equalised FOV)
 _CROP_MODE_MAP = {
-    'beam_crop':        dict(use_processed=True,  filename_suffix='circ',       processed_subdir='beam_crop/fits_files'),
-    'beam_crop_no_sub': dict(use_processed=True,  filename_suffix='circ_nosub', processed_subdir='beam_crop_no_sub/fits_files'),
-    'fov_crop':         dict(use_processed=True,  filename_suffix='fov',        processed_subdir='fov_crop/fits_files'),
-    'cheat_crop':       dict(use_processed=True,  filename_suffix='cheat',      processed_subdir='cheat_crop/fits_files'),
-    'pixel_crop':       dict(use_processed=False, filename_suffix=None,         processed_subdir=None),
+    'beam_crop':  dict(fov_based=False),
+    'fov_crop':   dict(fov_based=True),
+    'pixel_crop': dict(fov_based=False),   # raw on-the-fly; no processed files
 }
+
+# blur_method → convolution behaviour flags
+_BLUR_METHOD_MAP = {
+    'circular':        dict(subtract_beam=True,  cheat_rt=False),
+    'circular_no_sub': dict(subtract_beam=False, cheat_rt=False),
+    'cheat':           dict(subtract_beam=True,  cheat_rt=True),
+}
+
+def _processed_subdir(crop_mode: str, blur_method: str) -> Optional[str]:
+    """Return the PSZ2-relative fits_files path, or None for pixel_crop."""
+    if crop_mode == 'pixel_crop':
+        return None
+    return f"{crop_mode}/{blur_method}/fits_files"
 
 def load_PSZ2(
         path: str = ROOT_PATH + "PSZ2/classified/",
@@ -700,6 +712,7 @@ def load_PSZ2(
         processed_dir: Optional[str] = None,
         gate_with: Optional[Union[str, int, float]] = None,
         crop_mode: str = 'pixel_crop',
+        blur_method: str = 'circular',
 ) -> Tuple[List, List, List, List, List[str], List[str]]:
     """
     Load PSZ2 galaxy cluster images for one cross-validation fold.
@@ -724,8 +737,10 @@ def load_PSZ2(
         gate_with:      Restrict sources to those also present in a given
                         T version dir. 'auto' derives from versions; int/str
                         specify a kpc scale explicitly.
-        crop_mode:      Cropping strategy: 'pixel_crop' | 'beam_crop' |
-                        'fov_crop' | 'cheat_crop'. Default: 'pixel_crop'.
+        crop_mode:      Cropping strategy: 'pixel_crop' | 'beam_crop' | 'fov_crop'.
+                        Default: 'pixel_crop'.
+        blur_method:    Blurring kernel: 'circular' | 'circular_no_sub' | 'cheat'.
+                        Ignored for pixel_crop. Default: 'circular'.
 
     Returns:
         (train_images, train_labels, eval_images, eval_labels,
@@ -735,20 +750,25 @@ def load_PSZ2(
     if target_classes is None:
         target_classes = [50, 51]
 
-    # Resolve crop_mode → use_processed / filename_suffix / processed_dir
+    # Validate crop_mode and blur_method
     if crop_mode not in _CROP_MODE_MAP:
         raise ValueError(f"Unknown crop_mode {crop_mode!r}. "
                          f"Choose from: {list(_CROP_MODE_MAP)}")
-    _cm = _CROP_MODE_MAP[crop_mode]
-    use_processed = _cm['use_processed']
-    filename_suffix  = _cm['filename_suffix']
-    if use_processed and processed_dir is None:
-        processed_dir = os.path.join(_PSZ2_DATA_DIR, _cm['processed_subdir'])
+    if crop_mode != 'pixel_crop' and blur_method not in _BLUR_METHOD_MAP:
+        raise ValueError(f"Unknown blur_method {blur_method!r}. "
+                         f"Choose from: {list(_BLUR_METHOD_MAP)}")
+
+    # Resolve processed_dir and filename suffix
+    _subdir = _processed_subdir(crop_mode, blur_method)
+    filename_suffix = blur_method if _subdir is not None else None
+    if _subdir is not None and processed_dir is None:
+        processed_dir = os.path.join(_PSZ2_DATA_DIR, _subdir)
 
     print("Parameters:")
     print("  path:", path)
     print("  versions:", versions)
     print("  crop_mode:", crop_mode)
+    print("  blur_method:", blur_method)
     print("  filename_suffix:", filename_suffix)
     print("  crop_size:", crop_size)
     print("  downsample_size:", downsample_size)
@@ -759,11 +779,11 @@ def load_PSZ2(
     print("  fold:", fold)
 
     def _kpc_tag(v: Any) -> str:
-        """Canonical kpc tag for a version string, e.g. 'T50kpc', 'RT25kpc'."""
+        """Canonical kpc tag for a version string, e.g. 'T50kpc', 'Blur25kpc'."""
         vU = str(v).upper()
-        if vU.startswith("RT"):
+        if vU.startswith("BLUR"):
             num = ''.join(c for c in str(v) if c.isdigit())
-            return f"RT{num}kpc"
+            return f"Blur{num}kpc"
         if vU.startswith("T"):
             m = re.search(r'T(\d+)kpc', vU)
             if m:
@@ -799,7 +819,7 @@ def load_PSZ2(
     _, Ho, Wo         = _canon(downsample_size)
 
     # Equal-beams pre-scan (only when using processed files)
-    if use_processed:
+    if processed_dir is not None:
         EQUAL_TAPER = _pick_equal_taper_from(versions)
         n_beams_min, _T_header_cache = _scan_min_beams(path, target_classes, taper=EQUAL_TAPER)
     else:
@@ -827,7 +847,7 @@ def load_PSZ2(
         # Find a reference T version to enumerate sources
         ref_T_version: Optional[str] = None
         for v in norm_versions:
-            if str(v).upper().startswith('T') and not str(v).upper().startswith('RT'):
+            if str(v).upper().startswith('T') and not str(v).upper().startswith('BLUR'):
                 ref_T_version = v
                 print(f"[DEBUG] Reference T version from list: {ref_T_version}")
                 break
@@ -855,6 +875,11 @@ def load_PSZ2(
                     if f.lower().endswith('.fits'):
                         src_id = _source_id(os.path.splitext(f)[0])
                         source_ids.add(src_id)
+
+                if processed_dir is None:
+                    raise ValueError(
+                        f"Multi-version loading requires processed files. "
+                        f"crop_mode={crop_mode!r} has no processed_subdir.")
 
                 # Debug: check first 5 sources
                 for src_id in sorted(source_ids)[:5]:
@@ -923,7 +948,7 @@ def load_PSZ2(
             if gate_with is not None:
                 desired_num: Optional[float] = None
                 if isinstance(gate_with, str) and gate_with.lower() == "auto":
-                    m_rt = re.search(r"RT(\d+(?:\.\d+)?)", vU)
+                    m_rt = re.search(r"BLUR(\d+(?:\.\d+)?)", vU)
                     m_t  = re.search(r"T(\d+(?:\.\d+)?)KPC", vU)
                     if m_rt:   desired_num = float(m_rt.group(1))
                     elif m_t:  desired_num = float(m_t.group(1))
@@ -959,11 +984,8 @@ def load_PSZ2(
                 if gate_keys is not None and base.lower() not in gate_keys:
                     continue
 
-                # Prefer pre-formatted processed file
-                use_processed = use_processed and (
-                    vU.startswith("T") or vU.startswith("RT") or vU.startswith("RTNOSUB") or vU == "RAW")
-
-                if use_processed:
+                if processed_dir is not None and (
+                        vU.startswith("T") or vU.startswith("BLUR") or vU == "RAW"):
                     proc_path = os.path.join(
                         processed_dir,
                         f"{src}_{tag}_fmt_{Ho}x{Wo}_{filename_suffix}.fits")
@@ -1003,7 +1025,7 @@ def load_PSZ2(
                         torch.from_numpy(arr).unsqueeze(0).float(),
                         crop_size=(1, Hc_eff, Wc_eff), downsample_size=(1, Ho, Wo))
 
-                elif vU.startswith("RT"):
+                elif vU.startswith("BLUR"):
                     arr = np.squeeze(fits.getdata(fpath)).astype(np.float32)
                     if arr.ndim == 3: arr = arr.mean(axis=0)
                     if arr.ndim != 2: continue
@@ -1016,7 +1038,7 @@ def load_PSZ2(
                                     if os.path.isdir(os.path.join(path, preferred_gate, sub))
                                     else _nearest_T_dir(path, sub, float(num)))
                     if gate_dirname is None:
-                        print(f"[GATE] No TXXkpc for RT{num}kpc, sub='{sub}'. Skipping {src}.")
+                        print(f"[GATE] No TXXkpc for Blur{num}kpc, sub='{sub}'. Skipping {src}.")
                         continue
 
                     txx_path = os.path.join(path, gate_dirname, sub, f"{base}{gate_dirname}.fits")
@@ -1029,7 +1051,7 @@ def load_PSZ2(
                     C_tgt_w  = _beam_cov_world(txx_hdr)
                     sigma2   = float(np.sqrt(max(0.0, np.linalg.det(C_tgt_w))))
                     C_circ_w = np.array([[sigma2, 0.0], [0.0, sigma2]], float)
-                    if vU.startswith("RTNOSUB"):
+                    if vU.startswith("BLURNOSUB"):
                         # No beam subtraction: C_ker = C_target (final PSF = C_beam + C_target)
                         C_ker_w = C_circ_w
                     else:
@@ -1105,7 +1127,7 @@ def load_PSZ2(
             v_tag = _kpc_tag(versions[0] if isinstance(versions, (list, tuple)) else versions)
         except Exception:
             v_tag = str(versions)
-        if use_processed and processed_dir and filename_suffix:
+        if processed_dir and filename_suffix:
             detail = f"Looked for: {os.path.join(processed_dir, f'*_{v_tag}_fmt_{Ho}x{Wo}_{filename_suffix}.fits')}"
         else:
             detail = f"crop_mode={crop_mode!r}, path={path!r}, versions={versions!r}"
@@ -1179,6 +1201,7 @@ def load_galaxies(
         USE_CACHE: bool = True,
         DEBUG: bool = True,
         crop_mode: str = 'pixel_crop',
+        blur_method: str = 'circular',
 ) -> Tuple:
     """
     Master loader: delegates to the appropriate dataset loader, applies
@@ -1239,7 +1262,7 @@ def load_galaxies(
         'path': path, 'versions': versions, 'sample_size': sample_size,
         'fold': fold, 'train': train,
         'crop_size': crop_size, 'downsample_size': downsample_size,
-        'crop_mode': crop_mode,
+        'crop_mode': crop_mode, 'blur_method': blur_method,
     }
     clean_kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
