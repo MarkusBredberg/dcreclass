@@ -321,8 +321,10 @@ def plot_class_images(classes: List[Dict],
         ax.set_yticks([])
         ax.set_frame_on(False)
             
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])  
-    plt.savefig(f"./classifier/processing_step/{class1}_{class2}_{set_name}_comparison.png", dpi=300)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    out_path = Path(f"./classifier/processing_step/{class1}_{class2}_{set_name}_comparison.png")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=300)
     plt.close()
     
 def plot_images_by_class(images: torch.Tensor | np.ndarray,
