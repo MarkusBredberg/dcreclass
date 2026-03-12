@@ -34,7 +34,7 @@ warnings.filterwarnings("ignore", category=FITSFixedWarning)
 # dcreclass utilities
 from dcreclass.utils.fits import (
     ARCSEC_PER_RAD,
-    arcsec_per_pix, fwhm_major_as, beam_solid_angle_sr,
+    fwhm_major_as, beam_solid_angle_sr,
     read_fits_array_header_wcs, reproject_like,
     header_cluster_coord, robust_vmin_vmax, kernel_from_beams,
 )
@@ -45,7 +45,6 @@ from dcreclass.data.processing import (
     check_nan_fraction, process_images_for_scale,
 )
 from dcreclass.utils.annotation import (
-    add_beam_patch, add_scalebar_kpc,
     add_beam_patch_simple, add_scalebar_kpc_simple,
 )
 

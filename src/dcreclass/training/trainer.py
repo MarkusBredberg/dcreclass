@@ -76,7 +76,7 @@ def check_overfitting(metrics, history, classifier_name, dataset_sizes, folds, l
 ##################################################
     
 
-def compute_classification_metrics(y_true, y_pred, multilabel, num_classes):
+def compute_classification_metrics(y_true, y_pred, num_classes, multilabel=False):
     acc = accuracy_score(y_true, y_pred)
     if multilabel:
         avg = 'macro'

@@ -5,6 +5,8 @@ _sass/
 legacy_scripts/
 outputs/
 /data/
+scratch/
+notebooks/explore_blurring_outputs
 core_*
 
 # Byte-compiled / optimized / DLL files

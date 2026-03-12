@@ -1,66 +1,90 @@
-import numpy as np, pickle, torch, os, itertools
-from sklearn.metrics import confusion_matrix, roc_curve, auc
-from sklearn.preprocessing import label_binarize
-from utils.data_loader import get_classes, load_galaxies
+import numpy as np, pickle, torch, os, itertools, argparse
+from sklearn.metrics import roc_curve, auc
+from dcreclass.data import get_classes, load_galaxies
 from collections import defaultdict
-import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
-import seaborn as sns
-import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader
 
 # Import your classifiers
-from utils.classifiers import CNN, ImageCNN, ScatterNet, DualCNNSqueezeNet, DualScatterSqueezeNet
-from utils.calc_tools import fold_T_axis, custom_collate
+from dcreclass.models import CNN, ImageCNN, ScatterNet, DualCNNSqueezeNet, DualScatterSqueezeNet
+from dcreclass.utils import fold_T_axis, custom_collate, compute_scattering_coeffs, round_to_1
+from dcreclass.utils.calc_tools import initialize_metrics, update_metrics, recalculate_metrics_with_correct_positive_class
+from dcreclass.utils.plotting import (robust_metric_histograms, plot_avg_roc_curves,
+                                      plot_avg_std_confusion_matrix, plot_cluster_metrics,
+                                      plot_training_history, generate_attention_visualizations)
 
-_SCRATCH     = "/users/mbredber/scratch"
-MODELS_DIR   = os.path.join(_SCRATCH, 'data', 'models')
-METRICS_DIR  = os.path.join(_SCRATCH, 'data', 'metrics')
-FIGURES_DIR  = os.path.join(_SCRATCH, 'figures', 'classifying')
-ATTN_DIR     = os.path.join(_SCRATCH, 'figures', 'classifying', 'attention_maps')
+def _parse_args():
+    p = argparse.ArgumentParser(description="Plot classifier results")
+    p.add_argument('--classifier',    default='ImageCNN',
+                   choices=['CNN','ScatterNet','DualCSN','DualSSN','ImageCNN'])
+    p.add_argument('--version',       default='RAW',
+                   help="Single image version, e.g. RAW or T25kpc")
+    p.add_argument('--crop-mode',     default='beam_crop',
+                   choices=['beam_crop','beam_crop_no_sub','fov_crop','cheat_crop'])
+    p.add_argument('--blur-method',   default='circular',
+                   choices=['circular','circular_no_sub','cheat'])
+    p.add_argument('--lr',            type=float, nargs='+', default=[5e-5])
+    p.add_argument('--reg',           type=float, nargs='+', default=[1e-1])
+    p.add_argument('--folds',         type=int, nargs='+', default=list(range(10)))
+    p.add_argument('--num-experiments', type=int, default=3)
+    p.add_argument('--percentile-lo', type=int, default=30)
+    p.add_argument('--percentile-hi', type=int, default=99)
+    p.add_argument('--run-dir',       default=None)
+    p.add_argument('--data-run-dir',  default=None)
+    p.add_argument('--no-attention',  dest='generate_attention', action='store_false')
+    p.set_defaults(generate_attention=True)
+    return p.parse_args()
 
-os.makedirs(MODELS_DIR, exist_ok=True)
-os.makedirs(os.path.join(MODELS_DIR, 'filtered'), exist_ok=True)
+args = _parse_args()
+classifier            = args.classifier
+version               = args.version
+crop_mode             = args.crop_mode
+blur_method           = args.blur_method
+learning_rates        = args.lr
+regularization_params = args.reg
+folds                 = args.folds
+num_experiments       = args.num_experiments
+percentile_lo         = args.percentile_lo
+percentile_hi         = args.percentile_hi
+GENERATE_ATTENTION_MAPS = args.generate_attention
+
+OUTDIR_BASE = "/users/mbredber/p2_DCRECLASS/outputs/scratch/"
+_run_dir      = args.run_dir
+_data_run_dir = args.data_run_dir or args.run_dir
+if _run_dir and _data_run_dir:
+    FIGURES_DIR = os.path.join(_run_dir, 'figures/classifying')
+    MODELS_DIR  = os.path.join(_data_run_dir, 'data', 'models')
+    METRICS_DIR = os.path.join(_data_run_dir, 'data', 'metrics')
+else:
+    _SCRATCH    = "/users/mbredber/scratch"
+    FIGURES_DIR = os.path.join(_SCRATCH, 'figures', 'classifying')
+    MODELS_DIR  = os.path.join(_SCRATCH, 'data', 'models')
+    METRICS_DIR = os.path.join(_SCRATCH, 'data', 'metrics')
+
+# Constants not exposed as args
+galaxy_classes = [50, 51]
+crop_size = (512, 512)
+downsample_size = (128, 128)
+J, L, order = 2, 12, 2
+FILTERED = True
+USE_GLOBAL_NORMALISATION = False
+global_norm_mode = "percentile"
+ADJUST_POSITIVE_CLASS = True
+
+classes = get_classes()
+
+ATTN_DIR = os.path.join(FIGURES_DIR, 'attention_maps')
+
+
 os.makedirs(ATTN_DIR, exist_ok=True)
 os.makedirs(FIGURES_DIR, exist_ok=True)
 
 print("Running enhanced evaluation script 2.0 with attention visualization")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Set random seeds for reproducibility
 seed = 42
 torch.manual_seed(seed)
 np.random.seed(seed)
-
-###############################################
-################ CONFIGURATION ################
-###############################################
-
-FILTERED = True       
-USE_GLOBAL_NORMALISATION = False # False for per-image norm
-GLOBAL_NORM_MODE = "percentile"
-ADJUST_POSITIVE_CLASS = True
-GENERATE_ATTENTION_MAPS = True  # Toggle attention map generation
-
-classes = get_classes()
-galaxy_classes = [50, 51]
-learning_rates = [5e-5]
-regularization_params = [1e-1]
-num_experiments = 3
-percentile_lo, percentile_hi = 30, 99
-folds = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
-classifier = ["CNN",         # 0.Very Simple CNN
-              "ScatterNet",  # 1.Scattering coefficients as input to MLP
-              "DualCSN",     # 2.Dual input CNN with scattering coefficients as one input branch and Squeeze-and-Excitation blocks
-              "DualSSN",     # 3.Dual input CNN with scattering coefficients as one input branch and Squeeze-and-Excitation blocks
-              "ImageCNN",    # 4.Single image-encoder branch from DualCSN/DualSSN
-              ][3]
-crop_size = (512, 512)
-downsample_size = (128, 128)
-version     = 'T25kpc'
-crop_mode   = 'beam_crop'   # 'beam_crop' | 'fov_crop' | 'pixel_crop'
-blur_method = 'circular'    # 'circular'  | 'circular_no_sub' | 'cheat'
-J, L, order = 2, 12, 2
 
 # NEW: Attention visualization settings
 ATTENTION_METHODS = ['saliency', 'gradcam', 'integrated_gradients']  # Methods to use
@@ -74,6 +98,30 @@ cmap_green = LinearSegmentedColormap.from_list(
 ###############################################
 ######### SETTING THE RIGHT PARAMETERS ########
 ###############################################
+
+label_smoothing = 0.1  # must match script 04 default
+
+# Narrow METRICS_DIR and MODELS_DIR to the per-run subdirectory — mirrors script 04
+_sub = (f"{classifier}_{crop_mode}_{blur_method}_{learning_rates[0]}_"
+        f"{regularization_params[0]}_{percentile_lo}_{percentile_hi}_{label_smoothing}")
+METRICS_DIR = os.path.join(METRICS_DIR, _sub)
+MODELS_DIR  = os.path.join(MODELS_DIR,  _sub)
+
+run_version = (f"{galaxy_classes}_{classifier}_{[version]}_{crop_mode}_{blur_method}_"
+               f"{percentile_lo}_{percentile_hi}_{global_norm_mode}_"
+               f"{learning_rates[0]}_{regularization_params[0]}_{label_smoothing}")
+save_dir = os.path.join(FIGURES_DIR, run_version)
+os.makedirs(save_dir, exist_ok=True)
+
+def _base(fold, subset_size, lr, reg):
+    """Canonical key — must mirror script 04's _base()."""
+    return (f"{classifier}_ver{version}_cm{crop_mode}"
+            f"_lr{lr}_reg{reg}_ls{label_smoothing}"
+            f"_lo{percentile_lo}_hi{percentile_hi}"
+            f"_f{fold}_ss{round_to_1(subset_size)}")
+
+def _pkl_path(fold, subset_size, experiment, lr, reg):
+    return os.path.join(METRICS_DIR, f"{_base(fold, subset_size, lr, reg)}_e{experiment}.pkl")
 
 directory = os.path.join(MODELS_DIR, 'filtered') + os.sep if FILTERED else MODELS_DIR + os.sep
 
@@ -118,12 +166,7 @@ for lr, reg, experiment, fold in itertools.product(
     learning_rates, regularization_params, range(num_experiments), folds
 ):
     for subset_size in dataset_sizes[fold]:
-        cs = f"{crop_size[0]}x{crop_size[1]}"
-        ds = f"{downsample_size[0]}x{downsample_size[1]}"
-        if USE_GLOBAL_NORMALISATION:
-            metrics_read_path = os.path.join(METRICS_DIR, f"{classifier}_{galaxy_classes}_lr{lr}_reg{reg}_lo{percentile_lo}_hi{percentile_hi}_cs{cs}_ds{ds}_ver{version}_f{fold}_ss{round_to_1(subset_size)}_e{experiment}_{GLOBAL_NORM_MODE}_metrics_data.pkl")
-        else:
-            metrics_read_path = os.path.join(METRICS_DIR, f"{classifier}_{galaxy_classes}_lr{lr}_reg{reg}_lo{percentile_lo}_hi{percentile_hi}_cs{cs}_ds{ds}_ver{version}_f{fold}_ss{round_to_1(subset_size)}_e{experiment}_metrics_data.pkl")
+        metrics_read_path = _pkl_path(fold, subset_size, experiment, lr, reg)
         
         try:
             with open(metrics_read_path, 'rb') as f:
@@ -145,7 +188,7 @@ for lr, reg, experiment, fold in itertools.product(
             
             initialize_metrics(tot_metrics, subset_size, fold, experiment, lr, reg)
             
-            base = f"cl{classifier}_ss{subset_size}_f{fold}_lr{lr}_reg{reg}_ls0.1_cs{cs}_ds{ds}_pl{percentile_lo}_ph{percentile_hi}_ver{version}"
+            base = _base(fold, subset_size, lr, reg)
             
             acc = loaded_metrics.get("accuracy", [])
             prec = loaded_metrics.get("precision", [])
@@ -179,6 +222,23 @@ for lr, reg, experiment, fold in itertools.product(
                 training_times_dict,
                 all_pred_probs_dict
             )
+
+            # Compute AUC from raw probabilities
+            auc_val = float('nan')
+            if y_true and y_probs:
+                try:
+                    y_probs_arr = np.asarray(y_probs)
+                    scores = (y_probs_arr[:, 1]
+                              if y_probs_arr.ndim == 2 and y_probs_arr.shape[1] > 1
+                              else y_probs_arr.ravel())
+                    if np.unique(np.asarray(y_true)).size >= 2:
+                        fpr, tpr, _ = roc_curve(y_true, scores)
+                        auc_val = auc(fpr, tpr)
+                except Exception:
+                    pass
+            auc_key = f"auc_{subset_size}_{fold}_{experiment}_{lr}_{reg}"
+            tot_metrics.setdefault(auc_key, []).append(auc_val)
+
             loaded_count += 1
             
         except FileNotFoundError:
@@ -208,7 +268,7 @@ for fold in folds:
         continue
     subset = max(dataset_sizes[fold])
     for exp, lr, reg in itertools.product(range(num_experiments), learning_rates, regularization_params):
-        for metric in ["accuracy", "precision", "recall", "f1_score"]:
+        for metric in ["accuracy", "precision", "recall", "f1_score", "auc"]:
             k = f"{metric}_{subset}_{fold}_{exp}_{lr}_{reg}"
             if k in tot_metrics and tot_metrics[k]:
                 metrics_last[metric].extend(tot_metrics[k])
@@ -217,10 +277,11 @@ for fold in folds:
 print("\n" + "="*60)
 print("OVERALL PERFORMANCE SUMMARY")
 print("="*60)
-for metric in ["accuracy", "precision", "recall", "f1_score"]:
+for metric in ["accuracy", "precision", "recall", "f1_score", "auc"]:
     vals = np.array(metrics_last.get(metric, []), dtype=float)
+    vals = vals[np.isfinite(vals)]
     if vals.size:
-        print(f"{metric.capitalize()}: Mean = {vals.mean():.4f}, Std = {vals.std():.4f}")
+        print(f"{metric.upper() if metric == 'auc' else metric.capitalize()}: Mean = {vals.mean():.4f}, Std = {vals.std():.4f}")
 print("="*60 + "\n")
 
 # ---------------------- Training Times Summary ----------------------
@@ -271,20 +332,33 @@ for fold in folds:
         continue
     for subset_size in dataset_sizes[fold]:
         for experiment in range(num_experiments):
-            cs = f"{crop_size[0]}x{crop_size[1]}"
-            ds = f"{downsample_size[0]}x{downsample_size[1]}"
-            base = f"cl{classifier}_ss{subset_size}_f{fold}_lr{learning_rates[0]}_reg{regularization_params[0]}_ls0.1_cs{cs}_ds{ds}_pl{percentile_lo}_ph{percentile_hi}_ver{version}"
+            base = _base(fold, subset_size, learning_rates[0], regularization_params[0])
             
             # Check if we have history data for this configuration
             history_key = f"history_{subset_size}_{fold}_{experiment}_{learning_rates[0]}_{regularization_params[0]}"
             if history_key in metrics and metrics[history_key]:
                 history_data = metrics[history_key][0] if isinstance(metrics[history_key], list) else metrics[history_key]
                 if isinstance(history_data, dict):
-                    plot_training_history(history_data, base, experiment)
-robust_metric_histograms(metrics)
-plot_avg_roc_curves(metrics, merge_map=merge_map)
-plot_avg_std_confusion_matrix(metrics, metric_stats=metrics_last, merge_map=merge_map)
-plot_cluster_metrics(all_cluster_metrics)
+                    plot_training_history(history_data, base, experiment, save_dir=save_dir)
+robust_metric_histograms(metrics, galaxy_classes, classifier, dataset_sizes, folds,
+                         learning_rates, regularization_params, save_dir=save_dir)
+plot_avg_roc_curves(metrics, classifier,
+                    version=version, dataset_sizes=dataset_sizes,
+                    crop_size=crop_size, downsample_size=downsample_size,
+                    percentile_lo=percentile_lo, percentile_hi=percentile_hi,
+                    merge_map=merge_map, folds=folds,
+                    num_experiments=num_experiments,
+                    learning_rates=learning_rates,
+                    regularization_params=regularization_params,
+                    galaxy_classes=galaxy_classes,
+                    save_dir=save_dir)
+plot_avg_std_confusion_matrix(metrics, metrics_last, galaxy_classes, classifier,
+                              version, largest_sz, learning_rates, regularization_params,
+                              folds, dataset_sizes, crop_size, downsample_size,
+                              percentile_lo, percentile_hi,
+                              merge_map=merge_map, num_experiments=num_experiments,
+                              save_dir=save_dir)
+plot_cluster_metrics(all_cluster_metrics, save_dir=save_dir)
 
 print("\n" + "="*60)
 print("EVALUATION SCRIPT FINISHED SUCCESSFULLY!")
@@ -297,10 +371,20 @@ print(f"- Summary CSV: {os.path.join(FIGURES_DIR, f'{galaxy_classes}_{classifier
 
 
 if GENERATE_ATTENTION_MAPS:
+    # Check model exists before doing any expensive data loading
+    _fold_check = folds[0]
+    _ss_check   = dataset_sizes[_fold_check][0]
+    _model_path_check = os.path.join(MODELS_DIR,
+        f"{_base(_fold_check, _ss_check, learning_rates[0], regularization_params[0])}_model.pth")
+    if not os.path.exists(_model_path_check):
+        print(f"\nSkipping attention visualizations — model not found: {_model_path_check}")
+        GENERATE_ATTENTION_MAPS = False
+
+if GENERATE_ATTENTION_MAPS:
     print("\n" + "="*60)
     print("GENERATING ATTENTION VISUALIZATIONS")
     print("="*60)
-    
+
     # Load test data
     print("Loading test data...")
     _out = load_galaxies(
@@ -319,11 +403,12 @@ if GENERATE_ATTENTION_MAPS:
         NORMALISE=True,
         NORMALISETOPM=False,
         USE_GLOBAL_NORMALISATION=USE_GLOBAL_NORMALISATION,
-        GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
+        global_norm_mode=global_norm_mode,
         PRINTFILENAMES=True,  # CHANGED: Get filenames!
-        PREFER_PROCESSED=True,
         USE_CACHE=True,
         DEBUG=False,
+        crop_mode=crop_mode,
+        blur_method=blur_method,
         train=False
     )
 
@@ -346,7 +431,6 @@ if GENERATE_ATTENTION_MAPS:
     # Prepare test data based on classifier type
     if classifier in ['ScatterNet', 'DualSSN']:
         from kymatio.torch import Scattering2D
-        from utils.calc_tools import compute_scattering_coeffs
         
         test_images_folded = fold_T_axis(test_images)
         
@@ -375,10 +459,8 @@ if GENERATE_ATTENTION_MAPS:
     print("Loading trained model...")
     fold_to_use = folds[0]
     subset_size_to_use = dataset_sizes[fold_to_use][0]
-    cs = f"{crop_size[0]}x{crop_size[1]}"
-    ds = f"{downsample_size[0]}x{downsample_size[1]}"
-    
-    model_path = os.path.join(MODELS_DIR, f"cl{classifier}_ss{round_to_1(subset_size_to_use)}_f{fold_to_use}_lr{learning_rates[0]}_reg{regularization_params[0]}_ls0.1_cs{cs}_ds{ds}_pl{percentile_lo}_ph{percentile_hi}_ver{version}_model.pth")
+    model_path = os.path.join(MODELS_DIR,
+        f"{_base(fold_to_use, subset_size_to_use, learning_rates[0], regularization_params[0])}_model.pth")
     
     # Initialize model architecture
     img_shape = tuple(test_images.shape[1:]) if test_images.dim() == 4 else tuple(test_images.shape[2:])

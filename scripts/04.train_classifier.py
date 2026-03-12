@@ -1,4 +1,4 @@
-import os, time, random, pickle, hashlib, itertools, torch, datetime
+import os, time, random, pickle, itertools, torch, datetime, argparse
 from dcreclass.data import load_galaxies, get_classes
 from dcreclass.models import CNN, ImageCNN, ScatterNet, DualCNNSqueezeNet, DualScatterSqueezeNet
 from dcreclass.training import (EarlyStopping, reset_weights,
@@ -19,14 +19,106 @@ from torch.optim import AdamW
 from torch.utils.data import TensorDataset, DataLoader, Subset
 from torchsummary import summary
 from kymatio.torch import Scattering2D
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from tqdm import tqdm
-from math import log10, floor
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-SEED = 42  # Set a seed for reproducibility # Original: 42
+def _parse_args():
+    p = argparse.ArgumentParser(description="Train a radio-image classifier")
+    p.add_argument('--classifier',    default='ImageCNN',
+                   choices=['CNN','ScatterNet','DualCSN','DualSSN','ImageCNN'])
+    p.add_argument('--versions',      default='RAW',
+                   help="'+'-separated list, e.g. RAW or T25kpc+T50kpc")
+    p.add_argument('--crop-mode',     default='beam_crop',
+                   choices=['beam_crop','beam_crop_no_sub','fov_crop','cheat_crop','pixel_crop'])
+    p.add_argument('--blur-method',   default='circular',
+                   choices=['circular','circular_no_sub','cheat'])
+    p.add_argument('--lr',            type=float, default=5e-5)
+    p.add_argument('--reg',           type=float, default=1e-1)
+    p.add_argument('--label-smoothing', type=float, default=0.1)
+    p.add_argument('--folds',         type=int, nargs='+', default=[0])
+    p.add_argument('--num-experiments', type=int, default=2)
+    p.add_argument('--percentile-lo', type=int, default=30)
+    p.add_argument('--percentile-hi', type=int, default=99)
+    p.add_argument('--num-epochs-cuda', type=int, default=200)
+    p.add_argument('--num-epochs-cpu',  type=int, default=100)
+    p.add_argument('--patience',      type=int, default=50)
+    p.add_argument('--run-dir',       default=None,
+                   help="Override output root (figures/logs); falls back to scratch")
+    p.add_argument('--data-run-dir',  default=None,
+                   help="Override data output root (models/metrics)")
+    p.add_argument('--no-stretch',            dest='stretch',           action='store_false')
+    p.add_argument('--no-augment',            dest='augment',           action='store_false')
+    p.add_argument('--no-mixup',              dest='mixup',             action='store_false')
+    p.add_argument('--no-balance',            dest='balance',           action='store_false')
+    p.add_argument('--no-class-weights',      dest='use_class_weights', action='store_false')
+    p.add_argument('--no-early-stopping',     dest='es',                action='store_false')
+    p.add_argument('--no-scheduler',          dest='scheduler',         action='store_false')
+    p.add_argument('--force',                 action='store_true',
+                   help="Ignore and overwrite any existing cache files")
+    p.add_argument('--debug',                 action='store_true')
+    p.set_defaults(stretch=True, augment=True, mixup=True, balance=False,
+                   use_class_weights=True, es=True, scheduler=True)
+    return p.parse_args()
+
+args = _parse_args()
+
+classifier        = args.classifier
+versions          = args.versions.split('+') if '+' in args.versions else [args.versions]
+crop_mode         = args.crop_mode
+blur_method       = args.blur_method
+lr                = args.lr
+reg               = args.reg
+label_smoothing   = args.label_smoothing
+folds             = args.folds
+num_experiments   = args.num_experiments
+percentile_lo     = args.percentile_lo
+percentile_hi     = args.percentile_hi
+num_epochs_cuda   = args.num_epochs_cuda
+num_epochs_cpu    = args.num_epochs_cpu
+patience          = args.patience
+STRETCH           = args.stretch
+AUGMENT           = args.augment
+MIXUP             = args.mixup
+BALANCE           = args.balance
+USE_CLASS_WEIGHTS = args.use_class_weights
+ES                = args.es
+SCHEDULER         = args.scheduler
+USE_CACHE         = not args.force
+DEBUG             = args.debug
+
+OUTDIR_BASE = "/users/mbredber/p2_DCRECLASS/outputs/scratch/"
+_run_dir      = args.run_dir
+_data_run_dir = args.data_run_dir or args.run_dir
+if _run_dir and _data_run_dir:
+    FIGURES_DIR = os.path.join(_run_dir, 'figures/classifying')
+    LOGS_DIR    = os.path.join(_data_run_dir, 'data', 'logs')
+    _sub = f"{classifier}_{crop_mode}_{blur_method}_{lr}_{reg}_{percentile_lo}_{percentile_hi}_{label_smoothing}"
+    MODELS_DIR  = os.path.join(_data_run_dir, 'data', 'models', _sub)
+    METRICS_DIR = os.path.join(_data_run_dir, 'data', 'metrics', _sub)
+else:
+    _SCRATCH    = "/users/mbredber/scratch"
+    FIGURES_DIR = os.path.join(_SCRATCH, 'figures', 'classifying')
+    LOGS_DIR    = os.path.join(_SCRATCH, 'data', 'logs')
+    MODELS_DIR  = os.path.join(_SCRATCH, 'data', 'models')
+    METRICS_DIR = os.path.join(_SCRATCH, 'data', 'metrics')
+
+# Constants not exposed as args (rarely changed)
+SEED              = 42
+galaxy_classes    = [50, 51]
+max_num_galaxies  = 1000000
+dataset_portions  = [1]
+J, L, order       = 2, 12, 2
+NORMALISEIMGS     = True
+NORMALISEIMGSTOPM = False
+NORMALISESCS      = False
+NORMALISESCSTOPM  = False
+PRINTFILENAMES    = True
+SHOWIMGS          = False
+USE_GLOBAL_NORMALISATION = False
+global_norm_mode  = "percentile"
+
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -37,90 +129,8 @@ def set_seed(seed):
 
 set_seed(SEED)
 
-print("Running script 4.1 with dl1 Latest version with seed", SEED)
-
-
-###############################################
-################ CONFIGURATION ################
-###############################################
-galaxy_classes    = [50, 51]
-max_num_galaxies  = 1000000  # Upper limit for the all-classes combined training data before classical augmentation
-dataset_portions  = [1]
-J, L, order       = 2, 12, 2
-num_epochs_cuda = 200
-num_epochs_cpu = 100
-lr = 4e-5 # Learning rate #prefer processed has 6e-5 for RAW
-reg = 1e-1 # Weight decay (L2 regularization)
-label_smoothing = 0.1
-num_experiments = 1
-folds = [0] # 0-9 for 10-fold cross validation, 10 for only one training
-percentile_lo = 30 # Percentile stretch lower bound
-percentile_hi = 99  # Percentile stretch upper bound
-versions = ['RAW'] # any mix of loadable and runtime-tapered planes. 'rt50' or 'rt100' for tapering. Square brackets for stacking
-classifier = ["CNN",         # 0.Very Simple CNN
-              "ScatterNet",  # 1.Scattering coefficients as input to MLP
-              "DualCSN",     # 2.Dual input CNN with scattering coefficients as one input branch and Squeeze-and-Excitation blocks
-              "DualSSN",     # 3.Dual input CNN with scattering coefficients as one input branch and Squeeze-and-Excitation blocks
-              "ImageCNN",    # 4.Single image-encoder branch from DualCSN/DualSSN
-              ][3]
-
-# Override configuration from environment variables set by the SLURM job script
-if os.environ.get('CLASSIFIER'):
-    classifier = os.environ['CLASSIFIER']
-if os.environ.get('VERSIONS'):
-    _ver_str = os.environ['VERSIONS']
-    versions = _ver_str.split('+') if '+' in _ver_str else [_ver_str]
-if os.environ.get('LR'):
-    lr = float(os.environ['LR'])
-if os.environ.get('REG'):
-    reg = float(os.environ['REG'])
-
+print(f"Running script 4.1 with dl1 Latest version with seed {SEED}")
 print(f"Using classifier: {classifier}")
-
-OUTDIR_BASE = "/users/mbredber/p2_DCRECLASS/outputs/"
-
-# Run-specific output directories, set via env vars from the SLURM job script.
-# Falls back to legacy layout if not running inside a managed job.
-_RUN_DIR = os.environ.get('RUN_DIR')
-_DATA_RUN_DIR = os.environ.get('DATA_RUN_DIR')
-
-if _RUN_DIR and _DATA_RUN_DIR:
-    FIGURES_DIR = os.path.join(_RUN_DIR, 'figures')
-    LOGS_DIR    = os.path.join(_RUN_DIR, 'logs')
-    MODELS_DIR  = os.path.join(_DATA_RUN_DIR, 'models')
-    METRICS_DIR = os.path.join(_DATA_RUN_DIR, 'metrics')
-else:
-    _SCRATCH    = "/users/mbredber/scratch"
-    FIGURES_DIR = os.path.join(_SCRATCH, 'figures', 'classifying')
-    LOGS_DIR    = os.path.join(_SCRATCH, 'data', 'logs')
-    MODELS_DIR  = os.path.join(_SCRATCH, 'data', 'models')
-    METRICS_DIR = os.path.join(_SCRATCH, 'data', 'metrics')
-
-CROP_MODE   = 'beam_crop'   # 'beam_crop' | 'fov_crop' | 'pixel_crop'
-BLUR_METHOD = 'circular'    # 'circular'  | 'circular_no_sub' | 'cheat'
-if os.environ.get('CROP_MODE'):
-    CROP_MODE = os.environ['CROP_MODE']
-if os.environ.get('BLUR_METHOD'):
-    BLUR_METHOD = os.environ['BLUR_METHOD']
-STRETCH = True  # Arcsinh stretch
-USE_GLOBAL_NORMALISATION = False          # single on/off switch . False - image-by-image normalisation 
-GLOBAL_NORM_MODE = "percentile"           # "percentile" or "flux". Becomes "none" if USE_GLOBAL_NORMALISATION is 
-NORMALISEIMGS = True  # Normalise images to [0, 1]
-NORMALISEIMGSTOPM = False  # Normalise images to [-1, 1] 
-NORMALISESCS = False  # Normalise scattering coefficients to [0, 1]
-NORMALISESCSTOPM = False  # Normalise scattering coefficients to [-1, 1]
-FILTERED = True  # Remove in training and validation for the classifier
-BALANCE = True   # Reduce the larger classes to the size of the smallest class
-FILTERGEN = False  # Remove generated images that are too similar to other generated images
-AUGMENT = True  # Use classical data augmentation (flips, rotations)
-MIXUP = True  # Use MixUp augmentation as a means to reduce overfitting
-PRINTFILENAMES = True
-USE_CLASS_WEIGHTS = True  # Set to False to disable class weights
-ES, patience = True, 50  # Use early stopping
-SCHEDULER = True  # Use a learning rate scheduler
-SHOWIMGS = False  # Show some generated images for each class (Tool for control)
-DEBUG = False  # Perform data overlap checks
-USE_CACHE = False  # Use cached images, scattering coefficients, and metrics where available
 
 ########################################################################
 ##################### AUTOMATIC CONFIGURATION ##########################
@@ -130,14 +140,15 @@ os.makedirs(MODELS_DIR, exist_ok=True)
 os.makedirs(FIGURES_DIR, exist_ok=True)
 os.makedirs(LOGS_DIR, exist_ok=True)
 os.makedirs(METRICS_DIR, exist_ok=True)
+os.makedirs(f"{OUTDIR_BASE}/.cache/images", exist_ok=True)
 os.makedirs(f'{OUTDIR_BASE}/.cache/scattering_coefficients', exist_ok=True)
 
 # Build the per-run log filename and write the complete configuration header
-_ts = datetime.datetime.now().strftime('%Y%m%d_%H%M')
+_ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
 _ver_key_early = '+'.join(map(str, versions)) if isinstance(versions, (list, tuple)) else str(versions)
 log_path = os.path.join(LOGS_DIR,
-    f"log_{classifier}_{_ver_key_early}_{CROP_MODE}_{BLUR_METHOD}_{lr}_{reg}"
-    f"_{percentile_lo}_{percentile_hi}_{label_smoothing}_{_ts}.txt")
+    f"{galaxy_classes}_{classifier}_{_ver_key_early}_{crop_mode}_{blur_method}"
+    f"_{percentile_lo}_{percentile_hi}_{lr}_{reg}_{label_smoothing}_{_ts}.txt")
 with open(log_path, 'w') as _lf:
     _lf.write(f"Log file: {log_path}\n")
     _lf.write(f"Created:  {datetime.datetime.now()}\n")
@@ -147,8 +158,8 @@ with open(log_path, 'w') as _lf:
     _lf.write(f"SEED:                    {SEED}\n")
     _lf.write(f"classifier:              {classifier}\n")
     _lf.write(f"versions:                {versions}\n")
-    _lf.write(f"CROP_MODE:               {CROP_MODE}\n")
-    _lf.write(f"BLUR_METHOD:             {BLUR_METHOD}\n")
+    _lf.write(f"crop_mode:               {crop_mode}\n")
+    _lf.write(f"blur_method:             {blur_method}\n")
     _lf.write(f"galaxy_classes:          {galaxy_classes}\n")
     _lf.write(f"folds:                   {folds}\n")
     _lf.write(f"num_experiments:         {num_experiments}\n")
@@ -164,13 +175,11 @@ with open(log_path, 'w') as _lf:
     _lf.write(f"percentile_hi:           {percentile_hi}\n")
     _lf.write(f"STRETCH:                 {STRETCH}\n")
     _lf.write(f"USE_GLOBAL_NORMALISATION:{USE_GLOBAL_NORMALISATION}\n")
-    _lf.write(f"GLOBAL_NORM_MODE:        {GLOBAL_NORM_MODE}\n")
+    _lf.write(f"global_norm_mode:        {global_norm_mode}\n")
     _lf.write(f"NORMALISEIMGS:           {NORMALISEIMGS}\n")
     _lf.write(f"NORMALISEIMGSTOPM:       {NORMALISEIMGSTOPM}\n")
     _lf.write(f"NORMALISESCS:            {NORMALISESCS}\n")
     _lf.write(f"NORMALISESCSTOPM:        {NORMALISESCSTOPM}\n")
-    _lf.write(f"FILTERED:                {FILTERED}\n")
-    _lf.write(f"FILTERGEN:               {FILTERGEN}\n")
     _lf.write(f"AUGMENT:                 {AUGMENT}\n")
     _lf.write(f"MIXUP:                   {MIXUP}\n")
     _lf.write(f"USE_CLASS_WEIGHTS:       {USE_CLASS_WEIGHTS}\n")
@@ -191,7 +200,7 @@ else:
     num_epochs = num_epochs_cpu
 print(f"{DEVICE.upper()} is available. Setting epochs to {num_epochs}.")
 
-GLOBAL_NORM_MODE = "none" if not USE_GLOBAL_NORMALISATION else GLOBAL_NORM_MODE
+global_norm_mode = "none" if not USE_GLOBAL_NORMALISATION else global_norm_mode
 
 if galaxy_classes[0] in list(range(50, 60)):
     crop_size = (512, 512)  # Crop size for the images
@@ -219,20 +228,30 @@ def _verkey(v):
     return str(v)
 ver_key = _verkey(versions)
 
+def _base(fold, subset_size):
+    """Canonical key used for in-memory dicts and as the pkl filename stem."""
+    return (f"{classifier}_ver{ver_key}_cm{crop_mode}"
+            f"_lr{lr}_reg{reg}_ls{label_smoothing}"
+            f"_lo{percentile_lo}_hi{percentile_hi}"
+            f"_f{fold}_ss{round_to_1(subset_size)}")
+
+def _pkl_path(fold, subset_size, experiment):
+    return os.path.join(METRICS_DIR, f"{_base(fold, subset_size)}_e{experiment}.pkl")
+
 def _as_index_labels(y: torch.Tensor) -> torch.Tensor:
     return y.argmax(dim=1) if y.ndim > 1 else y
 
 def _as_5d(x):
     return x if x.dim() == 5 else x.unsqueeze(1)  # [B,1,H,W] -> [B,1,1,H,W]
 
-def _collapse_logits(logits, num_classes, multilabel):
+def _collapse_logits(logits, num_classes):
     if logits.ndim == 4:
         logits = torch.nn.functional.adaptive_avg_pool2d(logits, (1, 1)).squeeze(-1).squeeze(-1)
     elif logits.ndim == 3:
         logits = logits.mean(dim=-1)
     if logits.ndim == 1:
         logits = logits.unsqueeze(1)
-    if not multilabel and logits.shape[1] == 1 and num_classes == 2:
+    if logits.shape[1] == 1 and num_classes == 2:
         logits = torch.cat([-logits, logits], dim=1)
     return logits
 
@@ -288,7 +307,7 @@ _out  = load_galaxies(galaxy_classes=galaxy_classes,
             crop_size=crop_size,
             downsample_size=downsample_size,
             sample_size=max_num_galaxies,
-            REMOVEOUTLIERS=FILTERED,
+            REMOVEOUTLIERS=False,
             BALANCE=BALANCE,           # Reduce the larger classes to the size of the smallest class
             STRETCH=STRETCH,
             percentile_lo=percentile_lo,  # Percentile stretch lower bound
@@ -297,13 +316,13 @@ _out  = load_galaxies(galaxy_classes=galaxy_classes,
             NORMALISE=NORMALISEIMGS,
             NORMALISETOPM=NORMALISEIMGSTOPM,
             USE_GLOBAL_NORMALISATION=USE_GLOBAL_NORMALISATION,
-            GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
+            global_norm_mode=global_norm_mode,
             PRINTFILENAMES=PRINTFILENAMES,
-
             USE_CACHE=USE_CACHE,
             DEBUG=DEBUG,
-            crop_mode=CROP_MODE,
-            blur_method=BLUR_METHOD,
+            crop_mode=crop_mode,
+            blur_method=blur_method,
+            cache_dir=f"{OUTDIR_BASE}/.cache/images",
             train=False)  # Obtain the test set
 
 if len(_out) == 4:
@@ -319,7 +338,7 @@ test_images, test_labels = test_images[perm_test], test_labels[perm_test]
 if PRINTFILENAMES and test_fns is not None:
     test_fns = permute_like(test_fns, perm_test)
 
-test_labels = relabel(test_labels, galaxy_classes, multilabel=MULTILABEL)
+test_labels = relabel(test_labels, galaxy_classes)
 print("Labels of the test set after relabelling:", torch.unique(test_labels, return_counts=True))
 
 
@@ -338,9 +357,9 @@ if classifier in ['ScatterNet', 'DualSSN']: # When scattering is used
     
     # Define cache paths
     if USE_GLOBAL_NORMALISATION:
-        test_cache = f"./.cache/scattering_coefficients/test_scat_{galaxy_classes}_{versions}_{GLOBAL_NORM_MODE}_{CROP_MODE}.pt"
+        test_cache = f"{OUTDIR_BASE}/.cache/scattering_coefficients/test_scat_{galaxy_classes}_{versions}_{crop_mode}_{blur_method}_{percentile_lo}_{percentile_hi}_{global_norm_mode}.pt"
     else:
-        test_cache = f"./.cache/scattering_coefficients/test_scat_{galaxy_classes}_{versions}_{CROP_MODE}.pt"
+        test_cache = f"{OUTDIR_BASE}/.cache/scattering_coefficients/test_scat_{galaxy_classes}_{versions}_{crop_mode}_{blur_method}_{percentile_lo}_{percentile_hi}.pt"
 
     # Load or compute test scattering coefficients
     if os.path.exists(test_cache) and USE_CACHE:
@@ -359,9 +378,9 @@ if classifier in ['ScatterNet', 'DualSSN']: # When scattering is used
         # Now we need to normalise the scattering coefficients globally, and thus compute the scattering coeffs for all data
         trainval_images = fold_T_axis(train_val_images)
         if USE_GLOBAL_NORMALISATION:
-            trainval_cache = f"./.cache/scattering_coefficients/trainval_scat_{galaxy_classes}_{versions}_{GLOBAL_NORM_MODE}_{CROP_MODE}.pt"
+            trainval_cache = f"{OUTDIR_BASE}/.cache/scattering_coefficients/trainval_scat_{galaxy_classes}_{versions}_{crop_mode}_{blur_method}_{percentile_lo}_{percentile_hi}_{global_norm_mode}.pt"
         else:
-            trainval_cache = f"./.cache/scattering_coefficients/trainval_scat_{galaxy_classes}_{versions}_{CROP_MODE}.pt"
+            trainval_cache = f"{OUTDIR_BASE}/.cache/scattering_coefficients/trainval_scat_{galaxy_classes}_{versions}_{crop_mode}_{blur_method}_{percentile_lo}_{percentile_hi}.pt"
         if os.path.exists(trainval_cache) and USE_CACHE:
             print(f"✓ Loading trainval scattering coefficients from cache: {trainval_cache}")
             trainval_scat_coeffs = torch.load(trainval_cache)
@@ -402,21 +421,18 @@ experiments_run = set()
 FIRSTTIME = True  # Set to True to print model summaries only once
 for fold in folds:
     torch.cuda.empty_cache()
-    runname = f"{galaxy_classes}_lr{lr}_reg{reg}_lo{percentile_lo}_hi{percentile_hi}_cs{cs}_ds{ds}_ver{ver_key}_f{fold}"
-
-    print(f"\n▶ Experiment: g_classes={galaxy_classes}, lr={lr}, reg={reg}, ls={label_smoothing}, "
-    f"J={J}, L={L}, crop={crop_size}, down={downsample_size}, ver={versions}, "
-    f"lo={percentile_lo}, hi={percentile_hi}, classifier={classifier}, "
-    f"global_norm={USE_GLOBAL_NORMALISATION}, norm_mode={GLOBAL_NORM_MODE}, "
-    f"CROP_MODE={CROP_MODE} ◀")
+    if global_norm_mode != "none":
+        run_version = f"{galaxy_classes}_{classifier}_{versions}_{crop_mode}_{blur_method}_{percentile_lo}_{percentile_hi}_{global_norm_mode}_{lr}_{reg}_{label_smoothing}"
+    else:
+        run_version = f"{galaxy_classes}_{classifier}_{versions}_{crop_mode}_{blur_method}_{percentile_lo}_{percentile_hi}_{lr}_{reg}_{label_smoothing}"
+    
+    print(f"\n▶ fold={fold}: classifier={classifier}, ver={versions}, crop_mode={crop_mode}, "
+          f"lr={lr}, reg={reg}, lo={percentile_lo}, hi={percentile_hi} ◀")
 
     if USE_CACHE:
         fold_subset_sizes = [round_to_1(max(2, int(len(train_val_images) * p))) for p in dataset_portions]
         all_configs_exist = all(
-            config_already_exists(classifier, galaxy_classes, lr, reg, percentile_lo, percentile_hi,
-                                cs, ds, ver_key, fold, ss, exp,
-                                metrics_dir=METRICS_DIR, use_global_norm=USE_GLOBAL_NORMALISATION,
-                                global_norm_mode=GLOBAL_NORM_MODE)
+            os.path.exists(_pkl_path(fold, ss, exp))
             for ss in fold_subset_sizes
             for exp in range(num_experiments)
         )
@@ -433,7 +449,7 @@ for fold in folds:
             crop_size=crop_size,
             downsample_size=downsample_size,
             sample_size=max_num_galaxies,
-            REMOVEOUTLIERS=FILTERED,
+            REMOVEOUTLIERS=False,
             BALANCE=BALANCE,           # Reduce the larger classes to the size of the smallest class
             STRETCH=STRETCH,
             percentile_lo=percentile_lo,  # Percentile stretch lower bound
@@ -442,13 +458,13 @@ for fold in folds:
             NORMALISE=NORMALISEIMGS,
             NORMALISETOPM=NORMALISEIMGSTOPM,
             USE_GLOBAL_NORMALISATION=USE_GLOBAL_NORMALISATION,
-            GLOBAL_NORM_MODE=GLOBAL_NORM_MODE,
+            global_norm_mode=global_norm_mode,
             PRINTFILENAMES=PRINTFILENAMES,
-
             USE_CACHE=USE_CACHE,
             DEBUG=DEBUG,
-            crop_mode=CROP_MODE,
-            blur_method=BLUR_METHOD,
+            crop_mode=crop_mode,
+            blur_method=blur_method,
+            cache_dir=f"{OUTDIR_BASE}/.cache/images",
             train=True) # Obtain the train and validation set. Not test set
     
     if len(_out) == 4:
@@ -469,8 +485,8 @@ for fold in folds:
         train_fns = permute_like(train_fns, perm_train)
         valid_fns = permute_like(valid_fns, perm_valid)
         
-    train_labels, valid_labels = (relabel(train_labels, galaxy_classes, multilabel=MULTILABEL),
-                                  relabel(valid_labels, galaxy_classes, multilabel=MULTILABEL))
+    train_labels, valid_labels = (relabel(train_labels, galaxy_classes),
+                                  relabel(valid_labels, galaxy_classes))
 
     # ——— Data sanity checks ———
     if DEBUG:
@@ -485,14 +501,9 @@ for fold in folds:
         assert not val_test_common, f"Overlap detected: {len(val_test_common)} images appear in both validation and test validation!"
         
         for i, cls in enumerate(galaxy_classes):
-            if MULTILABEL:
-                train_mask = train_labels[:, i] > 0.5
-                valid_mask = valid_labels[:, i] > 0.5
-                test_mask  = test_labels[:,  i] > 0.5
-            else:
-                train_mask = _as_index_labels(train_labels) == i
-                valid_mask = _as_index_labels(valid_labels) == i
-                test_mask  = _as_index_labels(test_labels)  == i
+            train_mask = _as_index_labels(train_labels) == i
+            valid_mask = _as_index_labels(valid_labels) == i
+            test_mask  = _as_index_labels(test_labels)  == i
 
             check_tensor(f"Train images for class {cls} (idx={i})", train_images[train_mask])
             check_tensor(f"Valid images for class {cls} (idx={i})", valid_images[valid_mask])
@@ -527,9 +538,13 @@ for fold in folds:
         mock_valid = torch.zeros_like(valid_images)
 
         # Define cache paths
-        train_cache = f"./.cache/scattering_coefficients/train_scat_{galaxy_classes}_{versions}_{fold}_{FILTERED}_{CROP_MODE}.pt"
-        valid_cache = f"./.cache/scattering_coefficients/valid_scat_{galaxy_classes}_{versions}_{fold}_{FILTERED}_{CROP_MODE}.pt"
-
+        if USE_GLOBAL_NORMALISATION:
+            train_cache = f"{OUTDIR_BASE}/.cache/scattering_coefficients/train_scat_{galaxy_classes}_{versions}_{crop_mode}_{blur_method}_{percentile_lo}_{percentile_hi}_{global_norm_mode}.pt"
+            valid_cache = f"{OUTDIR_BASE}/.cache/scattering_coefficients/valid_scat_{galaxy_classes}_{versions}_{crop_mode}_{blur_method}_{percentile_lo}_{percentile_hi}_{global_norm_mode}.pt"
+        else:
+            train_cache = f"{OUTDIR_BASE}/.cache/scattering_coefficients/train_scat_{galaxy_classes}_{versions}_{crop_mode}_{blur_method}_{percentile_lo}_{percentile_hi}.pt"
+            valid_cache = f"{OUTDIR_BASE}/.cache/scattering_coefficients/valid_scat_{galaxy_classes}_{versions}_{crop_mode}_{blur_method}_{percentile_lo}_{percentile_hi}.pt"
+        
         # Load or compute train scattering coefficients
         if os.path.exists(train_cache) and USE_CACHE:
             print(f"✓ Loading train scattering coefficients from cache: {train_cache}")
@@ -604,17 +619,13 @@ for fold in folds:
             labels=lbls,
             classes=get_classes(),
             num_images=5,
-            save_path=f"{FIGURES_DIR}/{galaxy_classes}_{classifier}_{dataset_sizes[folds[0]][-1]}_{percentile_lo}_{percentile_hi}_example_train_data.pdf"
+            save_path=f"{FIGURES_DIR}/{run_version}/example_train_data_f{fold}.pdf"
         )     
         
         if len(galaxy_classes) == 2:
             # Plot histograms for the two classes
-            if MULTILABEL:
-                train_images_cls1 = train_images[train_labels[:, 0] > 0.5]
-                train_images_cls2 = train_images[train_labels[:, 1] > 0.5]
-            else:
-                train_images_cls1 = train_images[train_labels == galaxy_classes[0] - min(galaxy_classes)]
-                train_images_cls2 = train_images[train_labels == galaxy_classes[1] - min(galaxy_classes)]
+            train_images_cls1 = train_images[train_labels == galaxy_classes[0] - min(galaxy_classes)]
+            train_images_cls2 = train_images[train_labels == galaxy_classes[1] - min(galaxy_classes)]
 
             #Make sure the images are not tupples
             if isinstance(train_images_cls1, tuple): train_images_cls1 = train_images_cls1[0]
@@ -625,7 +636,7 @@ for fold in folds:
                 train_images_cls2.cpu(),
                 title1=f"Class {galaxy_classes[0]}",
                 title2=f"Class {galaxy_classes[1]}",
-                save_path=f"{FIGURES_DIR}/{galaxy_classes}_{classifier}_{dataset_sizes[folds[0]][-1]}_{percentile_lo}_{percentile_hi}_histogram_{ver_key}.pdf"
+                save_path=f"{FIGURES_DIR}/{run_version}/histogram_f{fold}.pdf"
             )
             
             plot_background_histogram(
@@ -633,7 +644,7 @@ for fold in folds:
                 train_images_cls2.cpu(),
                 img_shape=(1, 128, 128),
                 title="Background histograms",
-                save_path=f"{FIGURES_DIR}/{galaxy_classes}_{classifier}_{dataset_sizes[folds[0]][-1]}_background_hist.pdf"
+                save_path=f"{FIGURES_DIR}/{run_version}/background_histf{fold}.pdf"
             )
             
             # Histogram for summed pixel values. One image is one point in the histogram.
@@ -646,7 +657,7 @@ for fold in folds:
             plt.ylabel("Number of images")
             plt.title(f"Histogram of summed pixel values for classes {galaxy_classes[0]} and {galaxy_classes[1]}")
             plt.legend()
-            plt.savefig(f"{FIGURES_DIR}/{galaxy_classes}_{classifier}_{dataset_sizes[folds[0]][-1]}_{percentile_lo}_{percentile_hi}_sum_histogram_{ver_key}.pdf")
+            plt.savefig(f"{FIGURES_DIR}/{run_version}/sum_histogramf_{fold}.pdf")
             plt.close()
 
             for cls in galaxy_classes:
@@ -662,19 +673,19 @@ for fold in folds:
                 imgs4plot = _ensure_4d(train_images)[sel_train].cpu()
                 plot_image_grid(
                     imgs4plot, num_images=36, titles=titles_train,
-                    save_path=f"{FIGURES_DIR}/{galaxy_classes}_{classifier}_{dataset_sizes[folds[0]][-1]}_{percentile_lo}_{percentile_hi}_{cls}_train_grid_{ver_key}.pdf"
+                    save_path=f"{FIGURES_DIR}/{run_version}/train_grid_f{fold}.pdf"
                 )
 
                 imgs4plot = _ensure_4d(valid_images)[sel_valid].cpu()
                 plot_image_grid(
                     imgs4plot, num_images=36, titles=titles_valid,
-                    save_path=f"{FIGURES_DIR}/{galaxy_classes}_{classifier}_{dataset_sizes[folds[0]][-1]}_{percentile_lo}_{percentile_hi}_{cls}_valid_grid_{ver_key}.pdf"
+                    save_path=f"{FIGURES_DIR}/{run_version}/valid_grid_f{fold}.pdf"
                 )
                 
                 imgs4plot = _ensure_4d(test_images)[sel_test].cpu()
                 plot_image_grid(
                     imgs4plot, num_images=36, titles=titles_test,
-                    save_path=f"{FIGURES_DIR}/{galaxy_classes}_{classifier}_{dataset_sizes[folds[0]][-1]}_{percentile_lo}_{percentile_hi}_{cls}_test_grid_{ver_key}.pdf"
+                    save_path=f"{FIGURES_DIR}/{run_version}/test_grid_f{fold}.pdf"
                 )
 
                 # summed-intensity histogram helper unchanged...
@@ -685,7 +696,7 @@ for fold in folds:
                     train_images_cls2.cpu(),
                     label1=tag_to_desc[get_classes()[galaxy_classes[0]]['tag']],
                     label2=tag_to_desc[get_classes()[galaxy_classes[1]]['tag']],
-                    save_path=f"{FIGURES_DIR}/{galaxy_classes}_{classifier}_{dataset_sizes[folds[0]][-1]}_summed_intensity_histogram.pdf"
+                    save_path=f"{FIGURES_DIR}/{run_version}/summed_intensity_histogram_f{fold}.pdf"
                 )
        
                 
@@ -723,25 +734,17 @@ for fold in folds:
     ############### TRAINING LOOP #################
     ###############################################
     
-    if MULTILABEL:
-        # labels are 2-hot; compute per-label pos_weight for BCE
-        pos_counts = train_labels.sum(dim=0)                       # [2]
-        neg_counts = train_labels.shape[0] - pos_counts            # [2]
-        pos_counts = torch.clamp(pos_counts, min=1.0)
-        pos_weight = (neg_counts / pos_counts).to(DEVICE)          # [2]
-        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    if USE_CLASS_WEIGHTS:
+        unique, counts = np.unique(train_labels.cpu().numpy(), return_counts=True)
+        total_count = sum(counts)
+        class_weights = {i: total_count / count for i, count in zip(unique, counts)}
+        weights = torch.tensor([class_weights.get(i, 1.0) for i in range(num_classes)],
+                            dtype=torch.float, device=DEVICE)
+        print("Using class weighting:", weights)
+        criterion = nn.CrossEntropyLoss(weight=weights, label_smoothing=label_smoothing)
     else:
-        if USE_CLASS_WEIGHTS:
-            unique, counts = np.unique(train_labels.cpu().numpy(), return_counts=True)
-            total_count = sum(counts)
-            class_weights = {i: total_count / count for i, count in zip(unique, counts)}
-            weights = torch.tensor([class_weights.get(i, 1.0) for i in range(num_classes)],
-                                dtype=torch.float, device=DEVICE)
-            print("Using class weighting:", weights)
-            criterion = nn.CrossEntropyLoss(weight=weights, label_smoothing=label_smoothing)
-        else:
-            print("No class weighting")
-            criterion = nn.BCEWithLogitsLoss() if len(galaxy_classes)==2 else nn.CrossEntropyLoss()
+        print("No class weighting")
+        criterion = nn.CrossEntropyLoss()
 
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=reg)
 
@@ -751,10 +754,7 @@ for fold in folds:
             continue
         
         all_experiments_cached = all(
-            config_already_exists(classifier, galaxy_classes, lr, reg, percentile_lo, percentile_hi,
-                                cs, ds, ver_key, fold, subset_size, exp,
-                                metrics_dir=METRICS_DIR, use_global_norm=USE_GLOBAL_NORMALISATION,
-                                global_norm_mode=GLOBAL_NORM_MODE)
+            os.path.exists(_pkl_path(fold, subset_size, exp))
             for exp in range(num_experiments)
         )
         if USE_CACHE and all_experiments_cached:
@@ -768,14 +768,13 @@ for fold in folds:
 
         for experiment in range(num_experiments):
             
-            if USE_CACHE and config_already_exists(classifier, galaxy_classes, lr, reg, percentile_lo, percentile_hi, cs, ds, ver_key, fold, subset_size, experiment,
-                                                    metrics_dir=METRICS_DIR, use_global_norm=USE_GLOBAL_NORMALISATION, global_norm_mode=GLOBAL_NORM_MODE):
-                print(f"⏭️  Skipping: fold={fold}, subset_size={subset_size}, experiment={experiment} - configuration already trained")
+            if USE_CACHE and os.path.exists(_pkl_path(fold, subset_size, experiment)):
+                print(f"⏭️  Skipping: fold={fold}, subset_size={subset_size}, experiment={experiment} - already trained")
                 continue
             
             all_logits = []
 
-            base = f"cl{classifier}_ss{round_to_1(subset_size)}_f{fold}_lr{lr}_reg{reg}_ls{label_smoothing}_cs{cs}_ds{ds}_pl{percentile_lo}_ph{percentile_hi}_ver{ver_key}"
+            base = _base(fold, subset_size)
             initialise_history(history, base, experiment)
             initialise_metrics(metrics, base)
             initialise_labels(base, all_true_labels, all_pred_labels)
@@ -799,7 +798,7 @@ for fold in folds:
 
             early_stopping = EarlyStopping(patience=patience, verbose=False) if ES else None
 
-            for epoch in tqdm(range(num_epochs), desc=f'Training {classifier}_{galaxy_classes}_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{classifier}_lo{percentile_lo}_hi{percentile_hi}_cs{crop_size}'):
+            for epoch in tqdm(range(num_epochs), desc=f'Training {classifier}_{galaxy_classes}_{versions}_{crop_mode}_{blur_method}_{percentile_lo}_{percentile_hi}_{subset_size}_{fold}_{experiment}_{lr}_{reg}'):
                 model.train()
                 train_total_loss = 0
                 train_total_images = 0
@@ -822,9 +821,9 @@ for fold in folds:
                         else:
                             logits = model(images)
 
-                        logits = _collapse_logits(logits, num_classes, MULTILABEL)
-                        labels_a = labels_a.float() if MULTILABEL else labels_a.long()
-                        labels_b = labels_b.float() if MULTILABEL else labels_b.long()
+                        logits = _collapse_logits(logits, num_classes)
+                        labels_a = labels_a.long()
+                        labels_b = labels_b.long()
                         
                         # CHANGE: Use MixUp criterion
                         loss = mixup_criterion(criterion, logits, labels_a, labels_b, lam)
@@ -837,8 +836,8 @@ for fold in folds:
                         else:
                             logits = model(images)
 
-                        logits = _collapse_logits(logits, num_classes, MULTILABEL)
-                        labels = labels.float() if MULTILABEL else labels.long()
+                        logits = _collapse_logits(logits, num_classes)
+                        labels = labels.long()
                         loss = criterion(logits, labels)
 
                     loss.backward()
@@ -852,13 +851,8 @@ for fold in folds:
                     # Track training accuracy during training
                     if DEBUG:
                         with torch.no_grad():
-                            if MULTILABEL:
-                                preds = (torch.sigmoid(logits) >= THRESHOLD).cpu().numpy()
-                                trues = labels.cpu().numpy()
-                                train_correct += (preds == trues).all(axis=1).sum()
-                            else:
-                                preds = logits.argmax(dim=1)
-                                train_correct += (preds == labels).sum().item()
+                            preds = logits.argmax(dim=1)
+                            train_correct += (preds == labels).sum().item()
                                 
                 if DEBUG:
                     train_epoch_acc = train_correct / train_total_images if train_total_images > 0 else 0.0
@@ -889,10 +883,9 @@ for fold in folds:
                         else:
                             logits = model(images)
 
-                        logits = _collapse_logits(logits, num_classes, MULTILABEL)
-                        labels = labels.float() if MULTILABEL else labels.long()
-                        if not MULTILABEL:
-                            assert labels.dtype == torch.long, f"labels dtype {labels.dtype} must be long"
+                        logits = _collapse_logits(logits, num_classes)
+                        labels = labels.long()
+                        assert labels.dtype == torch.long, f"labels dtype {labels.dtype} must be long"
                         loss = criterion(logits, labels)
                         mn, mx = int(labels.min()), int(labels.max())
                         assert 0 <= mn and mx < num_classes, f"label range [{mn},{mx}] not in [0,{num_classes-1}]"
@@ -902,13 +895,8 @@ for fold in folds:
 
                         # Track validation accuracy per epoch
                         if DEBUG:
-                            if MULTILABEL:
-                                preds = (torch.sigmoid(logits) >= THRESHOLD).cpu().numpy()
-                                trues = labels.cpu().numpy()
-                                val_correct += (preds == trues).all(axis=1).sum()
-                            else:
-                                preds = logits.argmax(dim=1)
-                                val_correct += (preds == labels).sum().item()
+                            preds = logits.argmax(dim=1)
+                            val_correct += (preds == labels).sum().item()
                     
                 if DEBUG:
                     val_epoch_acc = val_correct / val_total_images if val_total_images > 0 else 0.0
@@ -938,21 +926,16 @@ for fold in folds:
                             else:
                                 logits = model(images)
 
-                            logits = _collapse_logits(logits, num_classes, MULTILABEL)
-                            labels = labels.float() if MULTILABEL else labels.long()
-                            
+                            logits = _collapse_logits(logits, num_classes)
+                            labels = labels.long()
+
                             loss = criterion(logits, labels)
                             batch_size = images.size(0)
-                            
+
                             test_total_loss += float(loss.item() * batch_size)
-                            
-                            if MULTILABEL:
-                                preds = (torch.sigmoid(logits) >= THRESHOLD).cpu().numpy()
-                                trues = labels.cpu().numpy()
-                                test_correct += (preds == trues).all(axis=1).sum()
-                            else:
-                                preds = logits.argmax(dim=1)
-                                test_correct += (preds == labels).sum().item()
+
+                            preds = logits.argmax(dim=1)
+                            test_correct += (preds == labels).sum().item()
                             
                             test_total_images += batch_size
 
@@ -1014,16 +997,11 @@ for fold in folds:
                     else:
                         logits = model(images)
                         
-                    logits = _collapse_logits(logits, num_classes, MULTILABEL)
-                    
-                    if MULTILABEL:
-                        preds = (torch.sigmoid(logits) >= THRESHOLD).cpu().numpy()
-                        trues = labels.cpu().numpy()
-                        train_correct += (preds == trues).all(axis=1).sum()
-                    else:
-                        preds = logits.argmax(dim=1)
-                        train_correct += (preds == labels).sum().item()
-                    
+                    logits = _collapse_logits(logits, num_classes)
+
+                    preds = logits.argmax(dim=1)
+                    train_correct += (preds == labels).sum().item()
+
                     train_total += images.size(0)
 
             final_train_acc = train_correct / train_total if train_total > 0 else 0.0
@@ -1042,15 +1020,11 @@ for fold in folds:
                     else:
                         logits = model(images)
                         
-                    logits = _collapse_logits(logits, num_classes, MULTILABEL)
-                    if MULTILABEL:
-                        preds = (torch.sigmoid(logits) >= THRESHOLD).cpu().numpy()
-                        trues = labels.cpu().numpy()
-                        val_correct += (preds == trues).all(axis=1).sum()
-                    else:
-                        preds = logits.argmax(dim=1)
-                        val_correct += (preds == labels).sum().item()
-                    
+                    logits = _collapse_logits(logits, num_classes)
+
+                    preds = logits.argmax(dim=1)
+                    val_correct += (preds == labels).sum().item()
+
                     val_total += images.size(0)
             
             final_val_acc = val_correct / val_total if val_total > 0 else 0.0
@@ -1077,31 +1051,18 @@ for fold in folds:
                         logits = model(images)
                         
                     all_logits.append(logits.cpu().numpy())
-                    logits = _collapse_logits(logits, num_classes, MULTILABEL)
-                    if MULTILABEL:
-                        probs = torch.sigmoid(logits).cpu().numpy()           # [B,2]
-                        preds = (probs >= THRESHOLD).astype(int)              # [B,2]
-                        trues = labels.cpu().numpy().astype(int)              # [B,2]
-                        all_pred_probs[base].extend(probs)
-                        all_pred_labels[base].extend(preds)
-                        all_true_labels[base].extend(trues)
-                    else:
-                        pred_probs = torch.softmax(logits, dim=1).cpu().numpy()
-                        true_labels = labels.cpu().numpy()
-                        pred_labels = np.argmax(pred_probs, axis=1)
-                        all_pred_probs[base].extend(pred_probs)
-                        all_pred_labels[base].extend(pred_labels)
-                        all_true_labels[base].extend(true_labels)
+                    logits = _collapse_logits(logits, num_classes)
+                    pred_probs = torch.softmax(logits, dim=1).cpu().numpy()
+                    true_labels = labels.cpu().numpy()
+                    pred_labels = np.argmax(pred_probs, axis=1)
+                    all_pred_probs[base].extend(pred_probs)
+                    all_pred_labels[base].extend(pred_labels)
+                    all_true_labels[base].extend(true_labels)
                         
                     if SHOWIMGS and experiment == num_experiments - 1:
-                        if MULTILABEL:
-                            batch_pred = preds          # shape [B, 2]
-                            batch_true = trues          # shape [B, 2]
-                            mask = (batch_pred != batch_true).any(axis=1)
-                        else:
-                            batch_pred = pred_labels    # shape [B]
-                            batch_true = true_labels    # shape [B]
-                            mask = batch_pred != batch_true
+                        batch_pred = pred_labels    # shape [B]
+                        batch_true = true_labels    # shape [B]
+                        mask = batch_pred != batch_true
 
                         mask_t = torch.as_tensor(mask, dtype=torch.bool, device=images.device)
                         mis_images.append(images.detach().cpu()[mask_t.cpu()])
@@ -1111,7 +1072,7 @@ for fold in folds:
                 # --- metrics ---
                 y_true = np.array(all_true_labels[base])
                 y_pred = np.array(all_pred_labels[base])
-                accuracy, precision, recall, f1 = compute_classification_metrics(y_true, y_pred, multilabel=MULTILABEL, num_classes=num_classes)
+                accuracy, precision, recall, f1 = compute_classification_metrics(y_true, y_pred, num_classes=num_classes)
                 update_metrics(metrics, base, accuracy, precision, recall, f1)
                 print(f"Fold {fold}, Experiment {experiment}, Subset Size {subset_size}, Classifier {classifier}, "
                     f"Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, "
@@ -1131,20 +1092,14 @@ for fold in folds:
                         # pick the first channel if there are two, else drop the singleton channel
                         img = img_tensor[0] if img_tensor.shape[0] > 1 else img_tensor.squeeze(0)
                         ax.imshow(img.numpy(), cmap='viridis')
-                        # Instead of seeing T=0, P=1. I want to see the actual class names (T=DE, P+NDE)
-                        if MULTILABEL:
-                            true_labels = [str(min(galaxy_classes) + idx) for idx, val in enumerate(mis_trues[i]) if val == 1]
-                            pred_labels = [str(min(galaxy_classes) + idx) for idx, val in enumerate(mis_preds[i]) if val == 1]
-                            ax.set_title(f"T={','.join(true_labels)}\nP={','.join(pred_labels)}", fontsize=8)
-                        else:
-                            ax.set_title(f"T={mis_trues[i]}, P={mis_preds[i]}", fontsize=8)
+                        ax.set_title(f"T={mis_trues[i]}, P={mis_preds[i]}", fontsize=8)
                         
                         ax.axis('off')
 
                     for ax in axes[len(mis_images):]:
                         ax.axis('off')
 
-                    out_path = f"{FIGURES_DIR}/{galaxy_classes}_{classifier}_{dataset_sizes[folds[0]][-1]}_{percentile_lo}_{percentile_hi}_misclassified_{ver_key}.pdf"
+                    out_path = f"{FIGURES_DIR}/{run_version}/_misclassified_{ver_key}_f{fold}.pdf"
                     fig.savefig(out_path, dpi=150, bbox_inches='tight')
                     plt.close(fig)
 
@@ -1169,7 +1124,7 @@ for fold in folds:
                 
                 # Write to log file (keep this)
                 with open(log_path, 'a') as file:
-                    file.write(f"Results for fold {fold}, Classifier {classifier}, lr={lr}, reg={reg}, percentile_lo={percentile_lo}, percentile_hi={percentile_hi}, crop_size={crop_size}, downsample_size={downsample_size}, STRETCH={STRETCH}, FILTERED={FILTERED} \n")
+                    file.write(f"Results for fold {fold}, Classifier {classifier}, lr={lr}, reg={reg}, percentile_lo={percentile_lo}, percentile_hi={percentile_hi}, crop_size={crop_size}, downsample_size={downsample_size}, STRETCH={STRETCH} \n")
                     file.write(f"Cluster Error: {cluster_error} \n")
                     file.write(f"Cluster Distance: {cluster_distance} \n")
                     file.write(f"Cluster Standard Deviation: {cluster_std_dev} \n")
@@ -1195,8 +1150,7 @@ for fold in folds:
                 print(f"⏭️  Skipping metrics save for fold={fold}, subset_size={subset_size}, exp={experiment} - experiment was not run")
                 continue
                 
-            # Build the configuration key
-            base = f"cl{classifier}_ss{round_to_1(subset_size)}_f{fold}_lr{lr}_reg{reg}_ls{label_smoothing}_cs{cs}_ds{ds}_pl{percentile_lo}_ph{percentile_hi}_ver{ver_key}"
+            base = _base(fold, subset_size)
             
             # Extract ONLY the metrics for this specific configuration
             config_metrics = {
@@ -1224,11 +1178,7 @@ for fold in folds:
                 fold: {subset_size: training_times.get(fold, {}).get(subset_size, [])}
             }
             
-            # Save to file
-            if USE_GLOBAL_NORMALISATION:
-                metrics_save_path = f'{METRICS_DIR}/{classifier}_{galaxy_classes}_lr{lr}_reg{reg}_lo{percentile_lo}_hi{percentile_hi}_cs{cs}_ds{ds}_ver{ver_key}_f{fold}_ss{round_to_1(subset_size)}_e{experiment}_{GLOBAL_NORM_MODE}_metrics_data.pkl'
-            else:
-                metrics_save_path = f'{METRICS_DIR}/{classifier}_{galaxy_classes}_lr{lr}_reg{reg}_lo{percentile_lo}_hi{percentile_hi}_cs{cs}_ds{ds}_ver{ver_key}_f{fold}_ss{round_to_1(subset_size)}_e{experiment}_metrics_data.pkl'
+            metrics_save_path = _pkl_path(fold, subset_size, experiment)
             
             with open(metrics_save_path, 'wb') as f:
                 pickle.dump({
@@ -1254,12 +1204,13 @@ for fold in folds:
                     continue
                 if not isinstance(values, (list, tuple)) or len(values) == 0:
                     continue
-
                 vals = np.asarray(values, dtype=float)
                 p16, p50, p84 = np.percentile(vals, [16, 50, 84])
                 sigma68 = 0.5 * (p84 - p16)
 
                 base, metric_name = key.rsplit('_', 1)  # split "..._accuracy" → ("...", "accuracy")
+                print("Base:", base)
+                print("Metric name", metric_name)
                 robust_summary.setdefault(base, {})[metric_name] = {
                     "n": int(vals.size),
                     "p16": float(p16),
@@ -1307,10 +1258,8 @@ for fold in folds:
 
                 plt.tight_layout()
 
-                save_path_hist = (
-                    f"{FIGURES_DIR}/{galaxy_classes}_{classifier}_"
-                    f"{round_to_1(dataset_sizes[folds[0]][-1])}_{metric_name}_histogram.pdf"
-                )
+                save_path_hist = (f"{FIGURES_DIR}/{run_version}/{metric_name}_histogram_f{fold}.pdf")
+                os.makedirs(os.path.dirname(save_path_hist), exist_ok=True)
                 plt.savefig(save_path_hist, dpi=150)
                 plt.close()
 
@@ -1332,8 +1281,8 @@ all_f1_scores = []
 
 for fold in folds:
     for subset_size in dataset_sizes[fold]:
-        base = f"cl{classifier}_ss{round_to_1(subset_size)}_f{fold}_lr{lr}_reg{reg}_ls{label_smoothing}_cs{cs}_ds{ds}_pl{percentile_lo}_ph{percentile_hi}_ver{ver_key}"
-        
+        base = _base(fold, subset_size)
+
         # Collect metrics from this fold/subset combination
         if f"{base}_accuracy" in metrics:
             all_accuracies.extend(metrics[f"{base}_accuracy"])
@@ -1349,10 +1298,10 @@ grand_mean_f1 = float(np.mean(all_f1_scores)) if all_f1_scores else float('nan')
 
 print("\n" + "="*80)
 print(f"GRAND AVERAGE over ALL {len(folds)} folds and {num_experiments} experiments:")
-print(f"  Accuracy:  {grand_mean_acc:.4f} ± {float(np.std(all_accuracies)):.4f}")
-print(f"  Precision: {grand_mean_prec:.4f} ± {float(np.std(all_precisions)):.4f}")
-print(f"  Recall:    {grand_mean_rec:.4f} ± {float(np.std(all_recalls)):.4f}")
-print(f"  F1 Score:  {grand_mean_f1:.4f} ± {float(np.std(all_f1_scores)):.4f}")
+print(f"  Accuracy:  {grand_mean_acc:.4f} ± {float(np.std(all_accuracies)) if all_accuracies else float('nan'):.4f}")
+print(f"  Precision: {grand_mean_prec:.4f} ± {float(np.std(all_precisions)) if all_precisions else float('nan'):.4f}")
+print(f"  Recall:    {grand_mean_rec:.4f} ± {float(np.std(all_recalls)) if all_recalls else float('nan'):.4f}")
+print(f"  F1 Score:  {grand_mean_f1:.4f} ± {float(np.std(all_f1_scores)) if all_f1_scores else float('nan'):.4f}")
 print(f"  Total experiments: {len(all_accuracies)}")
 print("="*80 + "\n")
   
@@ -1368,7 +1317,7 @@ if DEBUG:
         fig, axes = plt.subplots(2, 3, figsize=(18, 10))  # Changed to 2x3 grid
         
         for fold, experiment in list(itertools.product(folds, range(num_experiments))):
-            base = f"cl{classifier}_f{fold}_lr{lr}_reg{reg}_ls{label_smoothing}_cs{crop_size}_ds{downsample_size}_pl{percentile_lo}_ph{percentile_hi}_ver{ver_key}"
+            base = _base(fold, dataset_sizes[fold][-1])
             train_loss_key = f"{base}_{experiment}_train_loss"
             val_loss_key = f"{base}_{experiment}_val_loss"
             test_loss_key = f"{base}_{experiment}_test_loss"
@@ -1437,7 +1386,7 @@ if DEBUG:
         axes[1, 2].set_ylim([0, 1])
         
         plt.tight_layout()
-        save_path = f"{plot_dir}/{base}_all_experiments.pdf"
+        save_path = f"{plot_dir}/{base}_all_experiments_f{fold}.pdf"
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close()
         print(f"Saved aggregate plot to {save_path}")

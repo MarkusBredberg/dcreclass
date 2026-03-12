@@ -1,9 +1,15 @@
-import math, torch, os, hashlib
+import math, torch, os, hashlib, itertools
 import numpy as np
 import matplotlib.pyplot as plt
+import seaborn as sns
 from matplotlib.gridspec import GridSpecFromSubplotSpec
+from matplotlib.colors import LinearSegmentedColormap
 from typing import Dict, List, Optional, Any
 from pathlib import Path
+from collections import defaultdict
+from sklearn.metrics import confusion_matrix, roc_curve, auc
+from sklearn.preprocessing import label_binarize
+import torch.nn.functional as F
 
 
 def img_hash(img: torch.Tensor) -> str:
@@ -633,10 +639,7 @@ def robust_metric_histograms(metrics: Dict[str, Any],
 
         # ── Save ──────────────────────────────────────────────────────────────
         fig.tight_layout()
-        save_path_hist = (
-            f"{save_dir}/{galaxy_classes}_{classifier}_{version}_{largest_sz}_"
-            f"{learning_rates[0]}_{regularization_params[0]}_{metric_name}_histogram.pdf"
-        )
+        save_path_hist = f"{save_dir}/{group_key}_histogram.pdf"
         fig.savefig(save_path_hist, format="pdf", bbox_inches="tight", dpi=150)
         plt.close(fig)
         print(f"  Saved histogram: {os.path.basename(save_path_hist)}")
@@ -657,7 +660,7 @@ def robust_metric_histograms(metrics: Dict[str, Any],
     # ── Write CSV summary ─────────────────────────────────────────────────────
     if rows:
         import csv
-        csv_path = f"{save_dir}/{galaxy_classes}_{classifier}_robust_summary.csv"
+        csv_path = f"{save_dir}/robust_summary.csv"
 
         fieldnames = ["metric", "n", "setting", "mean", "std",
                       "p16", "p50", "p84", "sigma68"]
@@ -687,12 +690,6 @@ def robust_metric_histograms(metrics: Dict[str, Any],
         
 
 def plot_cluster_metrics(cluster_metrics_dict: Dict[str, List[float]],
-                         galaxy_classes: List[int],
-                         classifier: str,
-                         version: str,
-                         largest_sz: int,
-                         lr: float,
-                         reg: float,
                          save_dir: str = "./classifier/figures") -> None:    
     """
     Plot cluster metrics across experiments.
@@ -736,7 +733,7 @@ def plot_cluster_metrics(cluster_metrics_dict: Dict[str, List[float]],
                    ha='center', va='center', transform=ax.transAxes)
     
     plt.tight_layout()
-    save_path = f'{save_dir}/{galaxy_classes}_{classifier}_{version}_{largest_sz}_{lr}_{reg}_cluster_metrics_distribution.pdf'
+    save_path = f'{save_dir}/cluster_metrics_distribution.pdf'
     plt.savefig(save_path)
     plt.close()
     print(f"Saved cluster metrics plot to {save_path}")
@@ -751,6 +748,12 @@ def plot_avg_roc_curves(metrics: Dict[str, Any],
                         regularization_params: Optional[List[float]] = None,
                         galaxy_classes: Optional[List[int]] = None,
                         class_descriptions: Optional[Dict[int, str]] = None,
+                        version: Optional[str] = None,
+                        dataset_sizes: Optional[Dict] = None,
+                        crop_size: tuple = (512, 512),
+                        downsample_size: tuple = (128, 128),
+                        percentile_lo: int = 30,
+                        percentile_hi: int = 99,
                         save_dir: str = "./classifier/figures") -> None:
     """
     Plot average ROC curves with 68% confidence intervals.
@@ -810,6 +813,9 @@ def plot_avg_roc_curves(metrics: Dict[str, Any],
                 'downsample_size':       downsample_size,
             }
         ]
+
+    if class_descriptions is None:
+        class_descriptions = {}
 
     # ── Collect all subset sizes across all configs ───────────────────────────
     all_subset_sizes = sorted(set(
@@ -977,10 +983,7 @@ def plot_avg_roc_curves(metrics: Dict[str, Any],
 
         # ── Save ──────────────────────────────────────────────────────────────
         fig.tight_layout()
-        save_path = (
-            f"{save_dir}/{galaxy_classes}_{classifier}_{version}_"
-            f"{largest_sz}_ss{subset_size}_avg_roc_curve.pdf"
-        )
+        save_path = f"{save_dir}/ss{subset_size}_avg_roc_curve.pdf"
         fig.savefig(save_path, format="pdf", bbox_inches="tight", dpi=150)
         plt.close(fig)
         print(f"  Saved: {os.path.basename(save_path)}")
@@ -1003,6 +1006,7 @@ def plot_avg_std_confusion_matrix(metrics: Dict[str, Any],
                                   percentile_lo: int,
                                   percentile_hi: int,
                                   merge_map: Optional[Dict] = None,
+                                  num_experiments: int = 1,
                                   save_dir: str = "./classifier/figures") -> None:
     """
     Plot average confusion matrix with standard deviations across all experiments.
@@ -1059,7 +1063,8 @@ def plot_avg_std_confusion_matrix(metrics: Dict[str, Any],
             std_cm = np.std(cms, axis=0)
             
             # Get class descriptions
-            desc_by_tag = {cls['tag']: cls['description'] for cls in classes}
+            from dcreclass.data import get_classes as _get_classes
+            desc_by_tag = {cls['tag']: cls['description'] for cls in _get_classes()}
             present_descriptions = [desc_by_tag[tag] for tag in galaxy_classes]
             
             # Create annotation array with mean ± std
@@ -1074,6 +1079,7 @@ def plot_avg_std_confusion_matrix(metrics: Dict[str, Any],
             std_dev = np.std(values) if values else 0.0
             
             # Create heatmap
+            cmap_green = LinearSegmentedColormap.from_list('white_to_green', ['white', '#006400'])
             fig, ax = plt.subplots(figsize=(10, 8))
             sns.heatmap(
                 avg_cm,
@@ -1585,7 +1591,8 @@ def generate_attention_visualizations(model: torch.nn.Module,
                                       source_names: List[str],
                                       save_dir: str = "./classifier/attention_maps",
                                       methods: Optional[List[str]] = None,
-                                      classifier_name: str = "CNN") -> None:
+                                      classifier_name: str = "CNN",
+                                      device='cpu') -> None:
     """
     Generate attention visualizations for test samples.
     For multi-branch models (DualSSN, DualCSN), shows attention from both branches.

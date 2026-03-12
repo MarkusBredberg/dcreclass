@@ -561,9 +561,11 @@ def _build_cache_key(
         NORMALISE: bool,
         NORMALISETOPM: bool,
         USE_GLOBAL_NORMALISATION: bool,
-        GLOBAL_NORM_MODE: str,
+        global_norm_mode: str,
         train: Optional[bool],
-        crop_mode: str) -> str:
+        crop_mode: str,
+        blur_method: str,
+        alpha: float) -> str:
     """
     Build a unique, human-readable cache key from all parameters that affect loaded data.
 
@@ -591,19 +593,25 @@ def _build_cache_key(
         'NORMALISE':               NORMALISE,
         'NORMALISETOPM':           NORMALISETOPM,
         'USE_GLOBAL_NORMALISATION':USE_GLOBAL_NORMALISATION,
-        'GLOBAL_NORM_MODE':        GLOBAL_NORM_MODE,
+        'global_norm_mode':        global_norm_mode,
         'train':                   train,
         'crop_mode':               crop_mode,
+        'blur_method':             blur_method,
+        'alpha':                   alpha,
     }
 
     param_str  = json.dumps(params, sort_keys=True)
     cache_hash = hashlib.sha256(param_str.encode()).hexdigest()[:16]
 
     classes_str = "_".join(map(str, params['galaxy_classes']))
-    if USE_GLOBAL_NORMALISATION:
-        prefix = f"cache_cls{classes_str}_ver{ver_str}_globnorm{GLOBAL_NORM_MODE}_f{fold}"
-    else:
-        prefix = f"cache_cls{classes_str}_ver{ver_str}_f{fold}"
+    aug_s = "aug"   if AUGMENT else "noaug"
+    bal_s = "bal"   if BALANCE else "nobal"
+    str_s = "str"   if STRETCH else "nostr"
+    gn_s  = f"_gn{global_norm_mode}" if USE_GLOBAL_NORMALISATION else ""
+    prefix = (f"cache_cls{classes_str}_ver{ver_str}"
+              f"_crop{crop_mode}_blur{blur_method}"
+              f"_pct{int(percentile_lo)}-{int(percentile_hi)}"
+              f"_{aug_s}_{bal_s}_{str_s}{gn_s}_f{fold}")
     return f"{prefix}_{cache_hash}"
 
 
@@ -1187,7 +1195,7 @@ def load_galaxies(
         BALANCE: bool = False,
         AUGMENT: bool = False,
         USE_GLOBAL_NORMALISATION: bool = False,
-        GLOBAL_NORM_MODE: str = "percentile",
+        global_norm_mode: str = "percentile",
         STRETCH: bool = False,
         alpha: float = 10.0,
         percentile_lo: float = 30,
@@ -1202,6 +1210,7 @@ def load_galaxies(
         DEBUG: bool = True,
         crop_mode: str = 'pixel_crop',
         blur_method: str = 'circular',
+        cache_dir: str = "./.cache/images",
 ) -> Tuple:
     """
     Master loader: delegates to the appropriate dataset loader, applies
@@ -1220,7 +1229,7 @@ def load_galaxies(
         BALANCE:                  Down-sample majority class to minority size.
         AUGMENT:                  Apply rotation/flip augmentation.
         USE_GLOBAL_NORMALISATION: Normalise all images jointly to [0, 1].
-        GLOBAL_NORM_MODE:         'percentile' or 'minmax' (used with global norm).
+        global_norm_mode:         'percentile' or 'minmax' (used with global norm).
         STRETCH:                  Apply asinh stretch after normalisation.
         alpha:                    Asinh stretch scale factor.
         percentile_lo:            Lower percentile for per-image stretch.
@@ -1244,9 +1253,10 @@ def load_galaxies(
             galaxy_classes, versions, fold, crop_size, downsample_size,
             sample_size, REMOVEOUTLIERS, BALANCE, AUGMENT, STRETCH,
             percentile_lo, percentile_hi, NORMALISE, NORMALISETOPM,
-            USE_GLOBAL_NORMALISATION, GLOBAL_NORM_MODE, train, crop_mode)
+            USE_GLOBAL_NORMALISATION, global_norm_mode, train, crop_mode,
+            blur_method, alpha)
 
-        cached_data = _load_cache(cache_key)
+        cached_data = _load_cache(cache_key, cache_dir=cache_dir)
         if cached_data is not None:
             if PRINTFILENAMES and len(cached_data) == 6:
                 return cached_data
@@ -1409,7 +1419,7 @@ def load_galaxies(
     if USE_CACHE:
         cache_data = (train_images, train_labels, eval_images, eval_labels,
                       *(([train_filenames, eval_filenames]) if PRINTFILENAMES else []))
-        _save_cache(cache_key, cache_data)
+        _save_cache(cache_key, cache_data, cache_dir=cache_dir)
 
     # ── Return ────────────────────────────────────────────────────────────────
     if PRINTFILENAMES:

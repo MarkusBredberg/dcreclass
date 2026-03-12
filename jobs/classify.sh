@@ -4,7 +4,7 @@
 #SBATCH --account=sk032
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --time=4:00:00
+#SBATCH --time=1:00:00
 #SBATCH --chdir=/users/mbredber/p2_DCRECLASS
 #SBATCH --output=/users/mbredber/p2_DCRECLASS/outputs/logs/sbatchrun-%j.out
 #SBATCH --error=/users/mbredber/p2_DCRECLASS/outputs/logs/sbatchrun-%j.err
@@ -14,19 +14,18 @@
 #SBATCH --cpus-per-task=4
 
 # ── Run configuration ─────────────────────────────────────────────────────────
-export CLASSIFIER="ImageCNN"
-export CROP_MODE="beam_crop"
+CLASSIFIER="ImageCNN"
+CROP_MODE="beam_crop"
+VERSIONS="T25kpc"
+FOLDS="0 1 2 3 4 5 6 7 8 9"
+NUM_EXPERIMENTS=3
 
 # Output directories for this run
-RUN_LABEL="${CLASSIFIER}_${CROP_MODE}"
-export RUN_DIR="/users/mbredber/p2_DCRECLASS/outputs/classifier/${RUN_LABEL}"
-export DATA_RUN_DIR="/users/mbredber/p2_DCRECLASS/outputs/classifier/${RUN_LABEL}"
-export CONFIG_FILE="${RUN_DIR}/logs/config.txt"
-
-mkdir -p "${RUN_DIR}/figures"
-mkdir -p "${RUN_DIR}/logs"
-mkdir -p "${RUN_DIR}/models"
-mkdir -p "${RUN_DIR}/metrics"
+RUN_DIR="/users/mbredber/p2_DCRECLASS/outputs/scratch"
+mkdir -p "${RUN_DIR}/figures/"
+mkdir -p "${RUN_DIR}/data/logs/"
+mkdir -p "${RUN_DIR}/data/models/"
+mkdir -p "${RUN_DIR}/data/metrics/"}
 mkdir -p "/users/mbredber/p2_DCRECLASS/outputs/logs"
 
 # ── Environment ───────────────────────────────────────────────────────────────
@@ -44,16 +43,30 @@ echo "Job started at: $(date)"
 echo "Running on node: $(hostname)"
 echo "Classifier:  ${CLASSIFIER}"
 echo "Crop mode:   ${CROP_MODE}"
-echo "Output dir:  ${RUN_DIR}"
+echo "Versions:    ${VERSIONS}"
+echo "Run dir:     ${RUN_DIR}"
+echo "Data dir:    ${DATA_RUN_DIR}"
 echo "========================================"
 
 # ── Step 1: Train ─────────────────────────────────────────────────────────────
 echo "--- Training ${CLASSIFIER} on ${CROP_MODE} ---"
-python /users/mbredber/p2_DCRECLASS/scripts/04.train_classifier.py
+python /users/mbredber/p2_DCRECLASS/scripts/04.train_classifier.py \
+    --classifier "${CLASSIFIER}" \
+    --versions "${VERSIONS}" \
+    --crop-mode "${CROP_MODE}" \
+    --run-dir "${RUN_DIR}" \
+    --data-run-dir "${DATA_RUN_DIR}" \
+    --folds ${FOLDS} \
+    --num-experiments ${NUM_EXPERIMENTS}
 
 # ── Step 2: Evaluate ──────────────────────────────────────────────────────────
 echo "--- Evaluating ${CLASSIFIER} on ${CROP_MODE} ---"
-python /users/mbredber/p2_DCRECLASS/scripts/05.plot_classifier_results.py
+python /users/mbredber/p2_DCRECLASS/scripts/05.plot_classifier_results.py \
+    --classifier "${CLASSIFIER}" \
+    --version "${VERSIONS}" \
+    --crop-mode "${CROP_MODE}" \
+    --run-dir "${RUN_DIR}" \
+    --data-run-dir "${DATA_RUN_DIR}"
 
 echo "========================================"
 echo "Job finished at: $(date)"
