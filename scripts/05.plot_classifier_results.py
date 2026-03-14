@@ -501,7 +501,9 @@ if GENERATE_ATTENTION_MAPS:
             galaxy_classes=galaxy_classes,
             source_names=source_names,
             save_dir=ATTN_DIR,
-            methods=ATTENTION_METHODS
+            methods=ATTENTION_METHODS,
+            classifier_name=classifier,
+            device=device,
         )
 
 ###############################################

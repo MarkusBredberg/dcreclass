@@ -1300,7 +1300,7 @@ def load_galaxies(
             plot_class_images(get_classes(), train_images, eval_images,
                               train_labels, eval_labels,
                               train_filenames, eval_filenames,
-                              set_name='1.before_normalisation')
+                              save_path="/users/mbredber/scratch/figures/processing/processing_pipeline/before_normalisation.png")
             for cls in set(train_labels):
                 check_tensor(f"train class {cls} before norm",
                              [img for img, lbl in zip(train_images, train_labels) if lbl == cls])
@@ -1338,7 +1338,7 @@ def load_galaxies(
             plot_class_images(get_classes(), train_images, eval_images,
                               train_labels, eval_labels,
                               train_filenames, eval_filenames,
-                              set_name='2.after_normalisation')
+                              save_path="/users/mbredber/scratch/figures/processing/processing_pipeline/after_normalisation.png")
 
     # ── Asinh stretch ──────────────────────────────────────────────────────────
     if STRETCH:

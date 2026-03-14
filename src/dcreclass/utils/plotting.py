@@ -229,7 +229,8 @@ def plot_class_images(classes: List[Dict],
                       eval_labels: List[int] | torch.Tensor,
                       train_filenames: Optional[List[str]] = None,
                       eval_filenames: Optional[List[str]] = None,
-                      set_name: str = "comparison") -> None:    # ensure labels are a plain list of ints
+                      save_path: str = "./classifier/processing_step/class_examples.png"
+) -> None:    # ensure labels are a plain list of ints
     if isinstance(train_labels, torch.Tensor):
         print("Converting train_labels tensor to list")
         train_labels = train_labels.tolist()
@@ -328,9 +329,8 @@ def plot_class_images(classes: List[Dict],
         ax.set_frame_on(False)
             
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    out_path = Path(f"./classifier/processing_step/{class1}_{class2}_{set_name}_comparison.png")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(out_path, dpi=300)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_path, dpi=300)
     plt.close()
     
 def plot_images_by_class(images: torch.Tensor | np.ndarray,
@@ -1603,7 +1603,7 @@ def generate_attention_visualizations(model: torch.nn.Module,
     os.makedirs(save_dir, exist_ok=True)
     
     # Detect multi-branch architecture
-    is_multi_branch = classifier_name in ['DualSSN', 'DualCSN']
+    is_multi_branch = classifier_name in ['DualSSN']
     sources_per_class = 3 if is_multi_branch else 6
     
     print(f"Classifier: {classifier_name}")
@@ -1629,7 +1629,7 @@ def generate_attention_visualizations(model: torch.nn.Module,
             labels = labels.to(device)
             
             # Get predictions
-            if scat is not None:
+            if is_multi_branch and scat is not None:
                 outputs = model(images, scat)
             else:
                 outputs = model(images)
@@ -1651,7 +1651,7 @@ def generate_attention_visualizations(model: torch.nn.Module,
                 if len(class_examples[true_label]['images']) < sources_per_class:
                     class_examples[true_label]['images'].append(images[i:i+1].clone())
                     class_examples[true_label]['scats'].append(
-                        scat[i:i+1].clone() if scat is not None else None)
+                        scat[i:i+1].clone() if (is_multi_branch and scat is not None) else None)
                     class_examples[true_label]['true_labels'].append(true_label)
                     class_examples[true_label]['pred_labels'].append(pred_label)
                     class_examples[true_label]['probs'].append(probs[i].cpu().numpy())

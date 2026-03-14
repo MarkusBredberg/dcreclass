@@ -4,7 +4,6 @@ from dcreclass.models import CNN, ImageCNN, ScatterNet, DualCNNSqueezeNet, DualS
 from dcreclass.training import (EarlyStopping, reset_weights,
                                 relabel, permute_like,
                                 mixup_data, mixup_criterion,
-                                config_already_exists,
                                 initialise_history, initialise_labels, initialise_metrics,
                                 compute_classification_metrics, update_metrics,
                                 plot_training_history, plot_intensity_histogram,
@@ -539,11 +538,11 @@ for fold in folds:
 
         # Define cache paths
         if USE_GLOBAL_NORMALISATION:
-            train_cache = f"{OUTDIR_BASE}/.cache/scattering_coefficients/train_scat_{galaxy_classes}_{versions}_{crop_mode}_{blur_method}_{percentile_lo}_{percentile_hi}_{global_norm_mode}.pt"
-            valid_cache = f"{OUTDIR_BASE}/.cache/scattering_coefficients/valid_scat_{galaxy_classes}_{versions}_{crop_mode}_{blur_method}_{percentile_lo}_{percentile_hi}_{global_norm_mode}.pt"
+            train_cache = f"{OUTDIR_BASE}/.cache/scattering_coefficients/train_scat_fold{fold}_{galaxy_classes}_{versions}_{crop_mode}_{blur_method}_{percentile_lo}_{percentile_hi}_{global_norm_mode}.pt"
+            valid_cache = f"{OUTDIR_BASE}/.cache/scattering_coefficients/valid_scat_fold{fold}_{galaxy_classes}_{versions}_{crop_mode}_{blur_method}_{percentile_lo}_{percentile_hi}_{global_norm_mode}.pt"
         else:
-            train_cache = f"{OUTDIR_BASE}/.cache/scattering_coefficients/train_scat_{galaxy_classes}_{versions}_{crop_mode}_{blur_method}_{percentile_lo}_{percentile_hi}.pt"
-            valid_cache = f"{OUTDIR_BASE}/.cache/scattering_coefficients/valid_scat_{galaxy_classes}_{versions}_{crop_mode}_{blur_method}_{percentile_lo}_{percentile_hi}.pt"
+            train_cache = f"{OUTDIR_BASE}/.cache/scattering_coefficients/train_scat_fold{fold}_{galaxy_classes}_{versions}_{crop_mode}_{blur_method}_{percentile_lo}_{percentile_hi}.pt"
+            valid_cache = f"{OUTDIR_BASE}/.cache/scattering_coefficients/valid_scat_fold{fold}_{galaxy_classes}_{versions}_{crop_mode}_{blur_method}_{percentile_lo}_{percentile_hi}.pt"
         
         # Load or compute train scattering coefficients
         if os.path.exists(train_cache) and USE_CACHE:
@@ -1115,198 +1114,54 @@ for fold in folds:
             if all_logits:
                 model_save_path = f'{MODELS_DIR}/{base}_model.pth'
                 torch.save(model.state_dict(), model_save_path)
-                
+
                 all_logits_concat = np.concatenate(all_logits, axis=0)
                 cluster_error, cluster_distance, cluster_std_dev = cluster_metrics(all_logits_concat, n_clusters=num_classes)
-                
+
                 print(f"✓ Saved model for fold {fold}, subset_size {subset_size}: {model_save_path}")
                 experiments_run.add((fold, subset_size, experiment)) # Mark that we ran at least one experiment for this fold and subset size
-                
+
                 # Write to log file (keep this)
                 with open(log_path, 'a') as file:
                     file.write(f"Results for fold {fold}, Classifier {classifier}, lr={lr}, reg={reg}, percentile_lo={percentile_lo}, percentile_hi={percentile_hi}, crop_size={crop_size}, downsample_size={downsample_size}, STRETCH={STRETCH} \n")
                     file.write(f"Cluster Error: {cluster_error} \n")
                     file.write(f"Cluster Distance: {cluster_distance} \n")
                     file.write(f"Cluster Standard Deviation: {cluster_std_dev} \n")
+
+                # Save metrics pkl immediately after each experiment
+                config_metrics = {
+                    "accuracy": metrics.get(f"{base}_accuracy", []),
+                    "precision": metrics.get(f"{base}_precision", []),
+                    "recall": metrics.get(f"{base}_recall", []),
+                    "f1_score": metrics.get(f"{base}_f1_score", []),
+                    "train_acc": metrics.get(f"{base}_train_acc", []),
+                    "val_acc": metrics.get(f"{base}_val_acc", []),
+                }
+                config_history = {k: v for k, v in history.items() if k.startswith(f"{base}_{experiment}")}
+                config_training_times = {fold: {subset_size: training_times.get(fold, {}).get(subset_size, [])}}
+
+                metrics_save_path = _pkl_path(fold, subset_size, experiment)
+                with open(metrics_save_path, 'wb') as f:
+                    pickle.dump({
+                        "metrics": config_metrics,
+                        "history": config_history,
+                        "all_true_labels": {base: all_true_labels.get(base, [])},
+                        "all_pred_labels": {base: all_pred_labels.get(base, [])},
+                        "all_pred_probs":  {base: all_pred_probs.get(base, [])},
+                        "training_times": config_training_times,
+                        "classifier_name": classifier,
+                        "model_architecture": str(model),
+                        "cluster_error": cluster_error,
+                        "cluster_distance": cluster_distance,
+                        "cluster_std_dev": cluster_std_dev,
+                    }, f)
+                print(f"✓ Saved metrics PKL for fold={fold}, subset_size={subset_size}, exp={experiment}: {os.path.basename(metrics_save_path)}")
             else:
                 print(f"⏭️  No new experiments trained for fold {fold}, subset_size {subset_size} - skipping model save and cluster metrics")
-            
-###############################################
-########### SAVE ALL EXPERIMENT METRICS #######
-###############################################
-
-# Save metrics for each experiment that was actually run
-print("\n" + "="*80)
-print("SAVING METRICS FOR ALL EXPERIMENTS")
-print("="*80)
 
 
-for fold in folds:
-    for subset_size in dataset_sizes.get(fold, []):
-        for experiment in range(num_experiments):
-            print("Experiment: ", experiment)
-            # Skip if this experiment was not run (was cached)
-            if (fold, subset_size, experiment) not in experiments_run:
-                print(f"⏭️  Skipping metrics save for fold={fold}, subset_size={subset_size}, exp={experiment} - experiment was not run")
-                continue
-                
-            base = _base(fold, subset_size)
-            
-            # Extract ONLY the metrics for this specific configuration
-            config_metrics = {
-                "accuracy": metrics.get(f"{base}_accuracy", []),
-                "precision": metrics.get(f"{base}_precision", []),
-                "recall": metrics.get(f"{base}_recall", []),
-                "f1_score": metrics.get(f"{base}_f1_score", []),
-                "train_acc": metrics.get(f"{base}_train_acc", []),
-                "val_acc": metrics.get(f"{base}_val_acc", []),
-            }
-            
-            # Extract history for this configuration
-            config_history = {}
-            for key in history.keys():
-                if key.startswith(f"{base}_{experiment}"):
-                    config_history[key] = history[key]
-            
-            # Extract labels and predictions for this configuration
-            config_true_labels = {base: all_true_labels.get(base, [])}
-            config_pred_labels = {base: all_pred_labels.get(base, [])}
-            config_pred_probs = {base: all_pred_probs.get(base, [])}
-            
-            # Extract training time for this configuration
-            config_training_times = {
-                fold: {subset_size: training_times.get(fold, {}).get(subset_size, [])}
-            }
-            
-            metrics_save_path = _pkl_path(fold, subset_size, experiment)
-            
-            with open(metrics_save_path, 'wb') as f:
-                pickle.dump({
-                    "metrics": config_metrics,
-                    "history": config_history,
-                    "all_true_labels": config_true_labels,
-                    "all_pred_labels": config_pred_labels,
-                    "all_pred_probs": config_pred_probs,
-                    "training_times": config_training_times,
-                    "classifier_name": classifier,
-                    "model_architecture": str(model) if 'model' in locals() else f"Model {classifier} not initialized",
-                    "cluster_error": cluster_error if 'cluster_error' in locals() else None,
-                    "cluster_distance": cluster_distance if 'cluster_distance' in locals() else None,
-                    "cluster_std_dev": cluster_std_dev if 'cluster_std_dev' in locals() else None,
-                }, f)
-            print(f"✓ Saved metrics PKL for fold={fold}, subset_size={subset_size}, exp={experiment}: {os.path.basename(metrics_save_path)}")
-            
-            robust_summary = {}   # { base_key: {metric: {'n', 'p16','p50','p84','sigma68'} } }
-            skip_keys = {"accuracy", "precision", "recall", "f1_score"}
-            rows = []
-            for key, values in metrics.items():
-                if key in skip_keys:
-                    continue
-                if not isinstance(values, (list, tuple)) or len(values) == 0:
-                    continue
-                vals = np.asarray(values, dtype=float)
-                p16, p50, p84 = np.percentile(vals, [16, 50, 84])
-                sigma68 = 0.5 * (p84 - p16)
-
-                base, metric_name = key.rsplit('_', 1)  # split "..._accuracy" → ("...", "accuracy")
-                print("Base:", base)
-                print("Metric name", metric_name)
-                robust_summary.setdefault(base, {})[metric_name] = {
-                    "n": int(vals.size),
-                    "p16": float(p16),
-                    "p50": float(p50),   # median
-                    "p84": float(p84),
-                    "sigma68": float(sigma68)  # half-width of the central 68% interval
-                }
-                
-                # Histogram with percentile markers (bins span data range)
-                vmin, vmax = float(np.min(vals)), float(np.max(vals))
-                if vmin == vmax:  # guard against a degenerate run where all values are identical
-                    eps = 1e-6
-                    vmin, vmax = vmin - eps, vmax + eps
-                edges = np.linspace(vmin, vmax, 21)  # 20 bins across [min, max]
-
-                import matplotlib.patches as mpatches
-
-                # compute stats
-                mean = float(np.mean(vals))
-                std = float(np.std(vals, ddof=0))
-                p16, p50, p84 = float(p16), float(p50), float(p84)
-
-                plt.figure(figsize=(5,3.2))
-                counts, bins, patches = plt.hist(vals, bins=edges, edgecolor='black', color='green', alpha=0.45)
-
-                # vertical lines: mean (solid), median (dashed), p16/p84 (dotted)
-                mean_line, = plt.plot([mean, mean], [0, counts.max()], linestyle='-', color='blue', linewidth=2, label=f"Mean = {mean:.3f}, σ = {std:.3f}")
-                median_line, = plt.plot([p50, p50], [0, counts.max()], linestyle='--', color='orange', linewidth=2, label=f"Median = {p50:.3f}")
-                p16_line = plt.plot([p16, p16], [0, counts.max()], color='green', linestyle=':', linewidth=1)
-                p84_line = plt.plot([p84, p84], [0, counts.max()], color='green', linestyle=':', linewidth=1)
-                mean_plus_std_line = plt.plot([mean + std, mean + std], [0, counts.max()], color='blue', linestyle='--', linewidth=1)
-                mean_minus_std_line = plt.plot([mean - std, mean - std], [0, counts.max()], color='blue', linestyle='--', linewidth=1)
-
-                # shaded central 68% credibility region (p16--p84)
-                ymax = counts.max()
-                region_patch = plt.fill_betweenx([0, ymax], p16, p84, alpha=0.12, facecolor='green')
-
-                plt.xlim(vmin, vmax)
-                plt.xlabel(metric_name.capitalize())
-                plt.ylabel("Count")
-
-                # assemble legend: use created artists and the shaded patch
-                legend_handles = [median_line, mean_line, mpatches.Patch(facecolor='green', alpha=0.12, label=f"68% interval [{p16:.3f}, {p84:.3f}]")]
-                plt.legend(handles=legend_handles, loc='best', frameon=False, fontsize='small')
-
-                plt.tight_layout()
-
-                save_path_hist = (f"{FIGURES_DIR}/{run_version}/{metric_name}_histogram_f{fold}.pdf")
-                os.makedirs(os.path.dirname(save_path_hist), exist_ok=True)
-                plt.savefig(save_path_hist, dpi=150)
-                plt.close()
-
-                rows.append({
-                    "setting": base,
-                    "metric": metric_name,
-                    "n": int(vals.size),
-                    "p16": float(p16),
-                    "p50": float(p50),
-                    "p84": float(p84),
-                    "sigma68": float(sigma68)
-                })
-            
-# Calculate and print grand average over ALL folds and experiments
-all_accuracies = []
-all_precisions = []
-all_recalls = []
-all_f1_scores = []
-
-for fold in folds:
-    for subset_size in dataset_sizes[fold]:
-        base = _base(fold, subset_size)
-
-        # Collect metrics from this fold/subset combination
-        if f"{base}_accuracy" in metrics:
-            all_accuracies.extend(metrics[f"{base}_accuracy"])
-            all_precisions.extend(metrics[f"{base}_precision"])
-            all_recalls.extend(metrics[f"{base}_recall"])
-            all_f1_scores.extend(metrics[f"{base}_f1_score"])
-
-# Calculate grand averages
-grand_mean_acc = float(np.mean(all_accuracies)) if all_accuracies else float('nan')
-grand_mean_prec = float(np.mean(all_precisions)) if all_precisions else float('nan')
-grand_mean_rec = float(np.mean(all_recalls)) if all_recalls else float('nan')
-grand_mean_f1 = float(np.mean(all_f1_scores)) if all_f1_scores else float('nan')
-
-print("\n" + "="*80)
-print(f"GRAND AVERAGE over ALL {len(folds)} folds and {num_experiments} experiments:")
-print(f"  Accuracy:  {grand_mean_acc:.4f} ± {float(np.std(all_accuracies)) if all_accuracies else float('nan'):.4f}")
-print(f"  Precision: {grand_mean_prec:.4f} ± {float(np.std(all_precisions)) if all_precisions else float('nan'):.4f}")
-print(f"  Recall:    {grand_mean_rec:.4f} ± {float(np.std(all_recalls)) if all_recalls else float('nan'):.4f}")
-print(f"  F1 Score:  {grand_mean_f1:.4f} ± {float(np.std(all_f1_scores)) if all_f1_scores else float('nan'):.4f}")
-print(f"  Total experiments: {len(all_accuracies)}")
-print("="*80 + "\n")
-  
-if DEBUG:          
-    check_overfitting(metrics, history, classifier, dataset_sizes, folds, lr, reg, label_smoothing, crop_size, downsample_size, percentile_lo, percentile_hi, ver_key)
+if DEBUG:
+    check_overfitting(metrics, history, classifier, dataset_sizes, folds, lr, reg, label_smoothing, crop_mode, percentile_lo, percentile_hi, ver_key)
             
     # Create aggregate plot showing all experiments
     if num_experiments > 1:

@@ -37,6 +37,7 @@ from dcreclass.utils.fits import (
     fwhm_major_as, beam_solid_angle_sr,
     read_fits_array_header_wcs, reproject_like,
     header_cluster_coord, robust_vmin_vmax, kernel_from_beams,
+    wcs_after_center_crop_and_resize,
 )
 from dcreclass.data.processing import (
     circular_kernel_from_z, load_z_table, _canon_size,
@@ -679,6 +680,92 @@ def create_comparison_plot(sources: List[str],
 
 # ========================= parallel helpers ==================================
 
+def process_raw_only_source(source_name: str,
+                             raw_path: Path,
+                             global_nbeams: Dict,
+                             downsample_size=(1, 128, 128),
+                             out_fits_dir: Optional[Path] = None,
+                             suffix: str = "",
+                             force: bool = False,
+                             fov_arcsec: Optional[float] = None):
+    """Crop, downsample, and save only the RAW FITS for a source with no valid redshift.
+    Used when --include-no-z is set: T/Blur images are skipped since they require z.
+    """
+    Ho, Wo = _canon_size(downsample_size)[-2:]
+    out_fits_dir = Path(out_fits_dir)
+    raw_fits_path = out_fits_dir / f"{source_name}_RAW_fmt_{Ho}x{Wo}_{suffix}.fits"
+
+    if not force and raw_fits_path.exists():
+        print(f"[SKIP] {source_name}: RAW output already exists (use --force to regenerate)")
+        return
+
+    I_raw, H_raw, W_raw = read_fits_array_header_wcs(raw_path)
+
+    # Determine crop side in arcseconds
+    beam_fwhm_I_as = fwhm_major_as(H_raw)
+    if fov_arcsec is not None:
+        side_as = float(fov_arcsec)
+    else:
+        n_beams_raw = global_nbeams.get('RAW', 20.0)
+        max_side_as = _nan_free_centred_square_side_as(I_raw, H_raw)
+        side_as = min(n_beams_raw * beam_fwhm_I_as, max_side_as)
+
+    # Find cluster centre (same logic as process_images_for_scale)
+    header_sky = header_cluster_coord(H_raw)
+    if header_sky is None:
+        H0, W0 = I_raw.shape
+        yc, xc = float(H0 // 2), float(W0 // 2)
+    else:
+        x_i, y_i = W_raw.world_to_pixel(header_sky)
+        yc, xc = float(y_i), float(x_i)
+    dy_px, dx_px = OFFSETS_PX.get(source_name, (0.0, 0.0))
+    if dy_px or dx_px:
+        yc += dy_px; xc += dx_px
+
+    # Crop
+    (I_crop,), (nyc, nxc), (cy, cx) = crop_to_side_arcsec_on_raw(
+        I_raw, H_raw, side_as, center=(yc, xc))
+
+    check_nan_fraction(I_crop, f"{source_name} I_crop (RAW-only)")
+
+    # Downsample
+    t = torch.from_numpy(I_crop).float().unsqueeze(0).unsqueeze(0)
+    with torch.no_grad():
+        y = torch.nn.functional.interpolate(t, size=(Ho, Wo), mode='bilinear',
+                                            align_corners=False)
+    I_fmt_np = y.squeeze(0).squeeze(0).cpu().numpy()
+
+    # Build WCS header for the cropped+resized image
+    H0_raw, W0_raw = I_raw.shape
+    _, H_i_fmt = wcs_after_center_crop_and_resize(
+        H_raw, H0_raw, W0_raw, nyc, nxc, Ho, Wo,
+        int(round(cy)), int(round(cx)))
+
+    # Save
+    out_fits_dir.mkdir(parents=True, exist_ok=True)
+    fits.writeto(raw_fits_path, I_fmt_np.astype(np.float32), H_i_fmt, overwrite=True)
+    report_nans(raw_fits_path)
+    print(f"[OK] {source_name}: RAW-only FITS saved -> {raw_fits_path.name}")
+
+
+def process_raw_only_wrapper(args_tuple):
+    """Parallel wrapper for process_raw_only_source."""
+    source_name, raw_path, args_dict = args_tuple
+    try:
+        process_raw_only_source(
+            source_name=source_name, raw_path=raw_path,
+            global_nbeams=args_dict['global_nbeams'],
+            downsample_size=args_dict['down'],
+            out_fits_dir=args_dict['out_fits_dir'],
+            suffix=args_dict['suffix'],
+            force=args_dict['force'],
+            fov_arcsec=args_dict.get('fov_arcsec'))
+        return (source_name, True, None)
+    except Exception as e:
+        import traceback
+        return (source_name, False, traceback.format_exc())
+
+
 def process_single_source_wrapper(args_tuple):
     """Wrapper for parallel per-source montage processing."""
     (source_name, raw_path, scale_values, z, global_nbeams, args_dict) = args_tuple
@@ -922,6 +1009,9 @@ def main():
     ap.add_argument("--only-one", type=str, default=None,
                     help="Debug: process only this single source.")
     ap.add_argument("--no-montage", action="store_true", default=False)
+    ap.add_argument("--include-no-z", action="store_true", default=False,
+                    help="Process RAW images for sources with no valid redshift "
+                         "(T/Blur scales are skipped for these sources since they require z).")
     ap.add_argument("--comparison-plot", action="store_true", default=False)
     ap.add_argument("--no-annotate", action="store_true", default=False)
     ap.add_argument("--comp-out", type=Path,  default=None,
@@ -939,6 +1029,7 @@ def main():
     cheat_rt      = (blur_method == 'cheat')
     subtract_beam = (blur_method != 'circular_no_sub')
     fov_arcsec    = args.fov_arcsec if crop_mode == 'fov_crop' else None
+    include_no_z  = args.include_no_z
 
     mode_subdir = f"{crop_mode}/{blur_method}"
     if args.out is None:
@@ -1022,14 +1113,21 @@ def main():
                          subtract_beam=subtract_beam,
                          force=args.force, out_fits_dir=out_fits_dir,
                          fov_arcsec=fov_arcsec)
-        tasks = []; n_skip_z = 0
+        tasks = []; raw_only_tasks = []; n_skip_z = 0
         for source_name, raw_path in sources_to_process:
             z = slug_to_z.get(source_name, np.nan)
             if not cheat_rt and (not np.isfinite(z) or z <= 0):
-                print(f"[SKIP] {source_name}: no valid redshift (z={z})")
-                n_skip_z += 1; continue
+                if include_no_z:
+                    raw_only_tasks.append((source_name, raw_path, args_dict))
+                else:
+                    print(f"[SKIP] {source_name}: no valid redshift (z={z})")
+                    n_skip_z += 1
+                continue
             tasks.append((source_name, raw_path, scale_values, z, global_nbeams, args_dict))
-        print(f"[PARALLEL] Processing {len(tasks)} sources (skipped {n_skip_z} missing z)...")
+        print(f"[PARALLEL] Processing {len(tasks)} sources "
+              f"(skipped {n_skip_z} missing z"
+              + (f", {len(raw_only_tasks)} queued for RAW-only" if raw_only_tasks else "")
+              + ")...")
         if n_workers == 1:
             results = [process_single_source_wrapper(t) for t in tasks]
         else:
@@ -1041,6 +1139,22 @@ def main():
             if not ok:
                 print(f"[ERROR] {name}:\n{err}")
         print(f"\n[PARALLEL] Done. Wrote {n_ok} montages. Failed {n_fail}.")
+
+        if raw_only_tasks:
+            print(f"\n[RAW-only] Processing {len(raw_only_tasks)} z-less sources (RAW FITS only)...")
+            raw_args_dict = {**args_dict, 'global_nbeams': global_nbeams}
+            raw_only_tasks_with_nbeams = [(n, p, raw_args_dict) for n, p, _ in raw_only_tasks]
+            if n_workers == 1:
+                raw_results = [process_raw_only_wrapper(t) for t in raw_only_tasks_with_nbeams]
+            else:
+                with Pool(processes=n_workers) as pool:
+                    raw_results = pool.map(process_raw_only_wrapper, raw_only_tasks_with_nbeams)
+            n_raw_ok = sum(1 for _, ok, _ in raw_results if ok)
+            n_raw_fail = len(raw_results) - n_raw_ok
+            for name, ok, err in raw_results:
+                if not ok:
+                    print(f"[ERROR] {name}:\n{err}")
+            print(f"[RAW-only] Done. Wrote {n_raw_ok} RAW FITS. Failed {n_raw_fail}.")
 
         print("\n" + "=" * 80)
         print("VERIFICATION REPORT: SUB File Coverage")

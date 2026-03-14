@@ -44,24 +44,28 @@ def initialise_labels(key, all_true_labels, all_pred_labels):
 ############ OVERFITTING DIAGNOSTICS ################
 ####################################################
 
-def check_overfitting(metrics, history, classifier_name, dataset_sizes, folds, lr, reg, label_smoothing, crop_size, downsample_size, percentile_lo, percentile_hi, ver_key):
+def check_overfitting(metrics, history, classifier_name, dataset_sizes, folds, lr, reg, label_smoothing, crop_mode, percentile_lo, percentile_hi, ver_key):
     """ Same as check_overfitting_indicators but includes all folds and parameter combinations """
     print("\n" + "="*60)
     print("COMPREHENSIVE OVERFITTING DIAGNOSTICS ACROSS ALL EXPERIMENTS")
     print("="*60)
-    
+
     # Calculate the average and std for everything combined
     all_train_acc = []
     all_val_acc = []
-    all_test_acc = []    
+    all_test_acc = []
     for fold in folds:
-        base = f"cl{classifier_name}_ss{dataset_sizes.get(fold, 'all')}_f{fold}_lr{lr}_reg{reg}_ls{label_smoothing}_cs{crop_size[-2]}x{crop_size[-1]}_ds{downsample_size[-2]}x{downsample_size[-1]}_pl{percentile_lo}_ph{percentile_hi}_ver{ver_key}"
-        
-        # Only extend if the metrics actually exist for this fold
-        if f"{base}_train_acc" in metrics and len(metrics[f"{base}_train_acc"]) > 0:
-            all_train_acc.extend(metrics.get(f"{base}_train_acc", []))
-            all_val_acc.extend(metrics.get(f"{base}_val_acc", []))
-            all_test_acc.extend(metrics.get(f"{base}_accuracy", []))
+        for subset_size in dataset_sizes.get(fold, []):
+            base = (f"{classifier_name}_ver{ver_key}_cm{crop_mode}"
+                    f"_lr{lr}_reg{reg}_ls{label_smoothing}"
+                    f"_lo{percentile_lo}_hi{percentile_hi}"
+                    f"_f{fold}_ss{round_to_1(subset_size)}")
+
+            # Only extend if the metrics actually exist for this fold/subset
+            if f"{base}_train_acc" in metrics and len(metrics[f"{base}_train_acc"]) > 0:
+                all_train_acc.extend(metrics.get(f"{base}_train_acc", []))
+                all_val_acc.extend(metrics.get(f"{base}_val_acc", []))
+                all_test_acc.extend(metrics.get(f"{base}_accuracy", []))
     
     # Only compute stats if we have data
     if all_train_acc:
