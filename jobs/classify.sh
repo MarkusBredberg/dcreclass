@@ -14,8 +14,8 @@
 #SBATCH --cpus-per-task=4
 
 # ── Run configuration ─────────────────────────────────────────────────────────
-ALL_CLASSIFIERS=("DualSSN")
-CROP_MODE="fov_crop"
+ALL_CLASSIFIERS=("ImageCNN")
+CROP_MODE="pixel_crop"
 BLUR_METHOD="circular"
 FOLDS="0 1 2 3 4 5 6 7 8 9"
 NUM_EXPERIMENTS=3
