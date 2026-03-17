@@ -1,6 +1,6 @@
 import os, time, random, pickle, itertools, torch, datetime, argparse
 from dcreclass.data import load_galaxies, get_classes
-from dcreclass.models import CNN, ImageCNN, ScatterNet, DualCNNSqueezeNet, DualScatterSqueezeNet
+from dcreclass.models import CNN, ImageCNN, ScatterNet, SimpleScatterNet, DualCNNSqueezeNet, DualScatterSqueezeNet
 from dcreclass.training import (EarlyStopping, reset_weights,
                                 relabel, permute_like,
                                 mixup_data, mixup_criterion,
@@ -26,7 +26,7 @@ import matplotlib.pyplot as plt
 def _parse_args():
     p = argparse.ArgumentParser(description="Train a radio-image classifier")
     p.add_argument('--classifier',    default='ImageCNN',
-                   choices=['CNN','ScatterNet','DualCSN','DualSSN','ImageCNN'])
+                   choices=['CNN','ScatterNet','SimpleScatterNet','DualCSN','DualSSN','ImageCNN'])
     p.add_argument('--versions',      default='RAW',
                    help="'+'-separated list, e.g. RAW or T25kpc+T50kpc")
     p.add_argument('--crop-mode',     default='beam_crop',
@@ -345,7 +345,7 @@ print("Labels of the test set after relabelling:", torch.unique(test_labels, ret
 ################# NORMALISE AND PACKAGE TEST DATA ############################
 ##############################################################################
 
-if classifier in ['CNN', 'ImageCNN', 'DualCSN', 'DualSSN']: # When images are used
+if classifier in ['CNN', 'ImageCNN', 'SimpleScatterNet', 'DualCSN', 'DualSSN']: # When images are used
     test_images = _as_5d(test_images).to(DEVICE)
 
 if classifier in ['ScatterNet', 'DualSSN']: # When scattering is used
@@ -708,6 +708,8 @@ for fold in folds:
         model = CNN(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)
     elif classifier == "ImageCNN":
         model = ImageCNN(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)
+    elif classifier == "SimpleScatterNet":
+        model = SimpleScatterNet(input_shape=tuple(valid_images.shape[1:]), num_classes=num_classes).to(DEVICE)
     elif classifier == "ScatterNet":
         model = ScatterNet(input_dim=int(np.prod(scatdim)), num_classes=num_classes).to(DEVICE)
     elif classifier == "DualCSN":
@@ -724,7 +726,7 @@ for fold in folds:
             summary(model, input_size=scatdim, device=DEVICE)
         elif classifier == "DualSSN":  # Both image and scattering input
             summary(model, input_size=[valid_images.shape[1:], scatdim])
-        else:  # Only image input
+        else:  # Only image input (CNN, ImageCNN, SimpleScatterNet, DualCSN)
             summary(model, input_size=tuple(valid_images.shape[1:]), device=DEVICE)
         FIRSTTIME = False
         

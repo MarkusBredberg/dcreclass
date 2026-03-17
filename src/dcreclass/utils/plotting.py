@@ -1106,6 +1106,7 @@ def plot_avg_std_confusion_matrix(metrics: Dict[str, Any],
             os.makedirs(save_dir, exist_ok=True)
             save_path = f"{save_dir}/{galaxy_classes}_{classifier}_{version}_{largest_sz}_{lr}_{reg}_avg_confusion_matrix.pdf"
             plt.savefig(save_path, bbox_inches='tight')
+            plt.show()
             plt.close(fig)
             print(f"Saved confusion matrix to {save_path}")
 

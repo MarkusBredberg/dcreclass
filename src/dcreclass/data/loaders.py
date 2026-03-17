@@ -1014,7 +1014,7 @@ def load_PSZ2(
                 fpath = os.path.join(raw_dir, fname)
 
                 if vU.startswith("T"):
-                    t_path = os.path.join(path, tag, sub, f"{base}.fits")
+                    t_path = os.path.join(path, tag, sub, f"{base}{tag}.fits")
                     if not os.path.isfile(t_path):
                         print(f"[MISS] tapered FITS missing: {t_path}")
                         continue

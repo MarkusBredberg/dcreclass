@@ -4,7 +4,7 @@
 #SBATCH --account=sk036
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --time=2:00:00
+#SBATCH --time=0:10:00
 #SBATCH --chdir=/users/mbredber/p2_DCRECLASS
 #SBATCH --output=/users/mbredber/p2_DCRECLASS/outputs/logs/sbatchrun-%j.out
 #SBATCH --error=/users/mbredber/p2_DCRECLASS/outputs/logs/sbatchrun-%j.err
@@ -14,14 +14,14 @@
 #SBATCH --cpus-per-task=4
 
 # ── Run configuration ─────────────────────────────────────────────────────────
-ALL_CLASSIFIERS=("ImageCNN")
+ALL_CLASSIFIERS=("DualSSN")
 CROP_MODE="pixel_crop"
 BLUR_METHOD="circular"
 FOLDS="0 1 2 3 4 5 6 7 8 9"
 NUM_EXPERIMENTS=3
 
 ALL_VERSIONS=(
-    "RAW"
+   "T25kpc" "T50kpc" "T100kpc"
 )
 
 # Output directories for this run
@@ -68,14 +68,6 @@ for CLASSIFIER in "${ALL_CLASSIFIERS[@]}"; do
             --run-dir "${RUN_DIR}" \
             --folds ${FOLDS} \
             --num-experiments ${NUM_EXPERIMENTS}
-
-        echo "--- Evaluating ${CLASSIFIER} | ${VERSIONS} | ${CROP_MODE} ---"
-        python /users/mbredber/p2_DCRECLASS/scripts/05.plot_classifier_results.py \
-            --classifier "${CLASSIFIER}" \
-            --version "${VERSIONS}" \
-            --crop-mode "${CROP_MODE}" \
-            --blur-method "${BLUR_METHOD}" \
-            --run-dir "${RUN_DIR}"
     done
 done
 

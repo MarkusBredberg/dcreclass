@@ -159,6 +159,27 @@ class ScatterNet(nn.Module):
         return x
 
 
+class SimpleScatterNet(nn.Module):
+    """Simple MLP classifier: Flatten → Dense(120) → Dense(84) → Dropout(0.5) → output."""
+    def __init__(self, input_shape, num_classes=2):
+        super(SimpleScatterNet, self).__init__()
+        flat_dim = 1
+        for d in input_shape:
+            flat_dim *= d
+        self.net = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(flat_dim, 120),
+            nn.ReLU(),
+            nn.Linear(120, 84),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(84, num_classes),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
 class SEBlock(nn.Module):
     """
     Squeeze-and-Excitation block for channel-wise attention.

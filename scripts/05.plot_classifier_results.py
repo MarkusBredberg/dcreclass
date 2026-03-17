@@ -6,7 +6,7 @@ from matplotlib.colors import LinearSegmentedColormap
 from torch.utils.data import TensorDataset, DataLoader
 
 # Import your classifiers
-from dcreclass.models import CNN, ImageCNN, ScatterNet, DualCNNSqueezeNet, DualScatterSqueezeNet
+from dcreclass.models import CNN, ImageCNN, ScatterNet, SimpleScatterNet, DualCNNSqueezeNet, DualScatterSqueezeNet
 from dcreclass.utils import fold_T_axis, custom_collate, compute_scattering_coeffs, round_to_1
 from dcreclass.utils.calc_tools import initialize_metrics, update_metrics, recalculate_metrics_with_correct_positive_class
 from dcreclass.utils.plotting import (robust_metric_histograms, plot_avg_roc_curves,
@@ -16,11 +16,11 @@ from dcreclass.utils.plotting import (robust_metric_histograms, plot_avg_roc_cur
 def _parse_args():
     p = argparse.ArgumentParser(description="Plot classifier results")
     p.add_argument('--classifier',    default='ImageCNN',
-                   choices=['CNN','ScatterNet','DualCSN','DualSSN','ImageCNN'])
+                   choices=['CNN','ScatterNet','SimpleScatterNet','DualCSN','DualSSN','ImageCNN'])
     p.add_argument('--version',       default='RAW',
                    help="Single image version, e.g. RAW or T25kpc")
     p.add_argument('--crop-mode',     default='beam_crop',
-                   choices=['beam_crop','beam_crop_no_sub','fov_crop','cheat_crop'])
+                   choices=['beam_crop','beam_crop_no_sub','fov_crop','cheat_crop','pixel_crop'])
     p.add_argument('--blur-method',   default='circular',
                    choices=['circular','circular_no_sub','cheat'])
     p.add_argument('--lr',            type=float, nargs='+', default=[5e-5])
@@ -470,6 +470,8 @@ if GENERATE_ATTENTION_MAPS:
         model = CNN(input_shape=img_shape, num_classes=num_classes).to(device)
     elif classifier == "ImageCNN":
         model = ImageCNN(input_shape=img_shape, num_classes=num_classes).to(device)
+    elif classifier == "SimpleScatterNet":
+        model = SimpleScatterNet(input_shape=img_shape, num_classes=num_classes).to(device)
     elif classifier == "ScatterNet":
         scatdim = test_scat.shape[1:]
         model = ScatterNet(input_dim=int(np.prod(scatdim)), num_classes=num_classes).to(device)
