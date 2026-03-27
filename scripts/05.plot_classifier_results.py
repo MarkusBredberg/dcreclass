@@ -31,6 +31,8 @@ def _parse_args():
     p.add_argument('--percentile-hi', type=int, default=99)
     p.add_argument('--run-dir',       default=None)
     p.add_argument('--data-run-dir',  default=None)
+    p.add_argument('--noise-levels', type=float, nargs='+', default=[0.0],
+                   metavar='NL', help="Noise levels to sweep (must match script 04 runs)")
     p.add_argument('--no-attention',  dest='generate_attention', action='store_false')
     p.set_defaults(generate_attention=True)
     return p.parse_args()
@@ -47,6 +49,7 @@ num_experiments       = args.num_experiments
 percentile_lo         = args.percentile_lo
 percentile_hi         = args.percentile_hi
 GENERATE_ATTENTION_MAPS = args.generate_attention
+noise_levels          = args.noise_levels
 
 OUTDIR_BASE = "/users/mbredber/p2_DCRECLASS/outputs/scratch/"
 _run_dir      = args.run_dir
@@ -113,26 +116,36 @@ run_version = (f"{galaxy_classes}_{classifier}_{[version]}_{crop_mode}_{blur_met
 save_dir = os.path.join(FIGURES_DIR, run_version)
 os.makedirs(save_dir, exist_ok=True)
 
-def _base(fold, subset_size, lr, reg):
+def _base(fold, subset_size, lr, reg, noise_level=0.0):
     """Canonical key — must mirror script 04's _base()."""
     return (f"{classifier}_ver{version}_cm{crop_mode}"
             f"_lr{lr}_reg{reg}_ls{label_smoothing}"
             f"_lo{percentile_lo}_hi{percentile_hi}"
+            f"_nl{noise_level}"
             f"_f{fold}_ss{round_to_1(subset_size)}")
 
-def _pkl_path(fold, subset_size, experiment, lr, reg):
-    return os.path.join(METRICS_DIR, f"{_base(fold, subset_size, lr, reg)}_e{experiment}.pkl")
+def _pkl_path(fold, subset_size, experiment, lr, reg, noise_level=0.0):
+    return os.path.join(METRICS_DIR, f"{_base(fold, subset_size, lr, reg, noise_level)}_e{experiment}.pkl")
 
 directory = os.path.join(MODELS_DIR, 'filtered') + os.sep if FILTERED else MODELS_DIR + os.sep
 
-# Define dataset sizes (must match training)
-if galaxy_classes == [50, 51]:
-    dataset_sizes = {fold: [3000] for fold in range(10)}
-elif galaxy_classes == [52, 53]:
-    dataset_sizes = {fold: [2, 16, 168] for fold in range(10)}
-else:
-    print("Please specify the dataset sizes for the given galaxy classes.")
-    exit(1)
+# Auto-discover subset sizes from existing pkl files
+import glob as _glob, re as _re
+_pkls = _glob.glob(os.path.join(METRICS_DIR, '*.pkl'))
+_disc = sorted({int(_m.group(1))
+                for _p in _pkls
+                for _m in [_re.search(r'_ss(\d+)_e\d+\.pkl$', os.path.basename(_p))]
+                if _m})
+if not _disc:
+    # fallback if directory is empty / not yet populated
+    if galaxy_classes == [50, 51]:
+        _disc = [3000]
+    elif galaxy_classes == [52, 53]:
+        _disc = [2, 16, 168]
+    else:
+        print("No pkl files found and no default dataset_sizes for these galaxy classes.")
+        exit(1)
+dataset_sizes = {fold: _disc for fold in range(10)}
 
 largest_sz = max([sz for sizes in dataset_sizes.values() for sz in sizes])
 
@@ -162,33 +175,33 @@ loaded_count = 0
 failed_count = 0
 
 # Load all saved metrics
-for lr, reg, experiment, fold in itertools.product(
-    learning_rates, regularization_params, range(num_experiments), folds
+for lr, reg, nl, experiment, fold in itertools.product(
+    learning_rates, regularization_params, noise_levels, range(num_experiments), folds
 ):
     for subset_size in dataset_sizes[fold]:
-        metrics_read_path = _pkl_path(fold, subset_size, experiment, lr, reg)
-        
+        metrics_read_path = _pkl_path(fold, subset_size, experiment, lr, reg, nl)
+
         try:
             with open(metrics_read_path, 'rb') as f:
                 data = pickle.load(f)
-            
+
             loaded_metrics = data["metrics"]
             history = data["history"]
             all_true_labels_dict = data["all_true_labels"]
             all_pred_labels_dict = data["all_pred_labels"]
             all_pred_probs_dict = data["all_pred_probs"]
             training_times_dict = data["training_times"]
-            
+
             if data.get("cluster_error") is not None:
                 all_cluster_metrics['errors'].append(data["cluster_error"])
             if data.get("cluster_distance") is not None:
                 all_cluster_metrics['distances'].append(data["cluster_distance"])
             if data.get("cluster_std_dev") is not None:
                 all_cluster_metrics['std_devs'].append(data["cluster_std_dev"])
-            
+
             initialize_metrics(tot_metrics, subset_size, fold, experiment, lr, reg)
-            
-            base = _base(fold, subset_size, lr, reg)
+
+            base = _base(fold, subset_size, lr, reg, nl)
             
             acc = loaded_metrics.get("accuracy", [])
             prec = loaded_metrics.get("precision", [])
@@ -223,6 +236,13 @@ for lr, reg, experiment, fold in itertools.product(
                 all_pred_probs_dict
             )
 
+            # Copy metrics to nl-keyed versions so noise sweep can separate levels
+            for _m in ["accuracy", "precision", "recall", "f1_score"]:
+                _src = f"{_m}_{subset_size}_{fold}_{experiment}_{lr}_{reg}"
+                _dst = f"{_m}_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{nl}"
+                if _src in tot_metrics and tot_metrics[_src]:
+                    tot_metrics.setdefault(_dst, []).append(tot_metrics[_src][-1])
+
             # Compute AUC from raw probabilities
             auc_val = float('nan')
             if y_true and y_probs:
@@ -236,7 +256,7 @@ for lr, reg, experiment, fold in itertools.product(
                         auc_val = auc(fpr, tpr)
                 except Exception:
                     pass
-            auc_key = f"auc_{subset_size}_{fold}_{experiment}_{lr}_{reg}"
+            auc_key = f"auc_{subset_size}_{fold}_{experiment}_{lr}_{reg}_{nl}"
             tot_metrics.setdefault(auc_key, []).append(auc_val)
 
             loaded_count += 1
@@ -359,6 +379,51 @@ plot_avg_std_confusion_matrix(metrics, metrics_last, galaxy_classes, classifier,
                               merge_map=merge_map, num_experiments=num_experiments,
                               save_dir=save_dir)
 plot_cluster_metrics(all_cluster_metrics, save_dir=save_dir)
+
+# ── Learning curve ────────────────────────────────────────────────────────────
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as _plt
+
+_lc_vals = {}
+for _ss in sorted({s for fs in dataset_sizes.values() for s in fs}):
+    _v = []
+    for _fold in folds:
+        for _exp in range(num_experiments):
+            for _lr in learning_rates:
+                for _reg in regularization_params:
+                    _k = f'accuracy_{_ss}_{_fold}_{_exp}_{_lr}_{_reg}'
+                    _v.extend([x for x in tot_metrics.get(_k, []) if np.isfinite(x)])
+    if _v:
+        _lc_vals[_ss] = _v
+
+if len(_lc_vals) > 1:
+    _ss_sorted = sorted(_lc_vals)
+    _means = [np.mean(_lc_vals[s]) for s in _ss_sorted]
+    _stds  = [np.std( _lc_vals[s]) for s in _ss_sorted]
+    _ns    = [len(   _lc_vals[s]) for s in _ss_sorted]
+
+    fig_lc, ax_lc = _plt.subplots(figsize=(5, 3.5))
+    ax_lc.errorbar(_ss_sorted, _means, yerr=_stds,
+                   fmt='o-', capsize=4, linewidth=1.4, markersize=5,
+                   color='steelblue', ecolor='steelblue', capthick=1)
+    ax_lc.set_xscale('log')
+    ax_lc.set_xlabel('Training set size', fontsize=12)
+    ax_lc.set_ylabel('Accuracy', fontsize=12)
+    ax_lc.set_title(f'{classifier}  |  {version}  |  {crop_mode}', fontsize=11)
+    ax_lc.set_ylim(0, 1.05)
+    ax_lc.grid(True, which='both', alpha=0.3)
+    for _ss, _m, _n in zip(_ss_sorted, _means, _ns):
+        ax_lc.annotate(f'n={_n}', (_ss, _m), textcoords='offset points',
+                       xytext=(4, 6), fontsize=7.5, color='grey')
+    fig_lc.tight_layout()
+    _lc_path = os.path.join(save_dir, 'learning_curve.pdf')
+    fig_lc.savefig(_lc_path, bbox_inches='tight')
+    _plt.close(fig_lc)
+    print(f'Learning curve saved: {_lc_path}')
+    print(f'\n{"SS":>6}  {"mean":>6}  {"std":>6}  {"n":>4}')
+    for _ss, _m, _s, _n in zip(_ss_sorted, _means, _stds, _ns):
+        print(f'{_ss:>6}  {_m:.4f}  {_s:.4f}  {_n:>4}')
 
 print("\n" + "="*60)
 print("EVALUATION SCRIPT FINISHED SUCCESSFULLY!")
@@ -514,6 +579,34 @@ if GENERATE_ATTENTION_MAPS:
 
 # [Keep all your existing plotting functions here - they're already good]
 # Just add them back from your original script 4.2
+
+if len(noise_levels) > 1:
+    import matplotlib.pyplot as _plt
+    nl_means, nl_stds = [], []
+    for _nl in noise_levels:
+        vals = []
+        for _lr, _reg, _exp, _fold in itertools.product(
+            learning_rates, regularization_params, range(num_experiments), folds
+        ):
+            for _ss in dataset_sizes[_fold]:
+                k = f"accuracy_{_ss}_{_fold}_{_exp}_{_lr}_{_reg}_{_nl}"
+                vals.extend([v for v in tot_metrics.get(k, []) if np.isfinite(v)])
+        nl_means.append(np.mean(vals) if vals else np.nan)
+        nl_stds.append(np.std(vals) if vals else np.nan)
+
+    _fig, _ax = _plt.subplots(figsize=(5, 3.5))
+    _ax.errorbar(noise_levels, nl_means, yerr=nl_stds,
+                 fmt='o-', capsize=4, linewidth=1.4, markersize=5,
+                 color='steelblue', ecolor='steelblue', capthick=1)
+    _ax.set_xlabel('Noise level', fontsize=12)
+    _ax.set_ylabel('Accuracy', fontsize=12)
+    _ax.set_title(f'{classifier} | {version} | noise robustness', fontsize=11)
+    _ax.set_ylim(0, 1.05)
+    _ax.grid(True, alpha=0.3)
+    _fig.tight_layout()
+    _fig.savefig(os.path.join(save_dir, 'noise_sweep.pdf'), bbox_inches='tight')
+    _plt.show()
+    _plt.close()
 
 print("\n" + "="*60)
 print("EVALUATION SCRIPT FINISHED SUCCESSFULLY!")

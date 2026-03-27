@@ -885,9 +885,93 @@ def load_PSZ2(
                         source_ids.add(src_id)
 
                 if processed_dir is None:
-                    raise ValueError(
-                        f"Multi-version loading requires processed files. "
-                        f"crop_mode={crop_mode!r} has no processed_subdir.")
+                    # pixel_crop: enumerate from RAW, load each version on-the-fly, stack
+                    raw_dir_mv = os.path.join(path, "RAW", sub)
+                    if not os.path.isdir(raw_dir_mv):
+                        print(f"[SKIP] RAW folder missing for pixel_crop multi-version: {raw_dir_mv}")
+                        continue
+                    for fname_mv in sorted(os.listdir(raw_dir_mv)):
+                        if not fname_mv.lower().endswith('.fits'):
+                            continue
+                        base_mv   = os.path.splitext(fname_mv)[0]
+                        src_id_mv = _source_id(base_mv)
+                        if src_id_mv in _seen_sources:
+                            continue
+                        raw_path_mv = os.path.join(raw_dir_mv, fname_mv)
+                        raw_hdr_mv  = fits.getheader(raw_path_mv)
+                        raw_arr_mv  = np.squeeze(fits.getdata(raw_path_mv)).astype(np.float32)
+                        if raw_arr_mv.ndim == 3: raw_arr_mv = raw_arr_mv.mean(axis=0)
+                        if raw_arr_mv.ndim != 2: continue
+                        frames_mv: List[torch.Tensor] = []
+                        ok_mv = True
+                        for nv_mv in norm_versions:
+                            nvU_mv = str(nv_mv).upper()
+                            if nvU_mv == 'RAW':
+                                frm_mv = apply_formatting(
+                                    torch.from_numpy(raw_arr_mv.copy()).unsqueeze(0).float(),
+                                    crop_size=(1, Hc_ref, Wc_ref), downsample_size=(1, Ho, Wo))
+                                frames_mv.append(frm_mv)
+                            elif nvU_mv.startswith('BLUR'):
+                                num_mv  = ''.join([c for c in nvU_mv if c.isdigit()]) or "50"
+                                pref_mv = f"T{int(float(num_mv)) if float(num_mv).is_integer() else num_mv}kpc"
+                                gdir_mv = (pref_mv if os.path.isdir(os.path.join(path, pref_mv, sub))
+                                           else _nearest_T_dir(path, sub, float(num_mv)))
+                                if gdir_mv is None: ok_mv = False; break
+                                tpath_mv = os.path.join(path, gdir_mv, sub, f"{base_mv}{gdir_mv}.fits")
+                                if not os.path.isfile(tpath_mv): ok_mv = False; break
+                                thdr_mv  = fits.getheader(tpath_mv)
+                                C_raw_mv  = _beam_cov_world(raw_hdr_mv)
+                                C_tgt_mv  = _beam_cov_world(thdr_mv)
+                                sig_mv    = float(np.sqrt(max(0.0, np.linalg.det(C_tgt_mv))))
+                                C_circ_mv = np.array([[sig_mv, 0.0], [0.0, sig_mv]], float)
+                                if nvU_mv.startswith('BLURNOSUB'):
+                                    C_ker_mv = C_circ_mv
+                                else:
+                                    C_ker_mv  = C_circ_mv - C_raw_mv
+                                    w_mv, V_mv = np.linalg.eigh(C_ker_mv)
+                                    C_ker_mv   = (V_mv * np.clip(w_mv, 0.0, None)) @ V_mv.T
+                                J_mv    = _cd_matrix_rad(raw_hdr_mv)
+                                Cpix_mv = np.linalg.inv(J_mv) @ C_ker_mv @ np.linalg.inv(J_mv).T
+                                ev_mv, evec_mv = np.linalg.eigh(Cpix_mv)
+                                ev_mv  = np.clip(ev_mv, 1e-18, None)
+                                s1_mv, s2_mv = float(np.sqrt(ev_mv[0])), float(np.sqrt(ev_mv[1]))
+                                nk_mv  = int(np.ceil(8.0 * max(s1_mv, s2_mv))) | 1
+                                k_mv   = (nk_mv - 1) // 2
+                                yy_mv, xx_mv = np.mgrid[-k_mv:k_mv+1, -k_mv:k_mv+1].astype(np.float32)
+                                X_mv  = np.stack([xx_mv, yy_mv], axis=-1)
+                                Ci_mv = evec_mv @ np.diag(1.0 / np.array([s1_mv**2, s2_mv**2])) @ evec_mv.T
+                                ker_mv = np.exp(-0.5 * (X_mv @ Ci_mv * X_mv).sum(axis=-1))
+                                sk_mv  = float(ker_mv.sum())
+                                if not np.isfinite(sk_mv) or sk_mv <= 0: ok_mv = False; break
+                                ker_mv /= sk_mv
+                                ab_mv = convolve_fft(
+                                    raw_arr_mv.copy(), ker_mv, boundary="fill", fill_value=np.nan,
+                                    nan_treatment="interpolate", normalize_kernel=True,
+                                    psf_pad=True, fft_pad=True, allow_huge=True)
+                                ab_mv *= _beam_solid_angle_sr(thdr_mv) / _beam_solid_angle_sr(raw_hdr_mv)
+                                frm_mv = apply_formatting(
+                                    torch.from_numpy(ab_mv).unsqueeze(0).float(),
+                                    crop_size=(1, Hc_ref, Wc_ref), downsample_size=(1, Ho, Wo))
+                                frames_mv.append(frm_mv)
+                            elif nvU_mv.startswith('T'):
+                                tag_mv = _kpc_tag(nv_mv)
+                                tp_mv  = os.path.join(path, tag_mv, sub, f"{base_mv}{tag_mv}.fits")
+                                if not os.path.isfile(tp_mv): ok_mv = False; break
+                                arr_t_mv = np.squeeze(fits.getdata(tp_mv)).astype(np.float32)
+                                if arr_t_mv.ndim == 3: arr_t_mv = arr_t_mv.mean(axis=0)
+                                if arr_t_mv.ndim != 2: ok_mv = False; break
+                                frm_mv = apply_formatting(
+                                    torch.from_numpy(arr_t_mv).unsqueeze(0).float(),
+                                    crop_size=(1, Hc_ref, Wc_ref), downsample_size=(1, Ho, Wo))
+                                frames_mv.append(frm_mv)
+                            else:
+                                ok_mv = False; break
+                        if ok_mv and len(frames_mv) == len(norm_versions):
+                            images.append(torch.stack(frames_mv, dim=0))
+                            labels.append(cls)
+                            basenames.append(src_id_mv)
+                            _seen_sources.add(src_id_mv)
+                    continue  # skip the processed-file loading below for this cls
 
                 # Debug: check first 5 sources
                 for src_id in sorted(source_ids)[:5]:

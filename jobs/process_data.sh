@@ -1,7 +1,7 @@
 #!/bin/bash -l
 
 #SBATCH --job-name=process_data
-#SBATCH --account=sk032
+#SBATCH --account=sk036
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --time=0:10:00
@@ -38,19 +38,16 @@ echo "========================================"
 #   /users/mbredber/scratch/data/PSZ2/<crop_mode>/<blur_method>/fits_files/
 #   /users/mbredber/scratch/data/PSZ2/<crop_mode>/<blur_method>/montages/
 #   /users/mbredber/scratch/figures/processing/comparison_<crop_mode>_<blur_method>.pdf
-COMMON_ARGS="--comparison-plot --force --n-workers 16 --scales 25,50,100"
+COMMON_ARGS="--comparison-plot --no-montage --force --n-workers 16 --scales 25,50,100 --blur-method circular --no-annotate"
 
-#echo "--- beam_crop / circular ---"
-#python "$SCRIPT_PATH" $COMMON_ARGS --crop-mode beam_crop --blur-method circular
-#
-#echo "--- beam_crop / circular_no_sub ---"
-#python "$SCRIPT_PATH" $COMMON_ARGS --crop-mode beam_crop --blur-method circular_no_sub
+echo "--- beam_crop / circular (no annotations) ---"
+python "$SCRIPT_PATH" $COMMON_ARGS --crop-mode beam_crop
 
-echo "--- beam_crop / cheat ---"
-python "$SCRIPT_PATH" $COMMON_ARGS --crop-mode beam_crop --blur-method cheat
+echo "--- fov_crop / circular (no annotations) ---"
+python "$SCRIPT_PATH" $COMMON_ARGS --crop-mode fov_crop --fov-arcsec 800
 
-#echo "--- fov_crop / circular ---"
-#python "$SCRIPT_PATH" $COMMON_ARGS --crop-mode fov_crop --blur-method circular --fov-arcsec 800
+echo "--- pixel_crop / circular (no annotations) ---"
+python "$SCRIPT_PATH" $COMMON_ARGS --crop-mode pixel_crop
 
 echo "========================================"
 echo "Job finished at: $(date)"

@@ -1015,7 +1015,7 @@ def main():
     ap.add_argument("--comparison-plot", action="store_true", default=False)
     ap.add_argument("--no-annotate", action="store_true", default=False)
     ap.add_argument("--comp-out", type=Path,  default=None,
-                    help="Comparison plot path (default: PSZ2/<mode>/comparison_plot.pdf)")
+                    help="Comparison plot path (default: PSZ2/<mode>/comparison_plot.png)")
     ap.add_argument("--comp-sources", type=str, default=None)
     ap.add_argument("--n-de",  type=int, default=3)
     ap.add_argument("--n-nde", type=int, default=3)
@@ -1037,7 +1037,8 @@ def main():
     if args.fits_out is None:
         args.fits_out = PSZ2_DIR / crop_mode / blur_method / "fits_files"
     if args.comp_out is None:
-        args.comp_out = Path("/users/mbredber/scratch/figures/processing") / f"comparison_{mode_subdir.replace('/', '_')}.pdf"
+        annotate_tag = "noannotate" if args.no_annotate else "annotate"
+        args.comp_out = Path("/users/mbredber/scratch/figures/processing") / f"comparison_{mode_subdir.replace('/', '_')}_{annotate_tag}.png"
 
     print(f"[init] Loading redshift table from {args.z_csv}")
     slug_to_z = load_z_table(args.z_csv)

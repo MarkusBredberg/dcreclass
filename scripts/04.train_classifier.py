@@ -38,6 +38,9 @@ def _parse_args():
     p.add_argument('--label-smoothing', type=float, default=0.1)
     p.add_argument('--folds',         type=int, nargs='+', default=[0])
     p.add_argument('--num-experiments', type=int, default=2)
+    p.add_argument('--dataset-fractions', type=float, nargs='+', default=[1.0],
+                   metavar='F',
+                   help="Training-set fractions to sweep, e.g. 0.01 0.1 0.5 1.0")
     p.add_argument('--percentile-lo', type=int, default=30)
     p.add_argument('--percentile-hi', type=int, default=99)
     p.add_argument('--num-epochs-cuda', type=int, default=200)
@@ -54,6 +57,9 @@ def _parse_args():
     p.add_argument('--no-class-weights',      dest='use_class_weights', action='store_false')
     p.add_argument('--no-early-stopping',     dest='es',                action='store_false')
     p.add_argument('--no-scheduler',          dest='scheduler',         action='store_false')
+    p.add_argument('--noise-level', type=float, default=0.0,
+                   metavar='NL',
+                   help="Gaussian noise strength: 0=clean, 1=pure noise (applied to all splits)")
     p.add_argument('--force',                 action='store_true',
                    help="Ignore and overwrite any existing cache files")
     p.add_argument('--debug',                 action='store_true')
@@ -72,6 +78,7 @@ reg               = args.reg
 label_smoothing   = args.label_smoothing
 folds             = args.folds
 num_experiments   = args.num_experiments
+dataset_fractions = args.dataset_fractions
 percentile_lo     = args.percentile_lo
 percentile_hi     = args.percentile_hi
 num_epochs_cuda   = args.num_epochs_cuda
@@ -86,6 +93,7 @@ ES                = args.es
 SCHEDULER         = args.scheduler
 USE_CACHE         = not args.force
 DEBUG             = args.debug
+noise_level       = args.noise_level
 
 OUTDIR_BASE = "/users/mbredber/p2_DCRECLASS/outputs/scratch/"
 _run_dir      = args.run_dir
@@ -107,7 +115,7 @@ else:
 SEED              = 42
 galaxy_classes    = [50, 51]
 max_num_galaxies  = 1000000
-dataset_portions  = [1]
+dataset_portions  = dataset_fractions
 J, L, order       = 2, 12, 2
 NORMALISEIMGS     = True
 NORMALISEIMGSTOPM = False
@@ -227,11 +235,18 @@ def _verkey(v):
     return str(v)
 ver_key = _verkey(versions)
 
+def _add_noise(images: torch.Tensor, nl: float) -> torch.Tensor:
+    """Convex mix: nl=0 → clean image, nl=1 → pure Gaussian noise."""
+    if nl == 0.0:
+        return images
+    return (1.0 - nl) * images + nl * torch.randn_like(images)
+
 def _base(fold, subset_size):
     """Canonical key used for in-memory dicts and as the pkl filename stem."""
     return (f"{classifier}_ver{ver_key}_cm{crop_mode}"
             f"_lr{lr}_reg{reg}_ls{label_smoothing}"
             f"_lo{percentile_lo}_hi{percentile_hi}"
+            f"_nl{noise_level}"
             f"_f{fold}_ss{round_to_1(subset_size)}")
 
 def _pkl_path(fold, subset_size, experiment):
@@ -546,9 +561,14 @@ for fold in folds:
         
         # Load or compute train scattering coefficients
         if os.path.exists(train_cache) and USE_CACHE:
-            print(f"✓ Loading train scattering coefficients from cache: {train_cache}")
-            train_scat_coeffs = torch.load(train_cache)
-        else:
+            try:
+                print(f"✓ Loading train scattering coefficients from cache: {train_cache}")
+                train_scat_coeffs = torch.load(train_cache)
+            except Exception as e:
+                print(f"⚠ Corrupted cache file, recomputing: {e}")
+                os.remove(train_cache)
+                USE_CACHE = False  # also skip valid cache below
+        if not os.path.exists(train_cache) or not USE_CACHE:
             # Take time to compute scattering coefficients
             start_time = time.time()
             train_scat_coeffs = compute_scattering_coeffs(train_images, scattering, batch_size=128, device="cpu")
@@ -560,9 +580,14 @@ for fold in folds:
 
         # Load or compute validation scattering coefficients
         if os.path.exists(valid_cache) and USE_CACHE:
-            print(f"✓ Loading valid scattering coefficients from cache: {valid_cache}")
-            valid_scat_coeffs = torch.load(valid_cache)
-        else:
+            try:
+                print(f"✓ Loading valid scattering coefficients from cache: {valid_cache}")
+                valid_scat_coeffs = torch.load(valid_cache)
+            except Exception as e:
+                print(f"⚠ Corrupted cache file, recomputing: {e}")
+                os.remove(valid_cache)
+                USE_CACHE = False
+        if not os.path.exists(valid_cache) or not USE_CACHE:
             valid_scat_coeffs = compute_scattering_coeffs(valid_images, scattering, batch_size=128, device="cpu")
             os.makedirs(os.path.dirname(valid_cache), exist_ok=True)
             torch.save(valid_scat_coeffs, valid_cache)
@@ -809,6 +834,7 @@ for fold in folds:
                 for images, scat, _rest in subset_train_loader:
                     labels = _rest
                     images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
+                    images = _add_noise(images, noise_level)
                     optimizer.zero_grad()
                                             
                     # ADD MixUp here:
@@ -877,6 +903,7 @@ for fold in folds:
                             continue
                         labels = _rest
                         images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
+                        images = _add_noise(images, noise_level)
                         if classifier == 'ScatterNet':
                             logits = model(scat)
                         elif classifier == 'DualSSN':
@@ -919,7 +946,8 @@ for fold in folds:
                                 continue
                             labels = _rest
                             images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
-                            
+                            images = _add_noise(images, noise_level)
+
                             if classifier == 'ScatterNet':
                                 logits = model(scat)
                             elif classifier == 'DualSSN':
@@ -990,7 +1018,7 @@ for fold in folds:
                 for images, scat, _rest in subset_train_loader: # Evaluate on training data
                     labels = _rest
                     images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
-                    
+                    images = _add_noise(images, noise_level)
                     if classifier == 'ScatterNet':
                         logits = model(scat)
                     elif classifier == 'DualSSN':
@@ -1011,16 +1039,17 @@ for fold in folds:
             with torch.inference_mode():
                 val_correct = 0
                 val_total = 0
-                for images, scat, _rest in valid_loader: # Evaluate on validation data 
+                for images, scat, _rest in valid_loader: # Evaluate on validation data
                     labels = _rest
                     images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
+                    images = _add_noise(images, noise_level)
                     if classifier == 'ScatterNet':
                         logits = model(scat)
                     elif classifier == 'DualSSN':
                         logits = model(images, scat)
                     else:
                         logits = model(images)
-                        
+
                     logits = _collapse_logits(logits, num_classes)
 
                     preds = logits.argmax(dim=1)
@@ -1044,13 +1073,14 @@ for fold in folds:
                 for images, scat, _rest in test_loader: # Evaluate on test data
                     labels = _rest
                     images, scat, labels = images.to(DEVICE), scat.to(DEVICE), labels.to(DEVICE)
+                    images = _add_noise(images, noise_level)
                     if classifier == 'ScatterNet':
                         logits = model(scat)
                     elif classifier == 'DualSSN':
                         logits = model(images, scat)
                     else:
                         logits = model(images)
-                        
+
                     all_logits.append(logits.cpu().numpy())
                     logits = _collapse_logits(logits, num_classes)
                     pred_probs = torch.softmax(logits, dim=1).cpu().numpy()
