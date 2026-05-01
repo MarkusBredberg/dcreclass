@@ -1,4 +1,28 @@
-import os, time, random, pickle, itertools, torch, datetime, argparse
+# ── Standard library ───────────────────────────────────────────────────────────
+import argparse
+import datetime
+import itertools
+import os
+import pickle
+import random
+import time
+
+# ── Third-party: numerical / ML ────────────────────────────────────────────────
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.optim import AdamW
+from torch.utils.data import TensorDataset, DataLoader, Subset
+from kymatio.torch import Scattering2D
+from torchsummary import summary
+from tqdm import tqdm
+
+# ── Third-party: visualisation ─────────────────────────────────────────────────
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+# ── Project ────────────────────────────────────────────────────────────────────
 from dcreclass.data import load_galaxies, get_classes
 from dcreclass.models import CNN, ImageCNN, ScatterNet, SimpleScatterNet, DualCNNSqueezeNet, DualScatterSqueezeNet
 from dcreclass.training import (EarlyStopping, reset_weights,
@@ -12,16 +36,6 @@ from dcreclass.utils import (cluster_metrics, normalise_images, check_tensor, fo
                              compute_scattering_coeffs, custom_collate, round_to_1,
                              plot_histograms, plot_images_by_class, plot_image_grid,
                              plot_background_histogram)
-import numpy as np
-import torch.nn as nn
-from torch.optim import AdamW
-from torch.utils.data import TensorDataset, DataLoader, Subset
-from torchsummary import summary
-from kymatio.torch import Scattering2D
-from tqdm import tqdm
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
 
 def _parse_args():
     p = argparse.ArgumentParser(description="Train a radio-image classifier")
@@ -824,7 +838,7 @@ for fold in folds:
 
             early_stopping = EarlyStopping(patience=patience, verbose=False) if ES else None
 
-            for epoch in tqdm(range(num_epochs), desc=f'Training {classifier}_{galaxy_classes}_{versions}_{crop_mode}_{blur_method}_{percentile_lo}_{percentile_hi}_{subset_size}_{fold}_{experiment}_{lr}_{reg}'):
+            for epoch in tqdm(range(num_epochs), desc=f'Training {_base(fold, subset_size)}_e{experiment}'):
                 model.train()
                 train_total_loss = 0
                 train_total_images = 0

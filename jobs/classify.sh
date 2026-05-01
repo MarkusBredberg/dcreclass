@@ -4,7 +4,7 @@
 #SBATCH --account=sk036
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --time=0:20:00
+#SBATCH --time=0:10:00
 #SBATCH --chdir=/users/mbredber/p2_DCRECLASS
 #SBATCH --output=/users/mbredber/p2_DCRECLASS/outputs/logs/sbatchrun-%j.out
 #SBATCH --error=/users/mbredber/p2_DCRECLASS/outputs/logs/sbatchrun-%j.err
@@ -14,15 +14,15 @@
 #SBATCH --cpus-per-task=4
 
 # ── Run configuration ─────────────────────────────────────────────────────────
-ALL_CLASSIFIERS=("DualSSN")
+ALL_CLASSIFIERS=("ImageCNN" "SimpleScatterNet")
 CROP_MODE="beam_crop"
 BLUR_METHOD="circular"
-FOLDS="0 1 2 3 4 5 6 7 8 9"
+FOLDS="6 7 8 9 0 1 2 3 4 5"
 NUM_EXPERIMENTS=3
-DATASET_FRACTIONS="0.01 0.1 0.5"
+DATASET_FRACTIONS="1"
 
 ALL_VERSIONS=("T25kpc")
-NOISE_LEVELS="0.0"
+NOISE_LEVELS="0.3 0.5"
 
 # Output directories for this run
 RUN_DIR="/users/mbredber/p2_DCRECLASS/outputs/scratch"
@@ -33,9 +33,7 @@ mkdir -p "${RUN_DIR}/data/metrics/"
 mkdir -p "/users/mbredber/p2_DCRECLASS/outputs/logs"
 
 # ── Environment ───────────────────────────────────────────────────────────────
-source /opt/cray/pe/cpe/23.12/restore_lmod_system_defaults.sh
-module load cray/23.12
-module load cray-python/3.11.5
+source /users/mbredber/p2_DCRECLASS/.venv/bin/activate
 
 export PYTHONPATH=/users/mbredber/.local/lib/python3.11/site-packages:$PYTHONPATH
 export PYTHONPATH=/users/mbredber/p2_DCRECLASS/src:$PYTHONPATH
